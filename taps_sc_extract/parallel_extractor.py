@@ -1,14 +1,15 @@
 """
-Parallel single-cell TAPS methylation extraction engine with dedicated background writer thread.
+Parallel single-cell TAPS methylation extraction engine.
 
 Architecture:
 1. Extraction Pool (Workers):
    Worker processes extract genomic chunks from the BAM file in parallel and
-   stream completed chunk results into a bounded thread queue.
-2. Dedicated Shard Writer Thread:
-   Runs concurrently in the background while workers are actively extracting
-   subsequent chunks. Flushes, organizes, and writes shard data to disk in
-   real-time without blocking worker extraction.
+   stream per-shard compact chunk files (or in-memory payloads) as they finish.
+2. Shard write pool (after extractors exit):
+   Barcode-partitioned Amethyst shards can only be finalized after every
+   genomic chunk has been seen. Once the extract pool joins and releases RAM,
+   shards are assembled and written by a thread pool sized from MemAvailable
+   / estimated per-writer RSS.
 3. Master Index Generation:
    Creates a portable `master.h5` containing relative ExternalLinks to all shards.
 """
@@ -20,11 +21,9 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
-import queue
 import resource
 import shutil
 import tempfile
-import threading
 import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -321,87 +320,169 @@ def plan_genomic_chunks(
     return chunks
 
 
-def _dedicated_writer_worker(
-    write_queue: queue.Queue,
-    out_h5_path: str,
-    effective_shards: int,
-    shard_paths: List[str],
-    actual_temp_dir: Optional[str],
+def _meminfo_mb() -> Tuple[float, float]:
+    """Return (MemTotal, MemAvailable) in megabytes from /proc/meminfo."""
+    total_mb = 0.0
+    avail_mb = 0.0
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_mb = int(line.split()[1]) / 1024.0
+                elif line.startswith("MemAvailable:"):
+                    avail_mb = int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    if avail_mb <= 0.0:
+        avail_mb = 1024.0
+    if total_mb <= 0.0:
+        total_mb = avail_mb
+    return total_mb, avail_mb
+
+
+def _dir_size_mb(path: str) -> float:
+    """Sum file sizes under ``path`` in megabytes. Missing paths are 0."""
+    if not path or not os.path.isdir(path):
+        return 0.0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                continue
+    return total / (1024.0 * 1024.0)
+
+
+def _estimate_per_writer_mb(
+    temp_dir: Optional[str],
+    n_shards: int,
     use_temp_files: bool,
+) -> float:
+    """
+    Conservative RSS of one shard writer.
+
+    A writer loads one shard's chunk arrays and briefly holds a concatenated
+    copy while compressing HDF5. Temp-file pickle bytes are a lower bound
+    on that working set; in-memory mode already has the arrays resident and
+    concatenate makes another copy.
+    """
+    if use_temp_files and temp_dir:
+        sizes = [
+            _dir_size_mb(os.path.join(temp_dir, f"shard_{s:03d}"))
+            for s in range(max(1, n_shards))
+        ]
+        sizes = [sz for sz in sizes if sz > 0.0]
+        if sizes:
+            return max(128.0, max(sizes) * 2.5)
+        return 256.0
+    return 1024.0
+
+
+def _shard_writer_concurrency(
+    n_shards: int,
+    *,
+    use_temp_files: bool,
+    temp_dir: Optional[str] = None,
+) -> int:
+    """
+    How many shard-writer threads to run after extractors have exited.
+
+    A shard writer holds one shard's merged arrays (heavier than one pileup
+    worker, much lighter than the full extract pool). Scale from MemAvailable.
+    """
+    n_shards = max(1, int(n_shards))
+    _total_mb, avail_mb = _meminfo_mb()
+    per_writer_mb = _estimate_per_writer_mb(temp_dir, n_shards, use_temp_files)
+    headroom_mb = 512.0
+    budget_mb = max(0.0, avail_mb - headroom_mb)
+    n = int(budget_mb // per_writer_mb) if per_writer_mb > 0 else 1
+    n = max(1, n)
+    return min(n, n_shards, 16)
+
+
+def _merge_chunk_dict(
+    d: Optional[Dict[str, Dict[str, np.ndarray]]],
+    cg_accum: Dict[str, List[np.ndarray]],
+    ch_accum: Dict[str, List[np.ndarray]],
+) -> None:
+    if not d:
+        return
+    for bc, arr in d.get("CG", {}).items():
+        cg_accum[bc].append(arr)
+    for bc, arr in d.get("CH", {}).items():
+        ch_accum[bc].append(arr)
+
+
+def _flush_accum_to_h5(
+    shard_path: str,
+    cg_accum: Dict[str, List[np.ndarray]],
+    ch_accum: Dict[str, List[np.ndarray]],
     compression: str,
     compression_level: int,
+    version: str,
+) -> int:
+    """Single-pass write of concatenated per-barcode arrays. Returns cell count."""
+    all_shard_bcs = sorted(set(cg_accum.keys()) | set(ch_accum.keys()))
+    with AmethystH5Writer(
+        shard_path, mode="w", compression=compression, compression_level=compression_level
+    ) as writer:
+        writer.write_metadata(version)
+        for bc in all_shard_bcs:
+            if bc in cg_accum:
+                merged = cg_accum[bc][0] if len(cg_accum[bc]) == 1 else np.concatenate(cg_accum[bc])
+                writer.create_cell_dataset("CG", bc, merged)
+            if bc in ch_accum:
+                merged = ch_accum[bc][0] if len(ch_accum[bc]) == 1 else np.concatenate(ch_accum[bc])
+                writer.create_cell_dataset("CH", bc, merged)
+    return len(all_shard_bcs)
+
+
+def _assemble_and_write_shard(
+    shard_idx: int,
+    n_shards: int,
+    shard_path: str,
+    temp_shard_dir: Optional[str],
+    in_memory_chunks: Optional[List[Tuple[int, Optional[Dict[str, Dict[str, np.ndarray]]]]]],
+    compression: str = "gzip",
+    compression_level: int = 1,
     version: str = "amethyst2.0.0",
-):
+) -> Tuple[int, int, float]:
     """
-    Dedicated background thread that runs concurrently while extraction workers are active.
-    
-    Processes chunk results, tracks shard completion, and writes shards to disk in real-time.
+    Assemble one shard in genomic chunk_id order and single-pass write its HDF5.
+
+    ``in_memory_chunks`` must be a list of ``(chunk_id, payload)`` pairs. Payloads
+    are applied in ``chunk_id`` order, not completion order — ``imap_unordered``
+    would otherwise scramble chromosome contiguity.
     """
-    in_memory_shard_chunks: Dict[int, List[Any]] = {s: [] for s in range(effective_shards)}
-    chunks_received = 0
+    t0 = time.time()
+    cg_accum: Dict[str, List[np.ndarray]] = defaultdict(list)
+    ch_accum: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-    while True:
-        item = write_queue.get()
-        if item is None:
-            # Sentinel indicating all extraction workers are finished
-            write_queue.task_done()
-            break
+    if temp_shard_dir and os.path.exists(temp_shard_dir):
+        chunk_files = sorted(fn for fn in os.listdir(temp_shard_dir) if fn.endswith(".bin"))
+        for fn in chunk_files:
+            fp = os.path.join(temp_shard_dir, fn)
+            with open(fp, "rb") as f:
+                d = pickle.load(f)
+            _merge_chunk_dict(d, cg_accum, ch_accum)
+            del d
+        shutil.rmtree(temp_shard_dir, ignore_errors=True)
+    elif in_memory_chunks:
+        for _chunk_id, d in sorted(in_memory_chunks, key=lambda item: item[0]):
+            _merge_chunk_dict(d, cg_accum, ch_accum)
 
-        chunk_id, shard_payload = item
-        chunks_received += 1
-
-        if not use_temp_files and shard_payload:
-            for s in range(effective_shards):
-                in_memory_shard_chunks[s].append(shard_payload[s])
-
-        write_queue.task_done()
-
-    # Finalize and write each shard sequentially to keep RAM strictly <100 MB
-    for s in range(effective_shards):
-        t0 = time.time()
-        temp_s_dir = os.path.join(actual_temp_dir, f"shard_{s:03d}") if actual_temp_dir else None
-        mem_chunks = in_memory_shard_chunks[s] if not use_temp_files else None
-
-        cg_accum: Dict[str, List[np.ndarray]] = defaultdict(list)
-        ch_accum: Dict[str, List[np.ndarray]] = defaultdict(list)
-
-        if temp_s_dir and os.path.exists(temp_s_dir):
-            chunk_files = sorted(os.listdir(temp_s_dir))
-            for fn in chunk_files:
-                fp = os.path.join(temp_s_dir, fn)
-                with open(fp, "rb") as f:
-                    d = pickle.load(f)
-                for bc, arr in d.get("CG", {}).items():
-                    cg_accum[bc].append(arr)
-                for bc, arr in d.get("CH", {}).items():
-                    ch_accum[bc].append(arr)
-                del d
-            # Immediately purge temporary chunk files for this shard
-            shutil.rmtree(temp_s_dir, ignore_errors=True)
-        elif mem_chunks:
-            for d in mem_chunks:
-                for bc, arr in d.get("CG", {}).items():
-                    cg_accum[bc].append(arr)
-                for bc, arr in d.get("CH", {}).items():
-                    ch_accum[bc].append(arr)
-            in_memory_shard_chunks[s] = []
-
-        all_shard_bcs = sorted(set(cg_accum.keys()) | set(ch_accum.keys()))
-
-        with AmethystH5Writer(shard_paths[s], mode="w", compression=compression, compression_level=compression_level) as writer:
-            writer.write_metadata(version)
-            for bc in all_shard_bcs:
-                if bc in cg_accum:
-                    merged = cg_accum[bc][0] if len(cg_accum[bc]) == 1 else np.concatenate(cg_accum[bc])
-                    writer.create_cell_dataset("CG", bc, merged)
-                if bc in ch_accum:
-                    merged = ch_accum[bc][0] if len(ch_accum[bc]) == 1 else np.concatenate(ch_accum[bc])
-                    writer.create_cell_dataset("CH", bc, merged)
-
-        del cg_accum, ch_accum
-        gc.collect()
-        elapsed_s = time.time() - t0
-        logger.info(f"Shard {s:03d}/{effective_shards:03d} written to disk: {len(all_shard_bcs):,} cells in {elapsed_s:.2f}s -> {shard_paths[s]}")
+    n_cells = _flush_accum_to_h5(
+        shard_path, cg_accum, ch_accum, compression, compression_level, version
+    )
+    del cg_accum, ch_accum
+    gc.collect()
+    elapsed = time.time() - t0
+    logger.info(
+        f"Shard {shard_idx:03d} ({shard_idx + 1}/{n_shards}) written to disk: "
+        f"{n_cells:,} cells in {elapsed:.2f}s -> {shard_path}"
+    )
+    return shard_idx, n_cells, elapsed
 
 
 def extract_methylation_parallel(
@@ -426,11 +507,21 @@ def extract_methylation_parallel(
     ignore_overlaps: bool = True,
 ) -> Dict[str, Any]:
     """
-    Parallel single-cell TAPS methylation extractor with dedicated background writer thread.
+    Parallel single-cell TAPS methylation extractor.
 
     When n_shards > 1, writes shard_000.h5..shard_NNN.h5 and master.h5.
     When n_shards == 1, writes a single out_h5_path file.
+
+    Extraction runs to completion first. Shards are then assembled and written
+    by a RAM-capped thread pool (a writer holds one shard's arrays; extractors
+    are the RAM hog while they live).
     """
+    if compression not in ("gzip", "lzf", "none"):
+        raise ValueError(
+            f"Unsupported HDF5 compression {compression!r}. "
+            "Use 'gzip' (Amethyst/rhdf5 portable), 'lzf' (faster, needs rhdf5filters in R), or 'none'."
+        )
+
     whitelist: Optional[Set[str]] = None
     if whitelist_path:
         logger.info(f"Loading barcode whitelist from {whitelist_path}...")
@@ -470,7 +561,9 @@ def extract_methylation_parallel(
     )
     logger.info(
         f"Concurrency: {n_workers} worker processes × {decomp_threads} decompression thread(s) = "
-        f"{n_workers * decomp_threads + n_workers + 1} total execution threads."
+        f"{n_workers * decomp_threads + n_workers} extraction threads. "
+        f"HDF5 compression: {compression}"
+        f"{'' if compression != 'gzip' else f' (level {compression_level})'}."
     )
 
     worker_params = {
@@ -493,23 +586,9 @@ def extract_methylation_parallel(
         shard_filenames = [os.path.basename(out_h5_path)]
         shard_paths = [out_h5_path]
 
-    # Start dedicated background writer thread
-    write_queue: queue.Queue = queue.Queue(maxsize=32)
-    writer_thread = threading.Thread(
-        target=_dedicated_writer_worker,
-        args=(
-            write_queue,
-            out_h5_path,
-            effective_shards,
-            shard_paths,
-            actual_temp_dir,
-            use_temp_files,
-            compression,
-            compression_level,
-        ),
-        daemon=True,
-    )
-    writer_thread.start()
+    in_memory_shard_chunks: Dict[int, List[Tuple[int, Any]]] = {
+        s: [] for s in range(effective_shards)
+    }
 
     total_stats = {
         "CpG": {"c": 0, "t": 0},
@@ -540,8 +619,9 @@ def extract_methylation_parallel(
                     total_stats[k]["t"] += chunk_stats["stats"][k]["t"]
                 all_barcodes.update(chunk_stats["barcodes"])
 
-                # Forward completed chunk to dedicated writer thread in real-time
-                write_queue.put((chunk_id, shard_payload))
+                if not use_temp_files and shard_payload:
+                    for s in range(effective_shards):
+                        in_memory_shard_chunks[s].append((chunk_id, shard_payload[s]))
 
                 now = time.time()
                 if (chunks_completed % 10 == 0) or (now - last_log_time >= 15.0) or (chunks_completed == total_chunks):
@@ -567,12 +647,40 @@ def extract_methylation_parallel(
                     )
                     last_log_time = now
 
-        # Signal dedicated writer thread that extraction is complete
-        write_queue.put(None)
-        logger.info("Extraction pool finished. Finalizing shard writing in dedicated writer thread...")
-        writer_thread.join()
+        n_writers = _shard_writer_concurrency(
+            effective_shards,
+            use_temp_files=use_temp_files,
+            temp_dir=actual_temp_dir,
+        )
+        logger.info(
+            f"Extraction workers finished. Writing {effective_shards} shard(s) with "
+            f"{n_writers} writer(s) (sized from MemAvailable)."
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=n_writers,
+            thread_name_prefix="shard-write",
+        ) as writer_pool:
+            futs = []
+            for s in range(effective_shards):
+                temp_s_dir = (
+                    os.path.join(actual_temp_dir, f"shard_{s:03d}") if actual_temp_dir else None
+                )
+                mem_chunks = in_memory_shard_chunks[s] if not use_temp_files else None
+                futs.append(
+                    writer_pool.submit(
+                        _assemble_and_write_shard,
+                        s,
+                        effective_shards,
+                        shard_paths[s],
+                        temp_s_dir,
+                        mem_chunks,
+                        compression,
+                        compression_level,
+                    )
+                )
+            for f in concurrent.futures.as_completed(futs):
+                f.result()
 
-        # Generate master.h5 if sharded directory mode
         if effective_shards > 1:
             master_path = os.path.join(out_h5_path, "master.h5")
             with h5py.File(master_path, "w") as master_h5:

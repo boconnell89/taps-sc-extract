@@ -104,6 +104,17 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compression",
+        choices=["gzip", "lzf", "none"],
+        default="gzip",
+        help=(
+            "HDF5 dataset compression (default: gzip). "
+            "gzip is portable to Amethyst/rhdf5 with no extra R packages. "
+            "lzf writes much faster but R needs Bioconductor rhdf5filters. "
+            "none is fastest and produces the largest files."
+        ),
+    )
+    parser.add_argument(
         "--no-temp-file",
         action="store_true",
         help=(
@@ -190,6 +201,7 @@ def main(args: Optional[List[str]] = None) -> int:
             chunk_size_mb=parsed.chunk_size_mb,
             n_shards=parsed.shards,
             use_temp_files=not parsed.no_temp_file,
+            compression=parsed.compression,
             temp_dir=parsed.temp_dir,
             min_base_quality=parsed.min_baseq,
             min_mapq=parsed.min_mapq,

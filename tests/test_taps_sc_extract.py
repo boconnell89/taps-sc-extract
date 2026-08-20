@@ -324,3 +324,96 @@ def test_sharded_hdf5_writing(tmp_path):
         assert len(f["CH"]["cell_1"]["1"]) == 1
         assert f["CG"]["cell_1"]["1"][0]["pos"] == 100
 
+
+def _tiny_records(chrom: str, pos: int) -> np.ndarray:
+    return np.array([(chrom.encode("ascii"), pos, 50.0, 1, 1)], dtype=METH_DTYPE)
+
+
+def test_shard_writer_concurrency_after_extract():
+    from taps_sc_extract.parallel_extractor import _shard_writer_concurrency
+
+    assert _shard_writer_concurrency(1, use_temp_files=True) == 1
+    n_drain = _shard_writer_concurrency(16, use_temp_files=True)
+    assert 1 <= n_drain <= 16
+
+
+def test_assemble_and_write_shard_temp_file_order(tmp_path):
+    """Temp chunk files must be concatenated in chunk_id / filename order."""
+    import pickle
+    from taps_sc_extract.parallel_extractor import _assemble_and_write_shard
+
+    shard_dir = tmp_path / "shard_000"
+    shard_dir.mkdir()
+    # Write chunk 1 first on disk so directory iteration order is not the contract.
+    d1 = {"CG": {"cellA": _tiny_records("chr2", 200)}, "CH": {}}
+    d0 = {"CG": {"cellA": _tiny_records("chr1", 100)}, "CH": {}}
+    with open(shard_dir / "chunk_000001.bin", "wb") as f:
+        pickle.dump(d1, f)
+    with open(shard_dir / "chunk_000000.bin", "wb") as f:
+        pickle.dump(d0, f)
+
+    out_h5 = tmp_path / "shard_000.h5"
+    s_idx, n_cells, _elapsed = _assemble_and_write_shard(
+        shard_idx=0,
+        n_shards=1,
+        shard_path=str(out_h5),
+        temp_shard_dir=str(shard_dir),
+        in_memory_chunks=None,
+    )
+    assert s_idx == 0
+    assert n_cells == 1
+    with h5py.File(out_h5, "r") as h5:
+        pos = list(h5["CG"]["cellA"]["1"]["pos"])
+        chrom = [c.decode() for c in h5["CG"]["cellA"]["1"]["chr"]]
+        assert chrom == ["chr1", "chr2"]
+        assert pos == [100, 200]
+
+
+def test_assemble_and_write_shard_in_memory_ignores_completion_order(tmp_path):
+    """imap_unordered completion order must not scramble genomic order."""
+    from taps_sc_extract.parallel_extractor import _assemble_and_write_shard
+
+    d0 = {"CG": {"cellA": _tiny_records("chr1", 100)}, "CH": {}}
+    d1 = {"CG": {"cellA": _tiny_records("chr2", 200)}, "CH": {}}
+    # Reverse of genomic order, as imap_unordered can deliver.
+    mem = [(1, d1), (0, d0)]
+    out_h5 = tmp_path / "mem.h5"
+    _s, n_cells, _e = _assemble_and_write_shard(
+        shard_idx=0,
+        n_shards=1,
+        shard_path=str(out_h5),
+        temp_shard_dir=None,
+        in_memory_chunks=mem,
+    )
+    assert n_cells == 1
+    with h5py.File(out_h5, "r") as h5:
+        pos = list(h5["CG"]["cellA"]["1"]["pos"])
+        chrom = [c.decode() for c in h5["CG"]["cellA"]["1"]["chr"]]
+        assert chrom == ["chr1", "chr2"]
+        assert pos == [100, 200]
+
+
+def test_assemble_lzf_compression(tmp_path):
+    """lzf is a supported faster writer path; gzip remains the Amethyst default."""
+    import pickle
+    from taps_sc_extract.parallel_extractor import _assemble_and_write_shard
+
+    shard_dir = tmp_path / "shard_000"
+    shard_dir.mkdir()
+    d0 = {"CG": {"cellA": _tiny_records("chr1", 100)}, "CH": {}}
+    with open(shard_dir / "chunk_000000.bin", "wb") as f:
+        pickle.dump(d0, f)
+    out_h5 = tmp_path / "lzf.h5"
+    _assemble_and_write_shard(
+        shard_idx=0,
+        n_shards=1,
+        shard_path=str(out_h5),
+        temp_shard_dir=str(shard_dir),
+        in_memory_chunks=None,
+        compression="lzf",
+    )
+    with h5py.File(out_h5, "r") as h5:
+        ds = h5["CG"]["cellA"]["1"]
+        assert ds.compression == "lzf"
+        assert list(ds["pos"]) == [100]
+
