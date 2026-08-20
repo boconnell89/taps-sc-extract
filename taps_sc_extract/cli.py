@@ -166,6 +166,13 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 def main(args: Optional[List[str]] = None) -> int:
     parsed = parse_args(args)
     setup_logging(verbose=parsed.verbose, log_file=parsed.log_file)
+    logger = logging.getLogger("taps_sc_extract")
+
+    logger.info("=" * 70)
+    logger.info(f"taps-sc-extract v{__version__} - Single-Cell TAPS Extractor")
+    logger.info(f"Command line: {' '.join(sys.argv)}")
+    logger.info(f"Configuration: {vars(parsed)}")
+    logger.info("=" * 70)
 
     chroms_list = None
     if parsed.chroms:

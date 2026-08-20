@@ -401,7 +401,7 @@ def _dedicated_writer_worker(
         del cg_accum, ch_accum
         gc.collect()
         elapsed_s = time.time() - t0
-        logger.info(f"  -> Shard {s:03d} finalized: {len(all_shard_bcs):,} cells written in {elapsed_s:.2f}s ({shard_paths[s]})")
+        logger.info(f"Shard {s:03d}/{effective_shards:03d} written to disk: {len(all_shard_bcs):,} cells in {elapsed_s:.2f}s -> {shard_paths[s]}")
 
 
 def extract_methylation_parallel(
