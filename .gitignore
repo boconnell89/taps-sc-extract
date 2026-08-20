@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Testing & Linting
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and scratch files
+*.log
+scratch/
+tmp/
+
+# HDF5 output files (data files)
+*.h5
+*.hdf5
+sharded_output/
+
+# Sequencing / Reference datasets (store outside or keep untracked)
+*.bam
+*.bai
+*.fa
+*.fasta
+*.fai
+*.gz
+*.txt
+251107/
+260106_5base/
+260731/
+code/
+
+# IDE & Editor configs
+.vscode/
+.idea/
+.claude/
+.gemini/
+*.swp
+*.swo

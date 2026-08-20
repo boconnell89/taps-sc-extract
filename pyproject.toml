@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taps-sc-extract"
+version = "0.1.0"
+description = "Ultra-fast parallel single-cell TAPS DNA methylation extractor with Amethyst HDF5 output"
+readme = "README.md"
+authors = [
+    { name = "sciMET/TAPS Development Team" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "pysam>=0.20.0",
+    "h5py>=3.0.0",
+    "numpy>=1.20.0",
+]
+keywords = ["bioinformatics", "single-cell", "methylation", "taps", "epigenetics", "amethyst", "hdf5"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+taps-sc-extract = "taps_sc_extract.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["taps_sc_extract*"]

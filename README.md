@@ -1,0 +1,279 @@
+# taps-sc-extract
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+**`taps-sc-extract`** is a high-throughput, memory-bounded, parallel single-cell DNA methylation extraction tool designed for TAPS (TET-Assisted Pyridine Borane Sequencing / mC-to-T chemistry) coordinate-sorted BAM files.
+
+It outputs base-resolution methylation datasets directly into **Amethyst** (and Facet) compatible HDF5 formats (`/CG/<barcode>/1` and `/CH/<barcode>/1`), supporting both single monolithic HDF5 files and multi-file sharded directories with portable `master.h5` index files.
+
+---
+
+## Key Features
+
+- **Blistering Performance**: Processes **>5.5 million mapped reads/minute** (genome-wide mouse mm10 with 75M reads extracted in **~13.7 minutes** across 24 workers).
+- **Strictly Bounded RAM**: Disk-backed streaming mode keeps memory footprint to **< 500 MB RAM** regardless of cell count or genome size.
+- **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
+- **Single-Pass HDF5 Writer**: Bypasses HDF5 B-tree resizing overhead, writing tens of thousands of cell datasets in **seconds** rather than hours.
+- **Multi-File Sharded Directories**: Partitions cell barcodes across $N$ parallel shard files (`shard_000.h5`..`shard_NNN.h5`) and creates a portable `master.h5` with relative `ExternalLink` references.
+- **Native Amethyst Compatibility**: Output files can be loaded directly into R with `amethyst::createObject()` and `amethyst::indexChr()`.
+
+---
+
+## Installation
+
+### Using pip
+```bash
+git clone https://github.com/<your-org>/taps-sc-extract.git
+cd taps-sc-extract
+pip install -e .
+```
+
+### Using Conda / Mamba
+```bash
+mamba create -n taps_extract python=3.11 pysam h5py numpy pytest -y
+conda activate taps_extract
+pip install -e .
+```
+
+Verify the installation:
+```bash
+taps-sc-extract --help
+```
+
+---
+
+## Quickstart
+
+### 1. Standard Parallel Run (Single HDF5 File)
+```bash
+taps-sc-extract \
+  -b /path/to/aligned_taps.srt.bam \
+  -f /path/to/reference.fa \
+  -o all_cells.h5 \
+  -t 24 \
+  --chunk-size-mb 10 \
+  --log-file extraction.log
+```
+
+### 2. High-Throughput Sharded Output (Recommended for >50k Cells)
+```bash
+taps-sc-extract \
+  -b /path/to/aligned_taps.srt.bam \
+  -f /path/to/reference.fa \
+  -o /path/to/sharded_output/ \
+  -t 24 \
+  --shards 16 \
+  --log-file extraction.log
+```
+
+### 3. High-Memory Production Server (e.g. 720 GB RAM / 96 Cores)
+```bash
+taps-sc-extract \
+  -b /path/to/aligned_taps.srt.bam \
+  -f /path/to/reference.fa \
+  -o /path/to/sharded_output/ \
+  -t 64 \
+  --shards 16 \
+  --no-temp-file \
+  --log-file extraction.log
+```
+
+---
+
+## CLI Reference
+
+```
+usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
+                       [-t WORKERS] [--decomp-threads DECOMP_THREADS]
+                       [--chunk-size-mb CHUNK_SIZE_MB] [--shards SHARDS]
+                       [--no-temp-file] [--temp-dir TEMP_DIR]
+                       [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
+                       [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
+                       [--no-baq] [--no-overlap-clip] [-v] [--version]
+```
+
+### Argument Details
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-b, --bam` | `str` | *Required* | Path to coordinate-sorted, indexed BAM (`.bam` + `.bai`). |
+| `-f, --fasta` | `str` | *Required* | Path to reference FASTA (`.fa` + `.fai`). |
+| `-o, --out` | `str` | *Required* | Output `.h5` file path or output directory (when `--shards > 1`). |
+| `-c, --chroms` | `str` | `None` | Comma-separated contigs (e.g. `chr1,chr2` or `chr19`). Default: canonical autosomes + `chrX`, `chrY`. |
+| `-w, -a, --whitelist` | `str` | `None` | Path to optional barcode whitelist or cell annotation file. |
+| `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes. |
+| `--decomp-threads` | `int` | `1` | BAM BGZF decompression threads per worker process. |
+| `--chunk-size-mb` | `int` | `10` | Genomic window chunk size in megabases. |
+| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel. |
+| `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk. |
+| `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
+| `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
+| `--min-baseq` | `int` | `20` | Minimum base quality for pileup. |
+| `--min-mapq` | `int` | `0` | Minimum mapping quality for alignment filtering. |
+| `--max-depth` | `int` | `250` | Maximum pileup depth. |
+| `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
+| `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
+| `-v, --verbose` | `flag` | `False` | Enable verbose debug logging. |
+
+---
+
+## Performance Implications of Flags
+
+Understanding how each flag impacts CPU, memory, and I/O will help you optimize runs across different hardware profiles:
+
+### 1. `-t, --workers` (Process Parallelism)
+- **Mechanism**: Splits the genome into $N$ non-overlapping genomic windows and processes them concurrently across worker processes using `multiprocessing.Pool(context="spawn")`.
+- **Recommendation**: Set to $0.75 \times$ to $1.0 \times$ available physical CPU cores (e.g., `24` on a 32-core workstation; `64`–`80` on a 96-core server).
+- **Scaling**: Near-linear scaling up to 64 workers.
+
+### 2. `--decomp-threads` (BAM Decompression)
+- **Mechanism**: Allocates additional `htslib` background threads per worker process for BGZF block decompression.
+- **Recommendation**: Leave at `1` when using many worker processes (e.g. $\ge 16$ workers), as process-level parallelism already saturates CPU. Increase to `2`–`4` only when running with few workers ($\le 4$) on high-speed NVMe storage.
+
+### 3. `--chunk-size-mb` (Genomic Granularity & Load Balancing)
+- **Mechanism**: Defines the window size of each genomic chunk (default: `10` Mb $\to$ 286 chunks for mm10).
+- **Trade-offs**:
+  - **Smaller chunks (e.g., `5` Mb)**: Better load balancing across many workers; prevents workers from idling at the end of chromosomes.
+  - **Larger chunks (e.g., `20` Mb)**: Reduces chunk file count and IPC overhead; slightly higher memory usage per chunk.
+- **Recommendation**: `10` Mb is optimal for mammalian genomes (mm10 / hg38).
+
+### 4. `--shards` (Parallel HDF5 Writing & Scalability)
+- **Mechanism**: Partitions cell barcodes deterministically across $N$ shard files (`shard_000.h5`..`shard_NNN.h5`) using `hash(bc) % N` and creates `master.h5` with relative `ExternalLink` references.
+- **Benefits**:
+  - Eliminates single-file HDF5 write lock contention.
+  - Assembles and compresses all $N$ shards **concurrently** in parallel.
+  - Reduces individual file sizes for easier downstream parallelization in R/Amethyst.
+- **Recommendation**:
+  - $\le 10,000$ cells: `--shards 1` (single file) or `--shards 4`.
+  - $10,000$–$50,000$ cells: `--shards 8` or `--shards 16`.
+  - $> 100,000$ cells: `--shards 16` or `--shards 32`.
+
+### 5. `--no-temp-file` vs. Default Streaming Mode
+- **Default Mode (Disk-Streaming)**:
+  - Workers write compact binary chunk files to fast disk (`/tmp`) as each genomic window finishes.
+  - Each shard reads only its own chunk files in coordinate order and purges them immediately upon writing.
+  - **RAM Usage**: Strictly bounded to **< 500 MB RAM** regardless of worker count or cell count.
+  - **Recommendation**: Always use for workstations, desktops, and shared clusters (16–32 GB RAM).
+- **`--no-temp-file` (In-Memory Mode)**:
+  - Workers pass structured array dictionaries directly over IPC without writing to disk.
+  - **RAM Usage**: Accumulates in memory across all chunks (~10–20 GB for whole-genome mammalian datasets).
+  - **Recommendation**: Use on dedicated high-memory servers ($\ge 64$ GB RAM, 96 cores) to maximize I/O throughput.
+
+### 6. `--temp-dir` (Scratch Space Location)
+- **Mechanism**: Specifies the filesystem location where temporary chunk files are stored during extraction.
+- **Recommendation**: Point to a fast local NVMe SSD or memory-backed filesystem (e.g. `/tmp` or `/dev/shm`). Avoid slow network filesystems (NFS/Lustre) for temporary files.
+
+---
+
+## TAPS Chemistry & Calling Logic
+
+TAPS uses TET oxidation followed by pyridine borane reduction to convert methylated cytosines ($5\text{mC}$ and $5\text{hmC}$) into dihydrouracil ($\text{DHU}$), which is read by DNA polymerase as **Thymine ($\text{T}$)**. Unmethylated cytosines remain **Cytosine ($\text{C}$)**.
+
+$$\text{Methylated } 5\text{mC} / 5\text{hmC} \xrightarrow{\text{TAPS}} \text{T}$$
+$$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
+
+### Strand & Base Interpretation
+
+| Alignment Strand | Reference Base | Read Base | Interpretation | Methylation State |
+| :--- | :---: | :---: | :---: | :---: |
+| **OT** (Original Top, Strand `+`) | `C` | `T` | Modified ($5\text{mC}/5\text{hmC}$) | **Methylated** (`c += 1`) |
+| **OT** (Original Top, Strand `+`) | `C` | `C` | Unmodified ($\text{C}$) | **Unmethylated** (`t += 1`) |
+| **OB** (Original Bottom, Strand `-`) | `G` | `A` | Modified ($5\text{mC}/5\text{hmC}$) | **Methylated** (`c += 1`) |
+| **OB** (Original Bottom, Strand `-`) | `G` | `G` | Unmodified ($\text{C}$) | **Unmethylated** (`t += 1`) |
+
+*Note: In the Amethyst HDF5 output schema, `t` stores unmethylated counts and `c` stores methylated counts.*
+
+---
+
+## HDF5 Output Structure & Schema
+
+The output HDF5 matches the Amethyst 1.0+ / Facet specification:
+
+```
+all_cells.h5 (or master.h5)
+├── metadata/
+│   └── version = "amethyst2.0.0"
+├── CG/
+│   ├── <barcode_1>/
+│   │   └── 1  (Dataset: structured array)
+│   └── <barcode_2>/
+│       └── 1  (Dataset: structured array)
+└── CH/
+    ├── <barcode_1>/
+    │   └── 1  (Dataset: structured array)
+    └── <barcode_2>/
+        └── 1  (Dataset: structured array)
+```
+
+### Dataset Dtype Specification
+Each `/1` dataset is a coordinate-sorted NumPy structured array with dtype:
+```python
+dtype = [
+    ('chr', 'S10'),   # Chromosome name (ASCII bytes, e.g. b'chr1')
+    ('pos', '<i8'),   # 1-based genomic coordinate
+    ('pct', '<f8'),   # Methylation percentage: 100.0 * c / (c + t)
+    ('t',   '<i8'),   # Unmethylated read count
+    ('c',   '<i8'),   # Methylated read count
+]
+```
+
+---
+
+## Amethyst R Integration Guide
+
+### Loading a Single HDF5 File
+```R
+library(amethyst)
+library(rhdf5)
+
+h5_path <- "all_cells.h5"
+
+# List barcodes under /CG
+ls_df <- h5ls(h5_path)
+barcodes <- ls_df$name[ls_df$group == "/CG"]
+
+# Create Amethyst object
+h5_paths <- data.frame(path = h5_path, barcode = barcodes)
+obj <- createObject(h5paths = h5_paths)
+
+# Index chromosomes
+obj_cg <- indexChr(obj, "CG")
+obj_ch <- indexChr(obj, "CH")
+```
+
+### Loading a Sharded Directory (`master.h5`)
+```R
+library(amethyst)
+library(rhdf5)
+
+master_path <- "sharded_output/master.h5"
+
+# List barcodes from master index
+ls_df <- h5ls(master_path)
+barcodes <- ls_df$name[ls_df$group == "/CG"]
+
+# Create Amethyst object pointing to master.h5
+h5_paths <- data.frame(path = master_path, barcode = barcodes)
+obj <- createObject(h5paths = h5_paths)
+
+# Index chromosomes (resolves all external links transparently)
+obj_cg <- indexChr(obj, "CG")
+obj_ch <- indexChr(obj, "CH")
+```
+
+---
+
+## Running Tests
+
+Run the test suite with `pytest`:
+
+```bash
+pytest tests/ -v
+```
+
+---
+
+## License
+
+MIT License. Copyright (c) 2026 sciMET/TAPS Development Team.
