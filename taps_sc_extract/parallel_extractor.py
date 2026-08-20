@@ -489,27 +489,22 @@ def extract_methylation_parallel(
             shard_filenames = [os.path.basename(out_h5_path)]
             shard_paths = [out_h5_path]
 
-        # Execute shard assembly and writing concurrently across threads
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(effective_shards, 16)) as executor:
-            futures = []
-            for s in range(effective_shards):
-                temp_s_dir = os.path.join(actual_temp_dir, f"shard_{s:03d}") if actual_temp_dir else None
-                mem_chunks = in_memory_shard_chunks[s] if not use_temp_files else None
-                futures.append(
-                    executor.submit(
-                        _assemble_and_write_shard,
-                        s,
-                        shard_paths[s],
-                        temp_s_dir,
-                        mem_chunks,
-                        compression=compression,
-                        compression_level=compression_level,
-                    )
-                )
-
-            for f in concurrent.futures.as_completed(futures):
-                s_idx, n_cells, elapsed_s = f.result()
-                logger.info(f"  -> Shard {s_idx:03d} finished: {n_cells:,} cells written in {elapsed_s:.2f}s ({shard_paths[s_idx]})")
+        # Execute shard assembly and writing sequentially to keep RAM strictly bounded (<100 MB)
+        for s in range(effective_shards):
+            temp_s_dir = os.path.join(actual_temp_dir, f"shard_{s:03d}") if actual_temp_dir else None
+            mem_chunks = in_memory_shard_chunks[s] if not use_temp_files else None
+            s_idx, n_cells, elapsed_s = _assemble_and_write_shard(
+                shard_idx=s,
+                shard_path=shard_paths[s],
+                temp_shard_dir=temp_s_dir,
+                in_memory_chunks=mem_chunks,
+                compression=compression,
+                compression_level=compression_level,
+            )
+            logger.info(f"  -> Shard {s_idx:03d} finished: {n_cells:,} cells written in {elapsed_s:.2f}s ({shard_paths[s_idx]})")
+            if not use_temp_files:
+                in_memory_shard_chunks[s] = []
+            gc.collect()
 
         # Generate master.h5 if sharded directory mode
         if effective_shards > 1:
