@@ -10,7 +10,7 @@ readme = "README.md"
 authors = [
     { name = "sciMET/TAPS Development Team" }
 ]
-license = { text = "MIT" }
+license = { text = "CC-BY-NC-4.0" }
 requires-python = ">=3.9"
 dependencies = [
     "pysam>=0.20.0",
