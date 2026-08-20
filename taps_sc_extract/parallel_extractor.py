@@ -47,9 +47,50 @@ logger = logging.getLogger("taps_sc_extract")
 CANONICAL_CONTIGS = [f"chr{i}" for i in range(1, 20)] + ["chrX", "chrY"]
 
 
-def get_peak_rss_mb() -> float:
-    """Return peak resident set size in megabytes."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+
+def get_process_tree_rss_mb() -> float:
+    """
+    Return the total sum of Resident Set Size (RSS) across the main process
+    and ALL child worker processes / threads in megabytes by inspecting /proc.
+    """
+    try:
+        my_pid = os.getpid()
+        ppid_map: Dict[int, int] = {}
+        rss_map: Dict[int, int] = {}
+
+        for entry in os.listdir("/proc"):
+            if entry.isdigit():
+                pid = int(entry)
+                try:
+                    with open(f"/proc/{pid}/stat", "r") as f:
+                        stat = f.read()
+                    rparen = stat.rfind(")")
+                    fields = stat[rparen + 2:].split()
+                    ppid = int(fields[1])
+                    ppid_map[pid] = ppid
+
+                    with open(f"/proc/{pid}/statm", "r") as f:
+                        statm = f.read().split()
+                    rss_pages = int(statm[1])
+                    rss_map[pid] = rss_pages * PAGE_SIZE
+                except (IOError, IndexError, ValueError, PermissionError):
+                    continue
+
+        descendants = {my_pid}
+        changed = True
+        while changed:
+            changed = False
+            for pid, ppid in ppid_map.items():
+                if ppid in descendants and pid not in descendants:
+                    descendants.add(pid)
+                    changed = True
+
+        total_bytes = sum(rss_map.get(pid, 0) for pid in descendants)
+        return total_bytes / (1024.0 * 1024.0)
+    except Exception:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
 def _barcode_to_shard(bc: str, n_shards: int) -> int:
@@ -481,6 +522,7 @@ def extract_methylation_parallel(
     start_total_time = time.time()
     last_log_time = start_total_time
     chunks_completed = 0
+    peak_tree_rss = get_process_tree_rss_mb()
 
     try:
         ctx = mp.get_context("spawn")
@@ -504,7 +546,8 @@ def extract_methylation_parallel(
                 now = time.time()
                 if (chunks_completed % 10 == 0) or (now - last_log_time >= 15.0) or (chunks_completed == total_chunks):
                     elapsed = now - start_total_time
-                    peak_rss = get_peak_rss_mb()
+                    cur_tree_rss = get_process_tree_rss_mb()
+                    peak_tree_rss = max(peak_tree_rss, cur_tree_rss)
                     pct_done = 100.0 * chunks_completed / total_chunks
                     chunk_rate = (chunks_completed / elapsed * 60.0) if elapsed > 0 else 0.0
                     eta_min = (((total_chunks - chunks_completed) / (chunks_completed / elapsed)) / 60.0) if chunks_completed > 0 else 0.0
@@ -519,7 +562,8 @@ def extract_methylation_parallel(
                     logger.info(
                         f"Extraction: [{chunks_completed:3d}/{total_chunks} chunks | {pct_done:5.1f}%] | "
                         f"Rate: {chunk_rate:4.1f} chk/min | Elapsed: {elapsed:5.1f}s | ETA: {eta_min:4.1f}m | "
-                        f"Cells: {len(all_barcodes):,} | CG: {cg_pct:.1f}% | CH: {ch_pct:.2f}% | RSS: {peak_rss:.0f} MB"
+                        f"Cells: {len(all_barcodes):,} | CG: {cg_pct:.1f}% | CH: {ch_pct:.2f}% | "
+                        f"Tree RAM: {cur_tree_rss:.0f} MB (Peak: {peak_tree_rss:.0f} MB)"
                     )
                     last_log_time = now
 
@@ -570,7 +614,7 @@ def extract_methylation_parallel(
 
     reads_per_min = (total_target_reads / (total_elapsed / 60.0)) if total_elapsed > 0 else 0.0
     cells_per_min = (len(all_barcodes) / (total_elapsed / 60.0)) if total_elapsed > 0 else 0.0
-    final_peak_rss = get_peak_rss_mb()
+    final_peak_rss = peak_tree_rss
 
     summary = {
         "total_elapsed_sec": total_elapsed,
