@@ -24,7 +24,7 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 
 ### Using pip
 ```bash
-git clone https://github.com/<your-org>/taps-sc-extract.git
+git clone https://github.com/boconnell89/taps-sc-extract.git
 cd taps-sc-extract
 pip install -e .
 ```
