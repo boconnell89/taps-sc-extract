@@ -35,7 +35,12 @@ import pysam
 from .barcode import parse_annot
 from .calling import MCTOT_LOOKUP, FLAG_STRAND_MAP
 from .fasta import FastFaiReader
-from .h5_writer import AmethystH5Writer, METH_DTYPE
+from .h5_writer import (
+    AmethystH5Writer,
+    METH_DTYPE,
+    SUPPORTED_COMPRESSION,
+    configure_blosc_threads,
+)
 
 # Disable HDF5 file locking
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
@@ -398,7 +403,8 @@ def _shard_writer_concurrency(
     budget_mb = max(0.0, avail_mb - headroom_mb)
     n = int(budget_mb // per_writer_mb) if per_writer_mb > 0 else 1
     n = max(1, n)
-    return min(n, n_shards, 16)
+    # Cap at 6 writers to avoid disk I/O queue depth contention while fully parallelizing compression
+    return min(n, n_shards, 6)
 
 
 def _merge_chunk_dict(
@@ -499,6 +505,7 @@ def extract_methylation_parallel(
     temp_dir: Optional[str] = None,
     compression: str = "gzip",
     compression_level: int = 1,
+    compression_threads: Optional[int] = None,
     min_base_quality: int = 20,
     min_mapq: int = 0,
     max_depth: int = 250,
@@ -516,10 +523,10 @@ def extract_methylation_parallel(
     by a RAM-capped thread pool (a writer holds one shard's arrays; extractors
     are the RAM hog while they live).
     """
-    if compression not in ("gzip", "lzf", "none"):
+    if compression not in SUPPORTED_COMPRESSION:
         raise ValueError(
             f"Unsupported HDF5 compression {compression!r}. "
-            "Use 'gzip' (Amethyst/rhdf5 portable), 'lzf' (faster, needs rhdf5filters in R), or 'none'."
+            f"Use one of: {', '.join(SUPPORTED_COMPRESSION)}."
         )
 
     whitelist: Optional[Set[str]] = None
@@ -563,7 +570,7 @@ def extract_methylation_parallel(
         f"Concurrency: {n_workers} worker processes × {decomp_threads} decompression thread(s) = "
         f"{n_workers * decomp_threads + n_workers} extraction threads. "
         f"HDF5 compression: {compression}"
-        f"{'' if compression != 'gzip' else f' (level {compression_level})'}."
+        f"{f' (level {compression_level})' if compression in ('gzip', 'blosc', 'blosc-zstd') else ''}."
     )
 
     worker_params = {
@@ -652,9 +659,15 @@ def extract_methylation_parallel(
             use_temp_files=use_temp_files,
             temp_dir=actual_temp_dir,
         )
+        n_blosc = configure_blosc_threads(n_writers, compression, compression_threads)
+        blosc_note = (
+            f"; BLOSC_NTHREADS={n_blosc} (cpus/{n_writers} writers)"
+            if n_blosc is not None
+            else ""
+        )
         logger.info(
             f"Extraction workers finished. Writing {effective_shards} shard(s) with "
-            f"{n_writers} writer(s) (sized from MemAvailable)."
+            f"{n_writers} writer(s) (sized from MemAvailable){blosc_note}."
         )
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=n_writers,
