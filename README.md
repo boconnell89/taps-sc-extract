@@ -164,10 +164,12 @@ Understanding how each flag impacts CPU, memory, and I/O will help you optimize 
 
 ### 5. `--max-writer-threads` (Shard Writer Concurrency & Storage Optimization)
 - **Mechanism**: Controls the maximum number of parallel worker threads that assemble, compress, and write shard HDF5 files after chunk extraction finishes.
+- **Why it matters for large genomes**: On whole-genome mammalian datasets (>1 billion calls across 16 shards), gzip compression in the writer phase can become the dominant bottleneck. Increasing `--max-writer-threads` from 6 to 16 on high-core NVMe systems allows all shards to compress concurrently, cutting shard assembly time from ~3.5 minutes down to ~1 minute.
 - **Recommended Defaults by Storage Type**:
-  - **Local Fast NVMe / PCIe SSD**: `--max-writer-threads 6` *(Default)* &mdash; Maximizes parallel CPU compression throughput while avoiding disk queue saturation.
+  - **Local Fast NVMe / PCIe SSD with $\ge 32$ GB RAM**: `--max-writer-threads 8` to `16` &mdash; Compresses all shards simultaneously for maximum throughput.
+  - **Standard Workstations (Default)**: `--max-writer-threads 6` &mdash; Safe balance between parallel CPU compression and disk I/O queue depth.
   - **Network File Systems (NFS / Lustre / GPFS / SMB)**: `--max-writer-threads 2` to `4` &mdash; Minimizes concurrent metadata and lock contention across shared storage nodes.
-  - **Spinning Disk (HDD) or Memory-Constrained Systems**: `--max-writer-threads 1` &mdash; Strict single-thread sequential writing with zero seek contention and <100 MB active RAM.
+  - **Spinning Disk (HDD) or Memory-Constrained Systems**: `--max-writer-threads 1` &mdash; Strict single-thread sequential writing with zero seek contention and minimal RAM.
 
 ### 6. `--no-temp-file` vs. Default Streaming Mode
 - **Default Mode (Disk-Streaming)**:

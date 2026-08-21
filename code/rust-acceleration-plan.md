@@ -217,7 +217,11 @@ taps_sc_extract/             # unchanged Python reference engine
 | 6 | HDF5 + shards + master.h5, writer cap 6 | **Done:** hdf5-metno, gzip/none, ExternalLinks, cap 6. Amethyst verified on chr19. |
 | 7 | Auto-tune + new flags + CLI parity | **Done:** Whitelist ⇒ cell count; `--max-memory-gb`; dynamic `--memory-mode auto`; `open_bam` decompression thread setting. |
 | 8 | Perf harness + `--engine python\|rust` | **Done:** Transparent `--engine auto|rust|python` delegation in Python CLI, `scripts/benchmark_ab.py`, git tag `python-baseline-20260820`. |
-| 9 | Optional PyO3 wrap | Follow-on extension (CLI binary delegation is shipped and default in Python CLI). |
+| 9 | Optional PyO3 wrap | **Post-v1 / Optional:** Binary CLI delegation (`--engine auto|rust`) is shipped and default in `taps_sc_extract.cli`. PyO3 extension crate is optional for future in-process Python API without disk serialization. |
+
+### Future Optimization: Shard Writer Concurrency & Amdahl's Law
+- **Observation**: On full-genome mm10, genomic extraction finished in **~120 seconds** (3.83× speedup over Python), but gzip compression across 16 shards capped at 6 threads took **~220 seconds** (65% of total runtime).
+- **Optimization Note**: On fast local NVMe SSDs or systems with $\ge 32$ GB RAM, scaling `--max-writer-threads` to match shard count (e.g. `--max-writer-threads 16`) will compress all shards in parallel, reducing shard write time to ~80s and bringing full-genome runtime to ~3.3 minutes. Alternatively, multithreaded Blosc compression can compress large shards in parallel.
 
 ## Non-goals (v1)
 
