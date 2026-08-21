@@ -11,9 +11,10 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 
 ## Key Features
 
-- **Blistering Performance**: Processes **>5.89 million mapped reads/minute (98,300+ reads/s)** (genome-wide mouse mm10 with 75M reads extracted in **~12.7 minutes** across 24 workers).
+- **Blistering Performance**: Rust acceleration core processes **>15.4 million mapped reads/minute (256,400+ reads/s)** (genome-wide mouse mm10 with 75M reads and 1.11B base calls extracted in **~4.86 minutes** across 24 workers, **2.61× faster** than the multiprocessing Python reference engine).
 - **Predictable, Bounded Memory**: Process-tree memory tracks accurately via `/proc` and plateaus at steady state (~700 MB / worker, ~18 GB total across 24 workers) regardless of genome length.
-- **I/O-Optimized Shard Writer Pool**: Dynamically sizes and caps writer concurrency (up to 6 parallel threads) to saturate CPU compression without clogging disk queue depth.
+- **Auto-Scaled Shard Writer Pool**: Dynamically sizes writer concurrency (`--max-writer-threads 0` auto) to compress all output shards concurrently without bottlenecking disk queue depth.
+- **High-Speed HDF5 Compression Options**: Supports `gzip` (level 1 deflate, 100% portable), `gzip-shuffle` (byte shuffling + level 1 deflate, 25.5× compression ratio), `lzf` (near raw write speed with 87% size reduction), `blosc` (multithreaded LZ4), `blosc-zstd`, and uncompressed `none`.
 - **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
 - **Single-Pass HDF5 Writer**: Bypasses HDF5 B-tree resizing overhead, writing tens of thousands of cell datasets in **seconds** rather than hours.
 - **Multi-File Sharded Directories**: Partitions cell barcodes across $N$ parallel shard files (`shard_000.h5`..`shard_NNN.h5`) and creates a portable `master.h5` with relative `ExternalLink` references.
@@ -46,7 +47,7 @@ taps-sc-extract --help
 
 ## Quickstart
 
-### 1. Standard Parallel Run (Single HDF5 File)
+### 1. Standard Parallel Run (Auto Engine: Uses Compiled Rust Core)
 ```bash
 taps-sc-extract \
   -b /path/to/aligned_taps.srt.bam \
@@ -57,7 +58,7 @@ taps-sc-extract \
   --log-file extraction.log
 ```
 
-### 2. High-Throughput Sharded Output (Recommended for >50k Cells)
+### 2. High-Throughput Sharded Output (Recommended for >10k Cells)
 ```bash
 taps-sc-extract \
   -b /path/to/aligned_taps.srt.bam \
@@ -68,15 +69,15 @@ taps-sc-extract \
   --log-file extraction.log
 ```
 
-### 3. High-Memory Production Server (e.g. 720 GB RAM / 96 Cores)
+### 3. Maximum Speed Run with LZF or Raw Writing
 ```bash
 taps-sc-extract \
   -b /path/to/aligned_taps.srt.bam \
   -f /path/to/reference.fa \
   -o /path/to/sharded_output/ \
-  -t 64 \
+  -t 24 \
   --shards 16 \
-  --no-temp-file \
+  --compression lzf \
   --log-file extraction.log
 ```
 
@@ -86,8 +87,12 @@ taps-sc-extract \
 
 ```
 usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
+                       [--engine {auto,rust,python}] [--memory-mode {auto,stream,memory}]
+                       [--max-memory-gb MAX_MEMORY_GB] [--expected-cells EXPECTED_CELLS]
                        [-t WORKERS] [--decomp-threads DECOMP_THREADS]
                        [--chunk-size-mb CHUNK_SIZE_MB] [--shards SHARDS]
+                       [--compression {gzip,gzip-shuffle,gzip6,lzf,blosc,blosc-zstd,none}]
+                       [--max-writer-threads MAX_WRITER_THREADS]
                        [--no-temp-file] [--temp-dir TEMP_DIR]
                        [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
@@ -108,10 +113,11 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--max-memory-gb` | `float` | `None` | Optional RAM budget in GB (default: 0.6 × available memory). |
 | `--expected-cells` | `int` | `None` | Optional cell count (auto-detected from `-w/--whitelist` cardinality if omitted). |
 | `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes (or Rayon threads in Rust). `0` = auto. |
-| `--decomp-threads` | `int` | `1` | BAM BGZF decompression threads per worker process (`0` for synchronous reading). |
+| `--decomp-threads` | `int` | `0` | BAM BGZF decompression threads per worker process (`0` for synchronous reading). |
 | `--chunk-size-mb` | `int` | `10` | Genomic window chunk size in megabases. |
 | `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). |
-| `--max-writer-threads` | `int` | `6` | Maximum parallel shard-writer threads after extraction. Suggested: 6 for NVMe/SSD, 2–4 for HDD/NFS, 1 for sequential. |
+| `--compression` | `str` | `gzip` | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc`, `blosc-zstd`, `none`. |
+| `--max-writer-threads` | `int` | `0` | Maximum parallel shard-writer threads after extraction (`0` = auto-scales up to shard count). |
 | `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk (equivalent to `--memory-mode memory`). |
 | `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
 | `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
@@ -124,14 +130,28 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 ---
 
-## Performance Implications of Flags
+## Performance Benchmark & Flags Guide
 
-Understanding how each flag impacts CPU, memory, and I/O will help you optimize runs across different hardware profiles:
+### Whole-Genome mm10 Performance Comparison (74.9M Reads, 1.11 Billion Calls)
 
-### 1. `--engine` (Backend Acceleration)
-- **`auto` (Default)**: Automatically detects and executes the high-performance `taps-sc-extract-rs` Rust binary if installed or built; falls back to Python reference engine otherwise.
-- **`rust`**: Runs the Rayon-parallelized, `mimalloc` + `FxHashMap` accelerated Rust core (**~2.6× faster wall time, 56% lower peak RAM**).
-- **`python`**: Runs the multiprocessing Python reference implementation.
+| Engine / Mode | Wall Time | Elapsed Job Time | Extraction Throughput | Peak RAM | Call Parity |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Python Reference Engine** | 12.70 min (762 s) | 12.70 min | 98.3k reads/s | 18.1 GB | 7,355 cells |
+| **Rust Acceleration Core** | **5.00 min (300 s)** | **4.86 min (292 s)** | **256.4k reads/s** | **31.5 GB** | **100% Match (7,355 cells)** |
+| **Speedup** | **2.54× faster** | **2.61× faster** | **2.61× faster** | Bounded | Exact Bitwise Match |
+
+---
+
+### Compression Algorithm Trade-Offs (`--compression`)
+
+| Algorithm | Extraction + Write Time (`chr1–3`) | Shard Output Size | Compression Ratio | R / Bioconductor Requirements |
+| :--- | :---: | :---: | :---: | :--- |
+| **`none`** | **46.47 s** | 11.0 GB | 1.0× | Native `rhdf5` (No plugins needed) |
+| **`lzf`** | **47.88 s** *(Fastest Compressed)* | 1.4 GB | **7.8×** | `library(rhdf5filters)` |
+| **`blosc`** (LZ4) | **62.82 s** | 532 MB | **20.7×** | `library(rhdf5filters)` |
+| **`gzip`** *(Default)* | **66.53 s** | 728 MB | **15.1×** | **Native `rhdf5` (Zero extra packages)** |
+| **`gzip-shuffle`** | **76.79 s** | 431 MB | **25.5×** | Native `rhdf5` |
+| **`blosc-zstd`** | **74.71 s** | **385 MB** *(Smallest)* | **28.6×** | `library(rhdf5filters)` |
 
 ### 2. `-t, --workers` (Parallel Worker Threads/Processes)
 - **Mechanism**: Splits the genome into $N$ non-overlapping genomic windows and processes them concurrently.

@@ -9,7 +9,7 @@
 `taps-sc-extract` is a high-performance Python package and CLI tool for extracting single-cell DNA methylation from TAPS (mC-to-T chemistry) coordinate-sorted BAM files. It writes base-resolution methylation calls into **Amethyst-compatible HDF5 files** (`/CG/<barcode>/1` and `/CH/<barcode>/1`).
 
 ### Target Scale
-- **Workstations**: 32 cores, 32 GB RAM (processes ~75M mapped reads across mm10 in **~12.7 minutes** with **~18 GB peak total process-tree RAM** across 24 workers).
+- **Workstations**: 32 cores, 32 GB RAM (processes ~75M mapped reads and 1.11B calls across mm10 in **~4.86 minutes** with **~18 GB peak total process-tree RAM** across 24 workers in Rust; ~12.7 minutes in Python reference engine).
 - **Production Servers**: 96 cores, 720 GB RAM (scales to >200k cells and >1B reads).
 
 ---
@@ -41,7 +41,7 @@ taps-sc-extract/
 │       ├── extract.rs          # Column-wise bam_mplp samtools-style pileup & BAQ
 │       ├── parallel.rs         # Rayon thread pool & cancellation tokens
 │       ├── accumulate.rs       # Barcode intern & FxHashMap cell position maps
-│       ├── h5_out.rs           # Amethyst structured array HDF5 generator & master.h5
+│       ├── h5_out.rs           # Amethyst structured array HDF5 generator & master.h5 (Blosc, LZF, Gzip)
 │       ├── shard_io.rs         # Compact binary intermediate chunk partition files
 │       └── autotune.rs         # Hardware & memory budget auto-tuning heuristics
 └── tests/
@@ -69,7 +69,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 ### D. Memory Bounding & Shard Writer Concurrency
 - **Accurate Process-Tree Accounting**: Memory is monitored across the entire process tree (`/proc/<pid>/statm` or `sys_info`).
 - **Disk-Streaming vs. Memory Mode**: In `stream` mode (default), intermediate chunks are partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin` and purged on write. In `memory` mode, maps are kept in RAM.
-- **Capped Shard Writer Pool**: Sized from memory budget and capped at **6 parallel threads** by default (`--max-writer-threads 6`) to prevent disk I/O queue depth bottlenecks while maximizing parallel compression.
+- **Auto-Scaled Shard Writer Pool**: Sized from memory budget and shard count (`--max-writer-threads 0` auto) to compress all output shards concurrently without bottlenecking disk queue depth.
 
 ### E. TAPS Chemistry & Amethyst Schema
 - **TAPS Calling Logic**:
