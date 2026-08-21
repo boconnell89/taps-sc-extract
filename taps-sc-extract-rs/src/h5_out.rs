@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use hdf5_metno::types::FixedAscii;
 use hdf5_metno::{File, H5Type};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 pub const AMETHYST_VERSION: &str = "amethyst2.0.0";
@@ -110,8 +110,8 @@ fn write_cell_dataset(
 }
 
 /// Concatenate window chunks (already in chunk_id order) into Amethyst records.
-pub fn records_from_chunks(chunks: &[ChunkFile]) -> HashMap<String, (Vec<MethRec>, Vec<MethRec>)> {
-    let mut out: HashMap<String, (Vec<MethRec>, Vec<MethRec>)> = HashMap::new();
+pub fn records_from_chunks(chunks: &[ChunkFile]) -> FxHashMap<String, (Vec<MethRec>, Vec<MethRec>)> {
+    let mut out: FxHashMap<String, (Vec<MethRec>, Vec<MethRec>)> = FxHashMap::default();
     for ch in chunks {
         for cell in &ch.cells {
             let e = out.entry(cell.barcode.clone()).or_default();
@@ -132,7 +132,7 @@ pub fn records_from_chunks(chunks: &[ChunkFile]) -> HashMap<String, (Vec<MethRec
 
 pub fn write_shard_file(
     path: &Path,
-    cells: &HashMap<String, (Vec<MethRec>, Vec<MethRec>)>,
+    cells: &FxHashMap<String, (Vec<MethRec>, Vec<MethRec>)>,
     compression: H5Compression,
 ) -> Result<usize> {
     if let Some(parent) = path.parent() {

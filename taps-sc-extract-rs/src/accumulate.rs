@@ -5,11 +5,11 @@
 
 use crate::barcode::barcode_from_qname_bytes;
 use crate::context::Context;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct BarcodeIntern {
-    to_id: HashMap<Vec<u8>, u32>,
+    to_id: FxHashMap<Vec<u8>, u32>,
     names: Vec<String>,
 }
 
@@ -52,8 +52,8 @@ impl BarcodeIntern {
 /// Per-cell CG/CH maps: 1-based pos → (t unmethylated, c methylated).
 #[derive(Clone, Debug, Default)]
 pub struct CellMaps {
-    pub cg: HashMap<u32, (u32, u32)>,
-    pub ch: HashMap<u32, (u32, u32)>,
+    pub cg: FxHashMap<u32, (u32, u32)>,
+    pub ch: FxHashMap<u32, (u32, u32)>,
 }
 
 impl CellMaps {

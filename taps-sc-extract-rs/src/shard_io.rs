@@ -46,7 +46,9 @@ fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
-fn write_sites<W: Write>(w: &mut W, map: &std::collections::HashMap<u32, (u32, u32)>) -> std::io::Result<()> {
+use rustc_hash::FxHashMap;
+
+fn write_sites<W: Write>(w: &mut W, map: &FxHashMap<u32, (u32, u32)>) -> std::io::Result<()> {
     let mut items: Vec<(u32, u32, u32)> = map.iter().map(|(&p, &(t, c))| (p, t, c)).collect();
     items.sort_unstable_by_key(|x| x.0);
     write_u32(w, items.len() as u32)?;
