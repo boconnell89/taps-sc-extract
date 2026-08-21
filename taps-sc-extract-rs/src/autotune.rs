@@ -118,6 +118,25 @@ pub fn resolve_memory_mode(
     }
 }
 
+/// Resolve shard-writer thread pool concurrency (0 = auto).
+/// Auto sizes up to min(n_shards, nproc, floor(budget_gb / 1.5), 32).
+pub fn resolve_writer_threads(
+    cli_threads: usize,
+    n_shards: usize,
+    budget_gb: f64,
+) -> (usize, &'static str) {
+    if cli_threads > 0 {
+        (cli_threads, "explicit")
+    } else {
+        let nproc = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let mem_cap = (budget_gb / 1.5).floor() as usize;
+        let writers = n_shards.min(nproc).min(mem_cap).clamp(1, 32);
+        (writers, "auto")
+    }
+}
+
 pub fn shard_writer_concurrency(n_shards: usize) -> usize {
     n_shards.max(1).min(MAX_SHARD_WRITERS)
 }

@@ -129,7 +129,8 @@ enum Commands {
         expected_cells: Option<usize>,
         #[arg(long, default_value = "gzip")]
         compression: String,
-        #[arg(long, default_value_t = 6)]
+        /// Maximum parallel shard-writer threads (0 = auto sized from shards, cores, RAM).
+        #[arg(long, default_value_t = 0)]
         max_writer_threads: usize,
         #[arg(long, default_value_t = 20)]
         min_baseq: u8,
@@ -306,7 +307,7 @@ fn main() -> Result<()> {
                 None => None,
             };
 
-            // PR7 Auto-tuning
+            // PR7 Auto-tuning & Phase 1 Writer Auto-scaling
             let (budget_gb, budget_src) = autotune::system_memory_budget_gb(max_memory_gb);
             let cell_source = autotune::CellCountSource::resolve(
                 expected_cells,
@@ -316,6 +317,7 @@ fn main() -> Result<()> {
             let (n_workers, workers_src) = autotune::resolve_workers_with_budget(workers, budget_gb);
             let decomp = decomp_threads.unwrap_or_else(|| autotune::default_decomp_threads(n_workers));
             let (n_shards, shards_src) = autotune::resolve_shards(shards, cell_source.count());
+            let (writer_threads, writer_src) = autotune::resolve_writer_threads(max_writer_threads, n_shards, budget_gb);
             let total_genome_mb = windows.len() as u64 * u64::from(chunk_size_mb);
             let (resolved_memory_mode, mode_src) = autotune::resolve_memory_mode(
                 &memory_mode,
@@ -342,6 +344,7 @@ fn main() -> Result<()> {
             eprintln!("  Workers:         {} ({})", n_workers, workers_src);
             eprintln!("  Decomp threads:  {} per worker", decomp);
             eprintln!("  Shards:          {} ({})", n_shards, shards_src);
+            eprintln!("  Writer threads:  {} ({})", writer_threads, writer_src);
             eprintln!("  Memory mode:     {} ({})", resolved_memory_mode, mode_src);
             eprintln!("  BAQ:             {}", params.compute_baq);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
@@ -360,8 +363,8 @@ fn main() -> Result<()> {
                         n_workers,
                         &cancel,
                     )?;
-                    eprintln!("assembling HDF5 from memory (writers≤{max_writer_threads})…");
-                    let p = assemble_hdf5_from_memory(&mem, &out, compression, max_writer_threads)?;
+                    eprintln!("assembling HDF5 from memory (writers≤{writer_threads})…");
+                    let p = assemble_hdf5_from_memory(&mem, &out, compression, writer_threads)?;
                     (r, p)
                 }
                 "stream" => {
@@ -380,13 +383,13 @@ fn main() -> Result<()> {
                         n_workers,
                         &cancel,
                     )?;
-                    eprintln!("assembling HDF5 from temp chunks (writers≤{max_writer_threads})…");
+                    eprintln!("assembling HDF5 from temp chunks (writers≤{writer_threads})…");
                     let p = assemble_hdf5_from_temp(
                         tmp.path(),
                         &out,
                         n_shards,
                         compression,
-                        max_writer_threads,
+                        writer_threads,
                     )?;
                     if keep_temp {
                         let kept = tmp.keep();

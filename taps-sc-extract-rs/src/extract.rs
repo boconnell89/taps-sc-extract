@@ -263,6 +263,10 @@ pub fn process_window(
     let win_start = window.start as u32;
     let win_end = window.end as u32;
 
+    let mut mru_ptr: *const u8 = std::ptr::null();
+    let mut mru_len: usize = 0;
+    let mut mru_id: Option<u32> = None;
+
     let mut consume_column = |pos: u32, n_plp: i32, col: *const htslib::bam_pileup1_t| {
         if pos < win_start || pos >= win_end || n_plp <= 0 || col.is_null() {
             return;
@@ -303,14 +307,35 @@ pub fn process_window(
             let Some(call) = call_mctot(strand, ref_b, seq[qpos]) else {
                 continue;
             };
-            let bc_bytes = barcode_from_qname_bytes(rec.qname());
-            if let Some(wl) = whitelist {
-                let bc = std::str::from_utf8(bc_bytes).unwrap_or("");
-                if !wl.contains(bc) {
-                    continue;
-                }
-            }
-            let id = intern.intern_bytes(bc_bytes);
+
+            let qname = rec.qname();
+            let qptr = qname.as_ptr();
+            let qlen = qname.len();
+            let id_opt = if qptr == mru_ptr && qlen == mru_len {
+                mru_id
+            } else {
+                let bc_bytes = barcode_from_qname_bytes(qname);
+                let valid = if let Some(wl) = whitelist {
+                    let bc = std::str::from_utf8(bc_bytes).unwrap_or("");
+                    wl.contains(bc)
+                } else {
+                    true
+                };
+                let id = if valid {
+                    Some(intern.intern_bytes(bc_bytes))
+                } else {
+                    None
+                };
+                mru_ptr = qptr;
+                mru_len = qlen;
+                mru_id = id;
+                id
+            };
+
+            let Some(id) = id_opt else {
+                continue;
+            };
+
             if params.accumulate {
                 ensure_cell(&mut cells, id).add(ctx, pos + 1, call);
             }
