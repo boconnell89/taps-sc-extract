@@ -103,12 +103,16 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `-o, --out` | `str` | *Required* | Output `.h5` file path or output directory (when `--shards > 1`). |
 | `-c, --chroms` | `str` | `None` | Comma-separated contigs (e.g. `chr1,chr2` or `chr19`). Default: canonical autosomes + `chrX`, `chrY`. |
 | `-w, -a, --whitelist` | `str` | `None` | Path to optional barcode whitelist or cell annotation file. |
-| `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes. |
-| `--decomp-threads` | `int` | `1` | BAM BGZF decompression threads per worker process. |
+| `--engine` | `str` | `auto` | Backend engine: `auto` (prefers Rust, fallback Python), `rust` (fastest), `python` (reference). |
+| `--memory-mode` | `str` | `auto` | Memory mode: `auto` (heuristic based on budget/cells), `stream` (disk temp), `memory` (RAM). |
+| `--max-memory-gb` | `float` | `None` | Optional RAM budget in GB (default: 0.6 × available memory). |
+| `--expected-cells` | `int` | `None` | Optional cell count (auto-detected from `-w/--whitelist` cardinality if omitted). |
+| `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes (or Rayon threads in Rust). `0` = auto. |
+| `--decomp-threads` | `int` | `1` | BAM BGZF decompression threads per worker process (`0` for synchronous reading). |
 | `--chunk-size-mb` | `int` | `10` | Genomic window chunk size in megabases. |
-| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel. |
+| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). |
 | `--max-writer-threads` | `int` | `6` | Maximum parallel shard-writer threads after extraction. Suggested: 6 for NVMe/SSD, 2–4 for HDD/NFS, 1 for sequential. |
-| `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk. |
+| `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk (equivalent to `--memory-mode memory`). |
 | `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
 | `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
 | `--min-baseq` | `int` | `20` | Minimum base quality for pileup. |
@@ -124,14 +128,21 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 Understanding how each flag impacts CPU, memory, and I/O will help you optimize runs across different hardware profiles:
 
-### 1. `-t, --workers` (Process Parallelism)
-- **Mechanism**: Splits the genome into $N$ non-overlapping genomic windows and processes them concurrently across worker processes using `multiprocessing.Pool(context="spawn")`.
-- **Recommendation**: Set to $0.75 \times$ to $1.0 \times$ available physical CPU cores (e.g., `24` on a 32-core workstation; `64`–`80` on a 96-core server).
+### 1. `--engine` (Backend Acceleration)
+- **`auto` (Default)**: Automatically detects and executes the high-performance `taps-sc-extract-rs` Rust binary if installed or built; falls back to Python reference engine otherwise.
+- **`rust`**: Runs the Rayon-parallelized, `mimalloc` + `FxHashMap` accelerated Rust core (**~2.6× faster wall time, 56% lower peak RAM**).
+- **`python`**: Runs the multiprocessing Python reference implementation.
+
+### 2. `-t, --workers` (Parallel Worker Threads/Processes)
+- **Mechanism**: Splits the genome into $N$ non-overlapping genomic windows and processes them concurrently.
+- **Recommendation**: Set to $0.75 \times$ to $1.0 \times$ available physical CPU cores (e.g., `24` on a 32-core workstation; `64` on a 96-core server). `0` automatically sizes workers from hardware CPU count and memory budget.
 - **Scaling**: Near-linear scaling up to 64 workers.
 
-### 2. `--decomp-threads` (BAM Decompression)
-- **Mechanism**: Allocates additional `htslib` background threads per worker process for BGZF block decompression.
-- **Recommendation**: Leave at `1` when using many worker processes (e.g. $\ge 16$ workers), as process-level parallelism already saturates CPU. Increase to `2`–`4` only when running with few workers ($\le 4$) on high-speed NVMe storage.
+### 3. `--decomp-threads` (BAM BGZF Decompression Threads)
+- **Mechanism**: Allocates background `htslib` threads per worker for BGZF block decompression.
+- **Tuning by Worker Count**:
+  - **High Worker Count ($\ge 8$ workers, e.g. `-t 24` or `-t 32`)**: Use `--decomp-threads 0` or `1`. Because all CPU cores are already fully saturated processing genomic windows, spawning 24–48 additional threads causes thread oversubscription, context switching, and cache eviction.
+  - **Low Worker Count ($\le 4$ workers, e.g. single-chromosome extractions)**: Use `--decomp-threads 2` to `4`. Spare CPU cores are utilized to decompress BAM blocks ahead of pileup.
 
 ### 3. `--chunk-size-mb` (Genomic Granularity & Load Balancing)
 - **Mechanism**: Defines the window size of each genomic chunk (default: `10` Mb $\to$ 286 chunks for mm10).

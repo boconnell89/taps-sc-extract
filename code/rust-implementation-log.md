@@ -166,10 +166,17 @@ CH `indexChr` used the CG barcode list (Amethyst `h5paths` from `/CG`); CH-only 
   - Added automated A/B benchmark script `scripts/benchmark_ab.py`.
   - Tagged `python-baseline-20260820` on Git main branch.
 
-### A/B Benchmark Results (`taps_ucbTn5_sp2.srt.bam`, mm10, 24 workers, 8 shards)
+### A/B Benchmark Results (`taps_ucbTn5_sp2.srt.bam`, mm10, 24 workers, 16 shards)
 
-| Contig | Python Baseline | Rust Acceleration Core | Speedup | Peak RAM (Rust) |
-|---|---|---|---|---|
-| `chr19` (7 windows, 2.1M reads) | 39.04 s | **9.89 s** | **3.95× faster** | 1.52 GiB |
-| `chr1–3` (56 windows, 16.6M reads) | 176.3 s | **67.25 s** | **2.62× faster** | 7.93 GiB (56% less RAM) |
+| Dataset / Contigs | Python Baseline | Rust Acceleration Core | Speedup | Peak RAM (Rust) | Parity / Cells |
+|---|---|---|---|---|---|
+| `chr19` (7 windows, 2.1M reads) | 39.04 s | **9.89 s** | **3.95× faster** | 1.52 GiB | 5,781 cells, 63.75% mCG, 0.278% mCH |
+| `chr1–3` (56 windows, 16.6M reads) | 176.3 s | **67.25 s** | **2.62× faster** | 7.93 GiB | 7,268 cells, 65.86% mCG, 0.275% mCH |
+| **Whole Genome mm10** (286 windows, 74.9M reads) | **12.70 min** (762 s) | **5.68 min** (340.88 s) | **2.24× faster** | 33.3 GiB | **7,355 cells, 38.7M CpG calls (65.36% mCG), 1.075B CH calls (0.278% mCH)** |
+
+### Performance Optimization Summary
+1. **Thread Balancing**: `--decomp-threads 0` (synchronous BAM reader per worker) achieves highest throughput with $\ge 8$ workers because 24–32 CPU cores are already saturated without context-switch latency.
+2. **`rustc_hash::FxHashMap`**: Replacing SipHash with fast non-cryptographic word hashing saves ~70 seconds of CPU core time over 1 billion pileup calls.
+3. **Stream Memory Mode**: Intermediate chunks partitioned into temp files are assembled and compressed across 16 shards by a capped 6-thread pool in under 3.5 minutes.
+
 

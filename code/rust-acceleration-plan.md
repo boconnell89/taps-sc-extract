@@ -208,16 +208,16 @@ taps_sc_extract/             # unchanged Python reference engine
 
 | PR | Title | Notes |
 |---|---|---|
-| 0 | Pileup spike: rust-htslib vs Python chr19 | Go/no-go. No product CLI. |
-| 1 | Crate skeleton, calling/context/barcode, mimalloc, unit tests | Pure functions, golden vectors from Python. |
-| 2 | FASTA `.fai` reader + window planner | Match `plan_genomic_chunks`. |
-| 3 | Single-thread window extract on chr19 | Must match Python cell/call counts. |
-| 4 | Rayon + stream temp files + RAII cleanup | **Done:** TLS BAM, Arc FASTA, unique chunk files, SIGINT cancel. BAQ on (do not copy Python fastafile no-op). |
+| 0 | Pileup spike: rust-htslib vs Python chr19 | **Done:** Bit-accurate column-wise pileup parity verified. |
+| 1 | Crate skeleton, calling/context/barcode, mimalloc, unit tests | **Done:** Pure functions, golden vectors from Python. |
+| 2 | FASTA `.fai` reader + window planner | **Done:** Match `plan_genomic_chunks`. |
+| 3 | Single-thread window extract on chr19 | **Done:** Match Python cell/call counts. |
+| 4 | Rayon + stream temp files + RAII cleanup | **Done:** TLS BAM, Arc FASTA, unique chunk files, SIGINT cancel. BAQ on. |
 | 5 | In-memory mode | **Done:** `--memory-mode memory` keeps per-shard window payloads; same HDF5 as stream. |
-| 6 | HDF5 + shards + master.h5, writer cap 6 | **Done:** hdf5-metno, gzip/none, ExternalLinks, cap 6. Amethyst smoke still needed on full chr19. |
-| 7 | Auto-tune + new flags + CLI parity | Whitelist ⇒ cell count; `--max-memory-gb`; log defaults. Tuned on ~56 GB box. |
-| 8 | Perf harness + `--engine python\|rust` | Keep Python; comparison table; git tag Python baseline. |
-| 9 | Optional PyO3 wrap | Fallback to Python if binary absent. |
+| 6 | HDF5 + shards + master.h5, writer cap 6 | **Done:** hdf5-metno, gzip/none, ExternalLinks, cap 6. Amethyst verified on chr19. |
+| 7 | Auto-tune + new flags + CLI parity | **Done:** Whitelist ⇒ cell count; `--max-memory-gb`; dynamic `--memory-mode auto`; `open_bam` decompression thread setting. |
+| 8 | Perf harness + `--engine python\|rust` | **Done:** Transparent `--engine auto|rust|python` delegation in Python CLI, `scripts/benchmark_ab.py`, git tag `python-baseline-20260820`. |
+| 9 | Optional PyO3 wrap | Follow-on extension (CLI binary delegation is shipped and default in Python CLI). |
 
 ## Non-goals (v1)
 

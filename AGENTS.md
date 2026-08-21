@@ -21,10 +21,12 @@ taps-sc-extract/
 ├── pyproject.toml              # Build config, dependencies, CLI entrypoint (taps-sc-extract)
 ├── README.md                   # User documentation and performance guide
 ├── AGENTS.md                   # This AI developer reference
-├── taps_sc_extract/
+├── scripts/
+│   └── benchmark_ab.py         # Automated A/B performance benchmark (Python vs Rust)
+├── taps_sc_extract/            # Reference Python extraction engine
 │   ├── __init__.py             # Version definition
 │   ├── __main__.py             # Module execution entrypoint (python -m taps_sc_extract)
-│   ├── cli.py                  # CLI argument parser and logging setup
+│   ├── cli.py                  # CLI argument parser & engine dispatcher (--engine auto|rust|python)
 │   ├── parallel_extractor.py   # High-throughput multiprocessing extraction engine
 │   ├── extractor.py            # Single-process reference extractor
 │   ├── h5_writer.py            # Amethyst HDF5 writer & sharded directory manager
@@ -32,6 +34,16 @@ taps-sc-extract/
 │   ├── calling.py              # TAPS mC-to-T lookup tables & SAM flag classification
 │   ├── context.py              # Sequence context classifier (CpG, CHG, CHH, CG, CH)
 │   └── barcode.py              # Barcode extraction from QNAME/tags & whitelist parsing
+├── taps-sc-extract-rs/         # High-Performance Rust Acceleration Core (2.6x faster, 56% less RAM)
+│   ├── Cargo.toml              # Rust crate manifest (mimalloc, rust-htslib, hdf5-metno, rayon, rustc-hash)
+│   └── src/
+│       ├── main.rs             # Rust CLI entrypoint (extract, stats)
+│       ├── extract.rs          # Column-wise bam_mplp samtools-style pileup & BAQ
+│       ├── parallel.rs         # Rayon thread pool & cancellation tokens
+│       ├── accumulate.rs       # Barcode intern & FxHashMap cell position maps
+│       ├── h5_out.rs           # Amethyst structured array HDF5 generator & master.h5
+│       ├── shard_io.rs         # Compact binary intermediate chunk partition files
+│       └── autotune.rs         # Hardware & memory budget auto-tuning heuristics
 └── tests/
     └── test_taps_sc_extract.py # Pytest unit & integration test suite
 ```
@@ -42,23 +54,22 @@ taps-sc-extract/
 
 When modifying or extending this codebase, you **MUST** adhere to the following rules:
 
-### A. Multiprocessing & File Descriptors
-- **Always use `mp.get_context("spawn")`**: Never use `fork` with `pysam` or `h5py`. Forked C file descriptors cause deadlocks and corrupted reads.
-- **Never pass open file handles to worker processes**: Workers must initialize their own private `pysam.AlignmentFile` and `FastFaiReader` handles in `_init_worker`.
+### A. Dual Engine Architecture & Parity
+- **Preserve Python Reference Engine**: Never remove the Python reference implementation in `taps_sc_extract/`. It serves as the baseline ground truth and fallback.
+- **Unified Entrypoint**: `taps-sc-extract` CLI defaults to `--engine auto`, executing the compiled Rust binary when available and falling back to Python.
 
-### B. FASTA Reading Across Workers
-- **Never use `pysam.FastaFile` in parallel workers**: `htslib`'s underlying `bgzf_read_block` is not safe when multiple processes read the same indexed FASTA, causing C-level memory corruption.
-- **Always use [`taps_sc_extract.fasta.FastFaiReader`](file:///mnt/e/sciMET_TAPS/taps_sc_extract/fasta.py)**: It performs pure Python binary `seek()` and `read()` using `.fai` byte offsets, which is 100% process-safe.
+### B. Multiprocessing & Multithreading Safety
+- **Python Workers**: Always use `mp.get_context("spawn")`. Never use `fork` with `pysam` or `h5py`.
+- **Rust Rayon Workers**: Thread-local `IndexedReader` instances (never send BAM handles across threads); atomic `CancelFlag` for clean SIGINT cancellation.
 
-### C. HDF5 Single-Pass Creation vs. Resizing
-- **Never call `dataset.resize()` in a tight loop**: For 10,000+ cells, incremental resizing causes massive B-tree metadata churn (>20 minutes vs. <10 seconds).
-- **Always use single-pass dataset creation (`create_cell_dataset`)**: Pre-aggregate calls per cell/shard and call `create_dataset('1', data=records, ...)` once with the final exact shape.
-- **Chunk size constraint**: When creating a chunked dataset in `h5py`, chunk dimension cannot exceed data length: `chunk_size = min(len(records), 65536)`.
+### C. FASTA Reading Across Workers
+- **Never use `pysam.FastaFile` in parallel Python workers**: `htslib`'s underlying `bgzf_read_block` is not safe when multiple processes read the same indexed FASTA.
+- **Always use `FastFaiReader`**: Pure Python / Rust binary byte `seek()` and `read()` using `.fai` offsets is 100% process-safe.
 
 ### D. Memory Bounding & Shard Writer Concurrency
-- **Accurate Process-Tree Accounting**: Memory is monitored across the entire process tree (`/proc/<pid>/statm`) including all worker children. Each worker reaches a steady-state buffer (~700 MB) and plateaus.
-- **Never load all genomic chunk arrays into memory at once**: In disk-streaming mode (`use_temp_files=True`), workers write chunk outputs partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin`.
-- **Capped Shard Writer Pool**: `_shard_writer_concurrency()` sizes writer threads from `MemAvailable` and caps at **6 parallel threads** to prevent disk I/O queue depth congestion while maximizing parallel CPU compression. Each shard purges its temporary chunk files immediately upon writing.
+- **Accurate Process-Tree Accounting**: Memory is monitored across the entire process tree (`/proc/<pid>/statm` or `sys_info`).
+- **Disk-Streaming vs. Memory Mode**: In `stream` mode (default), intermediate chunks are partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin` and purged on write. In `memory` mode, maps are kept in RAM.
+- **Capped Shard Writer Pool**: Sized from memory budget and capped at **6 parallel threads** by default (`--max-writer-threads 6`) to prevent disk I/O queue depth bottlenecks while maximizing parallel compression.
 
 ### E. TAPS Chemistry & Amethyst Schema
 - **TAPS Calling Logic**:
@@ -76,14 +87,17 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 
 ### CLI Execution
 ```bash
-# 1. Standard parallel extraction
+# 1. Standard run (auto-selects Rust core if compiled, else Python)
 taps-sc-extract -b sample.srt.bam -f ref.fa -o output.h5 -t 24
 
-# 2. Sharded directory output (for large datasets)
-taps-sc-extract -b sample.srt.bam -f ref.fa -o sharded_dir/ -t 24 --shards 16 --log-file extraction.log
+# 2. High-throughput sharded directory output with Rust backend
+taps-sc-extract -b sample.srt.bam -f ref.fa -o sharded_dir/ -t 24 --shards 16 --engine rust
 
-# 3. High-memory in-memory mode
-taps-sc-extract -b sample.srt.bam -f ref.fa -o output.h5 -t 64 --no-temp-file
+# 3. Explicit Python reference engine run
+taps-sc-extract -b sample.srt.bam -f ref.fa -o output.h5 -t 24 --engine python
+
+# 4. Automated A/B performance comparison
+python3 scripts/benchmark_ab.py -b sample.srt.bam -f ref.fa -c chr1,chr2,chr3 -t 24 --shards 16
 ```
 
 ### Python Programmatic API
