@@ -126,6 +126,17 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-writer-threads",
+        "--writer-threads",
+        type=int,
+        default=6,
+        help=(
+            "Maximum parallel shard-writer threads after extraction (default: 6). "
+            "Recommended: 6 for local NVMe/SSD, 2-4 for HDD or network filesystems (NFS/Lustre), "
+            "1 for strict sequential writing."
+        ),
+    )
+    parser.add_argument(
         "--no-temp-file",
         action="store_true",
         help=(
@@ -214,6 +225,7 @@ def main(args: Optional[List[str]] = None) -> int:
             use_temp_files=not parsed.no_temp_file,
             compression=parsed.compression,
             compression_threads=parsed.compression_threads,
+            max_writer_threads=parsed.max_writer_threads,
             temp_dir=parsed.temp_dir,
             min_base_quality=parsed.min_baseq,
             min_mapq=parsed.min_mapq,

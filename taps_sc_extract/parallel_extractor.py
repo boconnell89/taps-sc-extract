@@ -389,12 +389,14 @@ def _shard_writer_concurrency(
     *,
     use_temp_files: bool,
     temp_dir: Optional[str] = None,
+    max_writer_threads: Optional[int] = 6,
 ) -> int:
     """
     How many shard-writer threads to run after extractors have exited.
 
     A shard writer holds one shard's merged arrays (heavier than one pileup
-    worker, much lighter than the full extract pool). Scale from MemAvailable.
+    worker, much lighter than the full extract pool). Scale from MemAvailable,
+    capped by max_writer_threads (default: 6) to prevent disk I/O congestion.
     """
     n_shards = max(1, int(n_shards))
     _total_mb, avail_mb = _meminfo_mb()
@@ -403,8 +405,8 @@ def _shard_writer_concurrency(
     budget_mb = max(0.0, avail_mb - headroom_mb)
     n = int(budget_mb // per_writer_mb) if per_writer_mb > 0 else 1
     n = max(1, n)
-    # Cap at 6 writers to avoid disk I/O queue depth contention while fully parallelizing compression
-    return min(n, n_shards, 6)
+    cap = 6 if max_writer_threads is None else max(1, int(max_writer_threads))
+    return min(n, n_shards, cap)
 
 
 def _merge_chunk_dict(
@@ -506,6 +508,7 @@ def extract_methylation_parallel(
     compression: str = "gzip",
     compression_level: int = 1,
     compression_threads: Optional[int] = None,
+    max_writer_threads: Optional[int] = 6,
     min_base_quality: int = 20,
     min_mapq: int = 0,
     max_depth: int = 250,
@@ -658,6 +661,7 @@ def extract_methylation_parallel(
             effective_shards,
             use_temp_files=use_temp_files,
             temp_dir=actual_temp_dir,
+            max_writer_threads=max_writer_threads,
         )
         n_blosc = configure_blosc_threads(n_writers, compression, compression_threads)
         blosc_note = (

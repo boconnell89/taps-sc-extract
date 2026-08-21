@@ -107,6 +107,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--decomp-threads` | `int` | `1` | BAM BGZF decompression threads per worker process. |
 | `--chunk-size-mb` | `int` | `10` | Genomic window chunk size in megabases. |
 | `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel. |
+| `--max-writer-threads` | `int` | `6` | Maximum parallel shard-writer threads after extraction. Suggested: 6 for NVMe/SSD, 2–4 for HDD/NFS, 1 for sequential. |
 | `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk. |
 | `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
 | `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
@@ -150,19 +151,26 @@ Understanding how each flag impacts CPU, memory, and I/O will help you optimize 
   - $10,000$–$50,000$ cells: `--shards 8` or `--shards 16`.
   - $> 100,000$ cells: `--shards 16` or `--shards 32`.
 
-### 5. `--no-temp-file` vs. Default Streaming Mode
+### 5. `--max-writer-threads` (Shard Writer Concurrency & Storage Optimization)
+- **Mechanism**: Controls the maximum number of parallel worker threads that assemble, compress, and write shard HDF5 files after chunk extraction finishes.
+- **Recommended Defaults by Storage Type**:
+  - **Local Fast NVMe / PCIe SSD**: `--max-writer-threads 6` *(Default)* &mdash; Maximizes parallel CPU compression throughput while avoiding disk queue saturation.
+  - **Network File Systems (NFS / Lustre / GPFS / SMB)**: `--max-writer-threads 2` to `4` &mdash; Minimizes concurrent metadata and lock contention across shared storage nodes.
+  - **Spinning Disk (HDD) or Memory-Constrained Systems**: `--max-writer-threads 1` &mdash; Strict single-thread sequential writing with zero seek contention and <100 MB active RAM.
+
+### 6. `--no-temp-file` vs. Default Streaming Mode
 - **Default Mode (Disk-Streaming)**:
   - Workers write compact binary chunk files to fast disk (`/tmp`) as each genomic window finishes.
   - Each shard reads only its own chunk files in coordinate order and purges them immediately upon writing.
   - **RAM Usage**: Process-tree RAM scales as $\approx 700\text{ MB / worker}$ (fixed heap buffers + BAM indices) and plateaus at steady state (~18 GB total across 24 workers), never growing linearly with genome size.
-  - **Writer Pool**: Automatically sizes writer concurrency from `MemAvailable` and caps at 6 parallel threads to optimize disk queue depth and maximize parallel compression.
+  - **Writer Pool**: Automatically sizes writer concurrency from `MemAvailable` and respects `--max-writer-threads`.
   - **Recommendation**: Always use for workstations, desktops, and standard production servers.
 - **`--no-temp-file` (In-Memory Mode)**:
   - Workers pass structured array dictionaries directly over IPC without writing to disk.
   - **RAM Usage**: Accumulates all chunk arrays directly in memory across the entire run (~25–35 GB for whole-genome mammalian datasets).
   - **Recommendation**: Use on high-memory servers ($\ge 128$ GB RAM, 64–96 cores) with shared RAM to maximize I/O throughput.
 
-### 6. `--temp-dir` (Scratch Space Location)
+### 7. `--temp-dir` (Scratch Space Location)
 - **Mechanism**: Specifies the filesystem location where temporary chunk files are stored during extraction.
 - **Recommendation**: Point to a fast local NVMe SSD or memory-backed filesystem (e.g. `/tmp` or `/dev/shm`). Avoid slow network filesystems (NFS/Lustre) for temporary files.
 

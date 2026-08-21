@@ -334,7 +334,9 @@ def test_shard_writer_concurrency_after_extract():
 
     assert _shard_writer_concurrency(1, use_temp_files=True) == 1
     n_drain = _shard_writer_concurrency(16, use_temp_files=True)
-    assert 1 <= n_drain <= 16
+    assert 1 <= n_drain <= 6  # default cap is 6
+    assert _shard_writer_concurrency(16, use_temp_files=True, max_writer_threads=3) <= 3
+    assert _shard_writer_concurrency(16, use_temp_files=True, max_writer_threads=1) == 1
 
 
 def test_assemble_and_write_shard_temp_file_order(tmp_path):
