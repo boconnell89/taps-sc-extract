@@ -11,8 +11,9 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 
 ## Key Features
 
-- **Blistering Performance**: Processes **>5.5 million mapped reads/minute** (genome-wide mouse mm10 with 75M reads extracted in **~13.7 minutes** across 24 workers).
-- **Strictly Bounded RAM**: Disk-backed streaming mode keeps memory footprint to **< 500 MB RAM** regardless of cell count or genome size.
+- **Blistering Performance**: Processes **>5.89 million mapped reads/minute (98,300+ reads/s)** (genome-wide mouse mm10 with 75M reads extracted in **~12.7 minutes** across 24 workers).
+- **Predictable, Bounded Memory**: Process-tree memory tracks accurately via `/proc` and plateaus at steady state (~700 MB / worker, ~18 GB total across 24 workers) regardless of genome length.
+- **I/O-Optimized Shard Writer Pool**: Dynamically sizes and caps writer concurrency (up to 6 parallel threads) to saturate CPU compression without clogging disk queue depth.
 - **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
 - **Single-Pass HDF5 Writer**: Bypasses HDF5 B-tree resizing overhead, writing tens of thousands of cell datasets in **seconds** rather than hours.
 - **Multi-File Sharded Directories**: Partitions cell barcodes across $N$ parallel shard files (`shard_000.h5`..`shard_NNN.h5`) and creates a portable `master.h5` with relative `ExternalLink` references.
@@ -153,12 +154,13 @@ Understanding how each flag impacts CPU, memory, and I/O will help you optimize 
 - **Default Mode (Disk-Streaming)**:
   - Workers write compact binary chunk files to fast disk (`/tmp`) as each genomic window finishes.
   - Each shard reads only its own chunk files in coordinate order and purges them immediately upon writing.
-  - **RAM Usage**: Strictly bounded to **< 500 MB RAM** regardless of worker count or cell count.
-  - **Recommendation**: Always use for workstations, desktops, and shared clusters (16–32 GB RAM).
+  - **RAM Usage**: Process-tree RAM scales as $\approx 700\text{ MB / worker}$ (fixed heap buffers + BAM indices) and plateaus at steady state (~18 GB total across 24 workers), never growing linearly with genome size.
+  - **Writer Pool**: Automatically sizes writer concurrency from `MemAvailable` and caps at 6 parallel threads to optimize disk queue depth and maximize parallel compression.
+  - **Recommendation**: Always use for workstations, desktops, and standard production servers.
 - **`--no-temp-file` (In-Memory Mode)**:
   - Workers pass structured array dictionaries directly over IPC without writing to disk.
-  - **RAM Usage**: Accumulates in memory across all chunks (~10–20 GB for whole-genome mammalian datasets).
-  - **Recommendation**: Use on dedicated high-memory servers ($\ge 64$ GB RAM, 96 cores) to maximize I/O throughput.
+  - **RAM Usage**: Accumulates all chunk arrays directly in memory across the entire run (~25–35 GB for whole-genome mammalian datasets).
+  - **Recommendation**: Use on high-memory servers ($\ge 128$ GB RAM, 64–96 cores) with shared RAM to maximize I/O throughput.
 
 ### 6. `--temp-dir` (Scratch Space Location)
 - **Mechanism**: Specifies the filesystem location where temporary chunk files are stored during extraction.

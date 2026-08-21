@@ -9,7 +9,7 @@
 `taps-sc-extract` is a high-performance Python package and CLI tool for extracting single-cell DNA methylation from TAPS (mC-to-T chemistry) coordinate-sorted BAM files. It writes base-resolution methylation calls into **Amethyst-compatible HDF5 files** (`/CG/<barcode>/1` and `/CH/<barcode>/1`).
 
 ### Target Scale
-- **Workstations**: 32 cores, 32 GB RAM (processes ~75M mapped reads across mm10 in ~14 minutes with < 500 MB RAM).
+- **Workstations**: 32 cores, 32 GB RAM (processes ~75M mapped reads across mm10 in **~12.7 minutes** with **~18 GB peak total process-tree RAM** across 24 workers).
 - **Production Servers**: 96 cores, 720 GB RAM (scales to >200k cells and >1B reads).
 
 ---
@@ -55,9 +55,10 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Always use single-pass dataset creation (`create_cell_dataset`)**: Pre-aggregate calls per cell/shard and call `create_dataset('1', data=records, ...)` once with the final exact shape.
 - **Chunk size constraint**: When creating a chunked dataset in `h5py`, chunk dimension cannot exceed data length: `chunk_size = min(len(records), 65536)`.
 
-### D. Memory Bounding (Streaming Partitions)
-- **Never load all genomic chunk arrays into memory at once**: Accumulating 286 whole-genome chunk dictionaries in a single Python dictionary requires >20 GB RAM and will OOM on 32 GB machines.
-- **Always stream by shard or batch**: Workers write chunk outputs partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin`. Each shard assembles its own files independently and purges temporary files immediately upon writing.
+### D. Memory Bounding & Shard Writer Concurrency
+- **Accurate Process-Tree Accounting**: Memory is monitored across the entire process tree (`/proc/<pid>/statm`) including all worker children. Each worker reaches a steady-state buffer (~700 MB) and plateaus.
+- **Never load all genomic chunk arrays into memory at once**: In disk-streaming mode (`use_temp_files=True`), workers write chunk outputs partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin`.
+- **Capped Shard Writer Pool**: `_shard_writer_concurrency()` sizes writer threads from `MemAvailable` and caps at **6 parallel threads** to prevent disk I/O queue depth congestion while maximizing parallel CPU compression. Each shard purges its temporary chunk files immediately upon writing.
 
 ### E. TAPS Chemistry & Amethyst Schema
 - **TAPS Calling Logic**:
