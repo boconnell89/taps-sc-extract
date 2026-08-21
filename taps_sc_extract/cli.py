@@ -108,15 +108,15 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--compression",
-        choices=["gzip", "lzf", "none", "blosc", "blosc-zstd"],
+        choices=["gzip", "gzip-shuffle", "gzip6", "lzf", "none", "blosc", "blosc-zstd"],
         default="gzip",
         help=(
             "HDF5 dataset compression (default: gzip). "
-            "gzip is portable to Amethyst/rhdf5 with no extra R packages. "
-            "blosc uses multithreaded LZ4 (fastest compressed write); "
-            "blosc-zstd is nearly as fast with gzip-like size. Both need "
-            "Bioconductor rhdf5filters to load in R. "
-            "lzf is a fast single-thread filter; none disables compression."
+            "gzip (level 1 deflate) is fast and 100% portable to Amethyst/rhdf5 with no extra packages. "
+            "gzip-shuffle applies byte shuffling before level 1 deflate for high ratio and speed. "
+            "gzip6 uses standard level 6 deflate. "
+            "none disables compression for maximum write speed. "
+            "blosc / blosc-zstd / lzf require rhdf5filters in R."
         ),
     )
     parser.add_argument(
@@ -132,11 +132,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--max-writer-threads",
         "--writer-threads",
         type=int,
-        default=6,
+        default=0,
         help=(
-            "Maximum parallel shard-writer threads after extraction (default: 6). "
-            "Recommended: 6 for local NVMe/SSD, 2-4 for HDD or network filesystems (NFS/Lustre), "
-            "1 for strict sequential writing."
+            "Maximum parallel shard-writer threads after extraction (default: 0 = auto). "
+            "Auto scales up to shard count, available CPU cores, and memory budget. "
+            "Suggested: 8-16 for NVMe/SSD, 2-4 for HDD or network filesystems (NFS/Lustre)."
         ),
     )
     parser.add_argument(

@@ -168,15 +168,18 @@ CH `indexChr` used the CG barcode list (Amethyst `h5paths` from `/CG`); CH-only 
 
 ### A/B Benchmark Results (`taps_ucbTn5_sp2.srt.bam`, mm10, 24 workers, 16 shards)
 
-| Dataset / Contigs | Python Baseline | Rust Acceleration Core | Speedup | Peak RAM (Rust) | Parity / Cells |
-|---|---|---|---|---|---|
-| `chr19` (7 windows, 2.1M reads) | 39.04 s | **9.89 s** | **3.95× faster** | 1.52 GiB | 5,781 cells, 63.75% mCG, 0.278% mCH |
-| `chr1–3` (56 windows, 16.6M reads) | 176.3 s | **67.25 s** | **2.62× faster** | 7.93 GiB | 7,268 cells, 65.86% mCG, 0.275% mCH |
-| **Whole Genome mm10** (286 windows, 74.9M reads) | **12.70 min** (762 s) | **5.68 min** (340.88 s) | **2.24× faster** | 33.3 GiB | **7,355 cells, 38.7M CpG calls (65.36% mCG), 1.075B CH calls (0.278% mCH)** |
+| Dataset / Contigs | Python Baseline | Rust Core (v0.1.0 Initial) | Rust Core (Optimized) | Total Speedup | Peak RAM (Rust) | Parity / Calls |
+|---|---|---|---|---|---|---|
+| `chr19` (7 windows, 2.1M reads) | 39.04 s | 13.21 s | **9.89 s** | **3.95× faster** | 1.52 GiB | 5,781 cells, 63.75% mCG, 0.278% mCH |
+| `chr1–3` (56 windows, 16.6M reads) | 176.3 s | 74.02 s | **67.25 s** | **2.62× faster** | 7.93 GiB | 7,268 cells, 65.86% mCG, 0.275% mCH |
+| **Whole Genome mm10** (286 windows, 74.9M reads) | **12.70 min** (762 s) | 5.68 min (340.88 s) | **4.86 min (292.12 s)** | **2.61× faster** | 31.5 GiB | **7,355 cells, 38.7M CpG calls (65.36% mCG), 1.075B CH calls (0.278% mCH)** |
 
 ### Performance Optimization Summary
 1. **Thread Balancing**: `--decomp-threads 0` (synchronous BAM reader per worker) achieves highest throughput with $\ge 8$ workers because 24–32 CPU cores are already saturated without context-switch latency.
 2. **`rustc_hash::FxHashMap`**: Replacing SipHash with fast non-cryptographic word hashing saves ~70 seconds of CPU core time over 1 billion pileup calls.
-3. **Stream Memory Mode**: Intermediate chunks partitioned into temp files are assembled and compressed across 16 shards by a capped 6-thread pool in under 3.5 minutes.
+3. **Phase 1 Shard Writer Scaling**: Auto-scaling shard writer threads up to 16 compresses all 16 shards concurrently, cutting whole-genome tail assembly time significantly.
+4. **Phase 2 Hot-Loop MRU Barcode Caching**: Avoids redundant ASCII string scanning and intern hash queries for consecutive pileup columns on the same read (>90% cache hit rate).
+5. **Phase 3 Compression Filters**: Supports `gzip` (level 1 deflate), `gzip-shuffle` (byte shuffling + level 1 deflate), `gzip6`, and `none`.
+
 
 
