@@ -57,6 +57,9 @@ fn contig_s10(s: &str) -> FixedAscii<10> {
 pub enum H5Compression {
     Gzip(u8),
     GzipShuffle(u8),
+    Lzf,
+    BloscLz4(u8, bool),
+    BloscZstd(u8, bool),
     None,
 }
 
@@ -66,8 +69,11 @@ impl H5Compression {
             "gzip" | "gzip-fast" | "gzip1" => Ok(Self::Gzip(1)),
             "gzip-shuffle" | "shuffle" => Ok(Self::GzipShuffle(1)),
             "gzip6" => Ok(Self::Gzip(6)),
+            "lzf" => Ok(Self::Lzf),
+            "blosc" | "blosc-lz4" => Ok(Self::BloscLz4(9, true)),
+            "blosc-zstd" => Ok(Self::BloscZstd(5, true)),
             "none" => Ok(Self::None),
-            other => anyhow::bail!("unsupported --compression {other} (options: gzip, gzip-shuffle, gzip6, none)"),
+            other => anyhow::bail!("unsupported --compression {other} (options: gzip, gzip-shuffle, gzip6, lzf, blosc, blosc-zstd, none)"),
         }
     }
 }
@@ -105,6 +111,9 @@ fn write_cell_dataset(
     b = match compression {
         H5Compression::Gzip(level) => b.deflate(level),
         H5Compression::GzipShuffle(level) => b.shuffle().deflate(level),
+        H5Compression::Lzf => b.lzf(),
+        H5Compression::BloscLz4(level, shuffle) => b.blosc(hdf5_metno::filters::Blosc::LZ4, level, shuffle),
+        H5Compression::BloscZstd(level, shuffle) => b.blosc(hdf5_metno::filters::Blosc::ZStd, level, shuffle),
         H5Compression::None => b,
     };
     b.create("1")?

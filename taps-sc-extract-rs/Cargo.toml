@@ -10,7 +10,7 @@ publish = false
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
-hdf5-metno = "0.14"
+hdf5-metno = { version = "0.14", features = ["blosc", "blosc-lz4", "blosc-zstd", "lzf"] }
 md-5 = "0.10"
 mimalloc = { version = "0.1", default-features = false }
 noodles = { version = "0.109.0", features = ["bam", "sam", "core", "bgzf"] }
