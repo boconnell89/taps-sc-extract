@@ -417,3 +417,45 @@ def test_assemble_lzf_compression(tmp_path):
         assert ds.compression == "lzf"
         assert list(ds["pos"]) == [100]
 
+
+def test_assemble_blosc_compression(tmp_path):
+    """Blosc (hdf5plugin) is the multithreaded compressed writer path."""
+    import pickle
+    from taps_sc_extract.h5_writer import configure_blosc_threads
+    from taps_sc_extract.parallel_extractor import _assemble_and_write_shard
+
+    n = configure_blosc_threads(n_writers=4, compression="blosc")
+    assert n >= 1
+    assert os.environ["BLOSC_NTHREADS"] == str(n)
+
+    shard_dir = tmp_path / "shard_000"
+    shard_dir.mkdir()
+    d0 = {"CG": {"cellA": _tiny_records("chr1", 100)}, "CH": {}}
+    with open(shard_dir / "chunk_000000.bin", "wb") as f:
+        pickle.dump(d0, f)
+    out_h5 = tmp_path / "blosc.h5"
+    _assemble_and_write_shard(
+        shard_idx=0,
+        n_shards=1,
+        shard_path=str(out_h5),
+        temp_shard_dir=str(shard_dir),
+        in_memory_chunks=None,
+        compression="blosc",
+    )
+    with h5py.File(out_h5, "r") as h5:
+        ds = h5["CG"]["cellA"]["1"]
+        filt = ds.id.get_create_plist().get_filter(0)
+        assert filt[0] == 32001  # Blosc filter id
+        assert filt[3] == b"blosc"
+        assert list(ds["pos"]) == [100]
+
+
+def test_h5_compression_kwargs_blosc_zstd():
+    from taps_sc_extract.h5_writer import h5_compression_kwargs
+
+    kw = h5_compression_kwargs("blosc-zstd", 1)
+    assert kw["compression"] == 32001
+    # filter_options: clevel=1, shuffle=1, compressor=zstd(5)
+    assert kw["compression_opts"][4] == 1
+    assert kw["compression_opts"][6] == 5
+

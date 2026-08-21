@@ -17,13 +17,70 @@ import concurrent.futures
 import hashlib
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import h5py
 import numpy as np
 
 # Disable HDF5 file locking on network / mounted filesystems
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+SUPPORTED_COMPRESSION = ("gzip", "lzf", "none", "blosc", "blosc-zstd")
+
+
+def h5_compression_kwargs(compression: str, compression_level: int = 1) -> Dict[str, Any]:
+    """Return h5py ``create_dataset`` compression keyword arguments."""
+    if compression in (None, "", "none"):
+        return {}
+    if compression == "gzip":
+        return {"compression": "gzip", "compression_opts": int(compression_level)}
+    if compression == "lzf":
+        return {"compression": "lzf"}
+    if compression in ("blosc", "blosc-zstd"):
+        try:
+            import hdf5plugin
+        except ImportError as exc:
+            raise ImportError(
+                "compression=%r requires the hdf5plugin package (pip install hdf5plugin)"
+                % compression
+            ) from exc
+        cname = "zstd" if compression == "blosc-zstd" else "lz4"
+        clevel = int(compression_level)
+        if not 0 <= clevel <= 9:
+            clevel = 1
+        return dict(
+            hdf5plugin.Blosc(
+                cname=cname,
+                clevel=clevel,
+                shuffle=hdf5plugin.Blosc.SHUFFLE,
+            )
+        )
+    raise ValueError(
+        f"Unsupported HDF5 compression {compression!r}. "
+        f"Use one of: {', '.join(SUPPORTED_COMPRESSION)}."
+    )
+
+
+def configure_blosc_threads(
+    n_writers: int,
+    compression: str,
+    compression_threads: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Set BLOSC_NTHREADS for intra-chunk parallel compression.
+
+    Blosc's thread pool is process-global, so when several shard writers share
+    a process the per-compress thread count is ``cpus // n_writers`` (unless
+    ``compression_threads`` is set explicitly).
+    """
+    if compression not in ("blosc", "blosc-zstd"):
+        return None
+    if compression_threads is not None:
+        n = max(1, int(compression_threads))
+    else:
+        n = max(1, (os.cpu_count() or 1) // max(1, n_writers))
+    os.environ["BLOSC_NTHREADS"] = str(n)
+    return n
 
 # Amethyst / Facet structured array dtype
 METH_DTYPE = np.dtype([
@@ -77,30 +134,13 @@ class AmethystH5Writer:
             del bc_group['1']
 
         chunk_size = min(len(records), 65536)
-        if self.compression == 'gzip':
-            bc_group.create_dataset(
-                '1',
-                data=records,
-                chunks=(chunk_size,),
-                dtype=METH_DTYPE,
-                compression='gzip',
-                compression_opts=self.compression_level,
-            )
-        elif self.compression == 'lzf':
-            bc_group.create_dataset(
-                '1',
-                data=records,
-                chunks=(chunk_size,),
-                dtype=METH_DTYPE,
-                compression='lzf',
-            )
-        else:
-            bc_group.create_dataset(
-                '1',
-                data=records,
-                chunks=(chunk_size,),
-                dtype=METH_DTYPE,
-            )
+        bc_group.create_dataset(
+            '1',
+            data=records,
+            chunks=(chunk_size,),
+            dtype=METH_DTYPE,
+            **h5_compression_kwargs(self.compression, self.compression_level),
+        )
 
     def append_data(self, context: str, barcode: str, records: np.ndarray):
         """
@@ -122,8 +162,7 @@ class AmethystH5Writer:
                 maxshape=(None,),
                 chunks=(chunk_size,),
                 dtype=METH_DTYPE,
-                compression='gzip',
-                compression_opts=self.compression_level
+                **h5_compression_kwargs(self.compression, self.compression_level),
             )
         else:
             ds = bc_group['1']
@@ -194,8 +233,10 @@ def write_sharded_hdf5_dir(
 
     shard_filenames = [f"shard_{i:03d}.h5" for i in range(n_shards)]
 
+    n_writers = min(n_shards, 16)
+    configure_blosc_threads(n_writers, compression)
     # Write shard files in parallel using ThreadPool
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_shards, 16)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_writers) as executor:
         futures = []
         for i in range(n_shards):
             shard_bcs = shard_assignments[i]

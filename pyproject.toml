@@ -16,6 +16,7 @@ dependencies = [
     "pysam>=0.20.0",
     "h5py>=3.0.0",
     "numpy>=1.20.0",
+    "hdf5plugin>=4.0.0",
 ]
 keywords = ["bioinformatics", "single-cell", "methylation", "taps", "epigenetics", "amethyst", "hdf5"]
 classifiers = [

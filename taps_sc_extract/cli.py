@@ -105,13 +105,24 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--compression",
-        choices=["gzip", "lzf", "none"],
+        choices=["gzip", "lzf", "none", "blosc", "blosc-zstd"],
         default="gzip",
         help=(
             "HDF5 dataset compression (default: gzip). "
             "gzip is portable to Amethyst/rhdf5 with no extra R packages. "
-            "lzf writes much faster but R needs Bioconductor rhdf5filters. "
-            "none is fastest and produces the largest files."
+            "blosc uses multithreaded LZ4 (fastest compressed write); "
+            "blosc-zstd is nearly as fast with gzip-like size. Both need "
+            "Bioconductor rhdf5filters to load in R. "
+            "lzf is a fast single-thread filter; none disables compression."
+        ),
+    )
+    parser.add_argument(
+        "--compression-threads",
+        type=int,
+        default=None,
+        help=(
+            "Blosc worker threads per compress call (default: CPU count / shard "
+            "writer count). Ignored unless --compression is blosc or blosc-zstd."
         ),
     )
     parser.add_argument(
@@ -202,6 +213,7 @@ def main(args: Optional[List[str]] = None) -> int:
             n_shards=parsed.shards,
             use_temp_files=not parsed.no_temp_file,
             compression=parsed.compression,
+            compression_threads=parsed.compression_threads,
             temp_dir=parsed.temp_dir,
             min_base_quality=parsed.min_baseq,
             min_mapq=parsed.min_mapq,
