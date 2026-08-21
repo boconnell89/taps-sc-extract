@@ -1,0 +1,4 @@
+[env]
+PKG_CONFIG_PATH = { value = "/home/oconnelb/miniforge3/lib/pkgconfig", relative = false, force = true }
+LIBCLANG_PATH = { value = "/home/oconnelb/miniforge3/lib", relative = false, force = true }
+HDF5_DIR = { value = "/home/oconnelb/miniforge3", relative = false, force = true }

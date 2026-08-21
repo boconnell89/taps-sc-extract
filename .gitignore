@@ -3,9 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-dist/
-build/
-.eggs/
+# Rust build artifacts
+target/
+**/target/
+Cargo.lock
 
 # Testing & Linting
 .pytest_cache/
@@ -33,7 +34,6 @@ sharded_output/
 251107/
 260106_5base/
 260731/
-code/
 
 # IDE & Editor configs
 .vscode/
