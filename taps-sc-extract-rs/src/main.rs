@@ -80,6 +80,12 @@ enum Commands {
         /// flag is currently a no-op; we do not copy that).
         #[arg(long, default_value_t = false)]
         no_baq: bool,
+        /// Drop this many 5' sequenced bases of read 1 before calling.
+        #[arg(long, default_value_t = 0)]
+        trim_r1: u32,
+        /// Drop this many 5' sequenced bases of read 2 before calling.
+        #[arg(long, default_value_t = 10)]
+        trim_r2: u32,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
         /// Pileup engine: rust-htslib (htslib) or noodles (pure Rust CIGAR walk).
@@ -145,6 +151,12 @@ enum Commands {
         /// Disable BAQ. Default is on (do not copy Python's current no-op).
         #[arg(long, default_value_t = false)]
         no_baq: bool,
+        /// Drop this many 5' sequenced bases of read 1 before calling.
+        #[arg(long, default_value_t = 0)]
+        trim_r1: u32,
+        /// Drop this many 5' sequenced bases of read 2 before calling.
+        #[arg(long, default_value_t = 10)]
+        trim_r2: u32,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
     },
@@ -170,6 +182,8 @@ fn main() -> Result<()> {
             no_overlap_clip,
             no_ignore_orphans,
             no_baq,
+            trim_r1,
+            trim_r2,
             whitelist,
             pileup,
             dump_sites,
@@ -210,9 +224,11 @@ fn main() -> Result<()> {
                 compute_baq,
                 decomp_threads: decomp,
                 accumulate: dump_sites.is_some(),
+                trim_r1,
+                trim_r2,
             };
             eprintln!(
-                "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={compute_baq} overlaps={ignore_overlaps} orphans={ignore_orphans} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
+                "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={compute_baq} overlaps={ignore_overlaps} orphans={ignore_orphans} trim_r1={trim_r1} trim_r2={trim_r2} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
                 windows.len(),
                 contig_list
             );
@@ -282,6 +298,8 @@ fn main() -> Result<()> {
             no_overlap_clip,
             no_ignore_orphans,
             no_baq,
+            trim_r1,
+            trim_r2,
             whitelist,
         } => {
             let fai = FastFaiReader::open(&fasta)?;
@@ -335,6 +353,8 @@ fn main() -> Result<()> {
                 compute_baq: !no_baq,
                 decomp_threads: decomp,
                 accumulate: true,
+                trim_r1,
+                trim_r2,
             };
             eprintln!("======================================================================");
             eprintln!("taps-sc-extract-rs v{}", env!("CARGO_PKG_VERSION"));
@@ -347,6 +367,7 @@ fn main() -> Result<()> {
             eprintln!("  Writer threads:  {} ({})", writer_threads, writer_src);
             eprintln!("  Memory mode:     {} ({})", resolved_memory_mode, mode_src);
             eprintln!("  BAQ:             {}", params.compute_baq);
+            eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
             eprintln!("======================================================================");

@@ -18,7 +18,9 @@
 
 use crate::accumulate::{ensure_cell, merge_window_cells, BarcodeIntern, CellMaps};
 use crate::barcode::barcode_from_qname_bytes;
-use crate::calling::{call_mctot, classify_strand};
+use crate::calling::{
+    call_mctot, classify_strand, keep_after_5prime_trim, DEFAULT_TRIM_R1, DEFAULT_TRIM_R2,
+};
 use crate::context::{classify_trinucleotide, Context, TriContext};
 use crate::fasta::FastFaiReader;
 use crate::window::Window;
@@ -151,6 +153,10 @@ pub struct ExtractParams {
     pub decomp_threads: usize,
     /// Fill per-barcode (pos, t, c) maps. Off for stats-only (saves RAM).
     pub accumulate: bool,
+    /// Drop this many 5' sequenced bases of read 1 (default 0).
+    pub trim_r1: u32,
+    /// Drop this many 5' sequenced bases of read 2 (default 10).
+    pub trim_r2: u32,
 }
 
 impl Default for ExtractParams {
@@ -164,6 +170,8 @@ impl Default for ExtractParams {
             compute_baq: true,
             decomp_threads: 1,
             accumulate: false,
+            trim_r1: DEFAULT_TRIM_R1,
+            trim_r2: DEFAULT_TRIM_R2,
         }
     }
 }
@@ -295,6 +303,15 @@ pub fn process_window(
             let rec = aln.record();
             let seq = rec.seq();
             if qpos >= seq.len() {
+                continue;
+            }
+            if !keep_after_5prime_trim(
+                qpos,
+                seq.len(),
+                rec.flags(),
+                params.trim_r1,
+                params.trim_r2,
+            ) {
                 continue;
             }
             let qual = rec.qual().get(qpos).copied().unwrap_or(0);

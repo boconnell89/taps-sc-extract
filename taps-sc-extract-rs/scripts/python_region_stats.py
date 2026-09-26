@@ -6,7 +6,13 @@ from collections import defaultdict
 
 import pysam
 
-from taps_sc_extract.calling import FLAG_STRAND_MAP, MCTOT_LOOKUP
+from taps_sc_extract.calling import (
+    DEFAULT_TRIM_R1,
+    DEFAULT_TRIM_R2,
+    FLAG_STRAND_MAP,
+    MCTOT_LOOKUP,
+    keep_after_5prime_trim,
+)
 from taps_sc_extract.fasta import FastFaiReader
 
 
@@ -20,6 +26,8 @@ def main():
     p.add_argument("--min-baseq", type=int, default=20)
     p.add_argument("--min-mapq", type=int, default=0)
     p.add_argument("--max-depth", type=int, default=250)
+    p.add_argument("--trim-r1", type=int, default=DEFAULT_TRIM_R1)
+    p.add_argument("--trim-r2", type=int, default=DEFAULT_TRIM_R2)
     p.add_argument(
         "--no-baq",
         action="store_true",
@@ -98,6 +106,10 @@ def main():
             aln = pr.alignment
             strand = FLAG_STRAND_MAP.get(aln.flag)
             if strand is None:
+                continue
+            if not keep_after_5prime_trim(
+                qpos, aln.query_length, aln.flag, args.trim_r1, args.trim_r2
+            ):
                 continue
             seq = aln.query_sequence
             if seq is None:

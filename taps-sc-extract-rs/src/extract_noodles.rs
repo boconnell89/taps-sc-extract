@@ -7,7 +7,7 @@
 
 use crate::accumulate::{ensure_cell, merge_window_cells, BarcodeIntern};
 use crate::barcode::barcode_from_qname_bytes;
-use crate::calling::{call_mctot, classify_strand};
+use crate::calling::{call_mctot, classify_strand, keep_after_5prime_trim};
 use crate::context::{classify_trinucleotide, Context, TriContext};
 use crate::extract::{CallStats, ExtractParams, WindowResult};
 use crate::fasta::FastFaiReader;
@@ -94,7 +94,15 @@ pub fn process_window_noodles(
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                     for _ in 0..len {
                         if ref_pos >= win_start && ref_pos < win_end {
-                            if qpos < seq.len() {
+                            if qpos < seq.len()
+                                && keep_after_5prime_trim(
+                                    qpos,
+                                    seq.len(),
+                                    flag_bits,
+                                    params.trim_r1,
+                                    params.trim_r2,
+                                )
+                            {
                                 let qb = qual_slice.get(qpos).copied().unwrap_or(0);
                                 if qb >= params.min_baseq {
                                     if let Some(base) = seq.get(qpos) {

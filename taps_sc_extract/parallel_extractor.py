@@ -33,7 +33,13 @@ import numpy as np
 import pysam
 
 from .barcode import parse_annot
-from .calling import MCTOT_LOOKUP, FLAG_STRAND_MAP
+from .calling import (
+    DEFAULT_TRIM_R1,
+    DEFAULT_TRIM_R2,
+    FLAG_STRAND_MAP,
+    MCTOT_LOOKUP,
+    keep_after_5prime_trim,
+)
 from .fasta import FastFaiReader
 from .h5_writer import (
     AmethystH5Writer,
@@ -154,6 +160,8 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     ignore_orphans = params["ignore_orphans"]
     use_temp_files = params.get("use_temp_files", True)
     n_shards = params.get("n_shards", 1)
+    trim_r1 = params.get("trim_r1", DEFAULT_TRIM_R1)
+    trim_r2 = params.get("trim_r2", DEFAULT_TRIM_R2)
 
     # Fetch reference sequence with 2bp padding on each side
     ref_len = fai.get_reference_length(contig)
@@ -237,6 +245,10 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
             aln = pileupread.alignment
             strand = FLAG_STRAND_MAP.get(aln.flag)
             if strand is None:
+                continue
+            if not keep_after_5prime_trim(
+                qpos, aln.query_length, aln.flag, trim_r1, trim_r2
+            ):
                 continue
 
             read_base = aln.query_sequence[qpos]
@@ -515,6 +527,8 @@ def extract_methylation_parallel(
     compute_baq: bool = True,
     ignore_orphans: bool = True,
     ignore_overlaps: bool = True,
+    trim_r1: int = DEFAULT_TRIM_R1,
+    trim_r2: int = DEFAULT_TRIM_R2,
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -575,6 +589,7 @@ def extract_methylation_parallel(
         f"HDF5 compression: {compression}"
         f"{f' (level {compression_level})' if compression in ('gzip', 'blosc', 'blosc-zstd') else ''}."
     )
+    logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp")
 
     worker_params = {
         "decomp_threads": decomp_threads,
@@ -586,6 +601,8 @@ def extract_methylation_parallel(
         "ignore_orphans": ignore_orphans,
         "use_temp_files": use_temp_files,
         "n_shards": effective_shards,
+        "trim_r1": trim_r1,
+        "trim_r2": trim_r2,
     }
 
     if effective_shards > 1:

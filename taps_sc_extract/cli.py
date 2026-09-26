@@ -112,7 +112,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default="gzip",
         help=(
             "HDF5 dataset compression (default: gzip). "
-            "gzip (level 1 deflate) is fast and 100% portable to Amethyst/rhdf5 with no extra packages. "
+            "gzip (level 1 deflate) is fast and 100%% portable to Amethyst/rhdf5 with no extra packages. "
             "gzip-shuffle applies byte shuffling before level 1 deflate for high ratio and speed. "
             "gzip6 uses standard level 6 deflate. "
             "none disables compression for maximum write speed. "
@@ -186,6 +186,21 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Do not ignore overlapping mate read bases.",
     )
     parser.add_argument(
+        "--trim-r2",
+        type=int,
+        default=10,
+        help=(
+            "Drop this many bases from the 5' end of read 2 before calling "
+            "(default: 10). Removes Tn5/TAPS M-bias on R2."
+        ),
+    )
+    parser.add_argument(
+        "--trim-r1",
+        type=int,
+        default=0,
+        help="Drop this many bases from the 5' end of read 1 before calling (default: 0).",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -247,6 +262,9 @@ def main(args: Optional[List[str]] = None) -> int:
     parsed = parse_args(args)
     setup_logging(verbose=parsed.verbose, log_file=parsed.log_file)
     logger = logging.getLogger("taps_sc_extract")
+    if parsed.trim_r1 < 0 or parsed.trim_r2 < 0:
+        logger.error("--trim-r1 and --trim-r2 must be >= 0.")
+        return 1
 
     logger.info("=" * 70)
     logger.info(f"taps-sc-extract v{__version__} - Single-Cell TAPS Extractor")
@@ -302,6 +320,7 @@ def main(args: Optional[List[str]] = None) -> int:
             cmd.extend(["--memory-mode", parsed.memory_mode])
         elif parsed.no_temp_file:
             cmd.extend(["--memory-mode", "memory"])
+        cmd.extend(["--trim-r1", str(parsed.trim_r1), "--trim-r2", str(parsed.trim_r2)])
 
         try:
             res = subprocess.run(cmd)
@@ -337,6 +356,8 @@ def main(args: Optional[List[str]] = None) -> int:
             compute_baq=not parsed.no_baq,
             ignore_orphans=True,
             ignore_overlaps=not parsed.no_overlap_clip,
+            trim_r1=parsed.trim_r1,
+            trim_r2=parsed.trim_r2,
         )
         return 0
     except Exception as e:

@@ -17,7 +17,13 @@ import numpy as np
 import pysam
 
 from .barcode import extract_barcode, parse_annot
-from .calling import MCTOT_LOOKUP, FLAG_STRAND_MAP
+from .calling import (
+    DEFAULT_TRIM_R1,
+    DEFAULT_TRIM_R2,
+    FLAG_STRAND_MAP,
+    MCTOT_LOOKUP,
+    keep_after_5prime_trim,
+)
 from .context import classify_context, classify_trinucleotide_context
 from .h5_writer import AmethystH5Writer, METH_DTYPE
 
@@ -44,6 +50,8 @@ def extract_methylation(
     compute_baq: bool = True,
     ignore_orphans: bool = True,
     ignore_overlaps: bool = True,
+    trim_r1: int = DEFAULT_TRIM_R1,
+    trim_r2: int = DEFAULT_TRIM_R2,
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -60,6 +68,8 @@ def extract_methylation(
         compute_baq: Whether to compute Base Alignment Quality (default True).
         ignore_orphans: Whether to ignore unpaired reads (default True).
         ignore_overlaps: Whether to skip overlapping mate bases (default True).
+        trim_r1: Drop this many 5' sequenced bases of read 1 (default 0).
+        trim_r2: Drop this many 5' sequenced bases of read 2 (default 10).
 
     Returns:
         Summary dictionary with counts, methylation percentages, and performance metrics.
@@ -86,6 +96,7 @@ def extract_methylation(
     total_target_reads = sum(idx_stats.get(c, 0) for c in target_contigs)
 
     logger.info(f"Processing {len(target_contigs)} contig(s) with {total_target_reads:,} total mapped reads.")
+    logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp")
 
     total_stats = {
         "CpG": {"c": 0, "t": 0},
@@ -180,6 +191,10 @@ def extract_methylation(
                     aln = pileupread.alignment
                     strand = FLAG_STRAND_MAP.get(aln.flag)
                     if strand is None:
+                        continue
+                    if not keep_after_5prime_trim(
+                        qpos, aln.query_length, aln.flag, trim_r1, trim_r2
+                    ):
                         continue
 
                     read_base = aln.query_sequence[qpos]

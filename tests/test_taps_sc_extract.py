@@ -10,7 +10,14 @@ import pysam
 import pytest
 
 from taps_sc_extract.barcode import extract_barcode, parse_annot
-from taps_sc_extract.calling import OT_FLAGS, OB_FLAGS, call_mctot, classify_strand
+from taps_sc_extract.cli import parse_args
+from taps_sc_extract.calling import (
+    OB_FLAGS,
+    OT_FLAGS,
+    call_mctot,
+    classify_strand,
+    keep_after_5prime_trim,
+)
 from taps_sc_extract.context import classify_context, classify_trinucleotide_context
 from taps_sc_extract.extractor import CANONICAL_CONTIGS, extract_methylation
 from taps_sc_extract.h5_writer import AmethystH5Writer, METH_DTYPE
@@ -103,6 +110,46 @@ def test_mCtoT_interpret():
     # OB strand with ref C should not make a call
     assert call_mctot("OB", "C", "T") is None
     assert call_mctot("OB", "C", "C") is None
+
+
+def test_keep_after_5prime_trim():
+    # R2 forward (flag 163): first 10 SEQ bases are the sequenced 5'.
+    flag_r2_fwd = 163
+    for q in range(10):
+        assert keep_after_5prime_trim(q, 49, flag_r2_fwd, 0, 10) is False
+    assert keep_after_5prime_trim(10, 49, flag_r2_fwd, 0, 10) is True
+    assert keep_after_5prime_trim(48, 49, flag_r2_fwd, 0, 10) is True
+
+    # R2 reverse (flag 147): sequenced 5' is at the high end of SEQ.
+    flag_r2_rev = 147
+    assert keep_after_5prime_trim(0, 49, flag_r2_rev, 0, 10) is True
+    assert keep_after_5prime_trim(38, 49, flag_r2_rev, 0, 10) is True
+    for q in range(39, 49):
+        assert keep_after_5prime_trim(q, 49, flag_r2_rev, 0, 10) is False
+
+    # R1 default trim 0 keeps every base.
+    for flag in (99, 83):
+        for q in range(39):
+            assert keep_after_5prime_trim(q, 39, flag, 0, 10) is True
+
+    # R1 reverse with trim_r1=5 drops the last 5 SEQ bases.
+    flag_r1_rev = 83
+    assert keep_after_5prime_trim(33, 39, flag_r1_rev, 5, 10) is True
+    assert keep_after_5prime_trim(34, 39, flag_r1_rev, 5, 10) is False
+
+    # Zero trim keeps everything; trim covering the whole read drops everything.
+    assert keep_after_5prime_trim(0, 49, flag_r2_fwd, 0, 0) is True
+    assert keep_after_5prime_trim(0, 10, flag_r2_fwd, 0, 10) is False
+    assert keep_after_5prime_trim(9, 10, flag_r2_fwd, 0, 10) is False
+
+
+def test_cli_trim_defaults():
+    ns = parse_args(["-b", "x.bam", "-f", "x.fa", "-o", "out.h5"])
+    assert ns.trim_r1 == 0
+    assert ns.trim_r2 == 10
+    ns = parse_args(["-b", "x.bam", "-f", "x.fa", "-o", "out.h5", "--trim-r1", "5", "--trim-r2", "0"])
+    assert ns.trim_r1 == 5
+    assert ns.trim_r2 == 0
 
 
 # 4. Barcode extraction tests

@@ -96,7 +96,9 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--no-temp-file] [--temp-dir TEMP_DIR]
                        [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
-                       [--no-baq] [--no-overlap-clip] [-v] [--version]
+                       [--no-baq] [--no-overlap-clip]
+                       [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
+                       [-v] [--version]
 ```
 
 ### Argument Details
@@ -126,6 +128,8 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--max-depth` | `int` | `250` | Maximum pileup depth. |
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
+| `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
+| `--trim-r1` | `int` | `0` | Drop this many 5′ sequenced bases of read 1 before calling. |
 | `-v, --verbose` | `flag` | `False` | Enable verbose debug logging. |
 
 ---

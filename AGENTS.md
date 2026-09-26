@@ -75,6 +75,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **TAPS Calling Logic**:
   - Original Top strand (`OT`, `+`): Reference `C` $\to$ Read `T` is **Methylated** (`c += 1`), Read `C` is **Unmethylated** (`t += 1`).
   - Original Bottom strand (`OB`, `-`): Reference `G` $\to$ Read `A` is **Methylated** (`c += 1`), Read `G` is **Unmethylated** (`t += 1`).
+  - **5′ sequenced-base trim**: drop `--trim-r2` (default 10) bases of read 2 and `--trim-r1` (default 0) of read 1 before calling. Reverse-strand BAM SEQ is reverse-complemented, so the original 5′ end is at the high end of SEQ. Implemented by `keep_after_5prime_trim()` in Python and Rust.
 - **Amethyst Structured Array Dtype**:
   `[('chr', 'S10'), ('pos', '<i8'), ('pct', '<f8'), ('t', '<i8'), ('c', '<i8')]`
   - `t` (unmethylated) comes **before** `c` (methylated).
@@ -112,6 +113,8 @@ summary = extract_methylation_parallel(
     n_shards=16,
     chunk_size_mb=10,
     use_temp_files=True,
+    trim_r1=0,
+    trim_r2=10,
 )
 print("Extraction Summary:", summary)
 ```

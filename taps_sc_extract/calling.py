@@ -23,6 +23,15 @@ FLAG_STRAND_MAP = {
     163: 'OB',
 }
 
+# SAM flag bits used to locate the sequenced 5' end of R1/R2.
+BAM_FREVERSE = 16
+BAM_FREAD2 = 128
+
+# Default 5' sequenced-base trims. R2 5' shows strong Tn5/TAPS M-bias;
+# R1 is typically clean.
+DEFAULT_TRIM_R1 = 0
+DEFAULT_TRIM_R2 = 10
+
 # Direct lookup table for mCtoT calling: (strand, ref_base, read_base) -> 0 (unmeth) / 1 (meth)
 MCTOT_LOOKUP = {
     ('OT', 'C', 'T'): 1,
@@ -44,6 +53,31 @@ def classify_strand(flag: int) -> Optional[str]:
     will not match these flags and return None.
     """
     return FLAG_STRAND_MAP.get(flag)
+
+
+def keep_after_5prime_trim(
+    qpos: int,
+    query_length: int,
+    flag: int,
+    trim_r1: int = DEFAULT_TRIM_R1,
+    trim_r2: int = DEFAULT_TRIM_R2,
+) -> bool:
+    """
+    Keep this pileup base if it is past the 5' sequenced-base trim.
+
+    ``qpos`` is the 0-based index into BAM SEQ (reference-oriented). Reverse-
+    strand records store SEQ reverse-complemented, so the original sequenced
+    5' end is at the high end of SEQ. R2 uses ``trim_r2`` (default 10);
+    everything else uses ``trim_r1`` (default 0).
+    """
+    trim = trim_r2 if (flag & BAM_FREAD2) else trim_r1
+    if trim <= 0:
+        return True
+    if trim >= query_length:
+        return False
+    if flag & BAM_FREVERSE:
+        return qpos < query_length - trim
+    return qpos >= trim
 
 
 def call_mctot(strand: str, ref_base: str, read_base: str) -> Optional[int]:
