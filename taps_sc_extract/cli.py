@@ -134,8 +134,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Blosc worker threads per compress call (default: CPU count / shard "
-            "writer count). Ignored unless --compression is blosc or blosc-zstd."
+            "Rust engine: Blosc threads per shard writer (default 1). Only used with "
+            "--compression blosc or blosc-zstd; more threads measured no gain."
         ),
     )
     parser.add_argument(
@@ -359,6 +359,8 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.append("--no-overlap-clip")
     if parsed.profile_json:
         cmd.extend(["--profile-json", parsed.profile_json])
+    if parsed.compression_threads is not None:
+        cmd.extend(["--compression-threads", str(parsed.compression_threads)])
     if parsed.max_memory_gb:
         cmd.extend(["--max-memory-gb", str(parsed.max_memory_gb)])
     if parsed.max_memory_fraction:

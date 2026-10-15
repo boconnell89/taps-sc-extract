@@ -223,6 +223,25 @@ pub fn write_shard_file(
     Ok(cells.len())
 }
 
+/// Blosc's internal compression threads per writer (`--compression-threads`;
+/// 0 = Blosc's default of 1). Only the blosc codecs use it; LZF and gzip run
+/// single-threaded inside HDF5. Set by `extract` before writing; passed on to
+/// `write-shard` children.
+pub static BLOSC_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set Blosc's thread count for this process (no-op for 0).
+pub fn apply_blosc_threads(n: usize) {
+    if n > 0 {
+        hdf5_metno::filters::blosc_set_nthreads(n.min(255) as u8);
+    }
+}
+
+impl H5Compression {
+    pub fn is_blosc(self) -> bool {
+        matches!(self, Self::BloscLz4(..) | Self::BloscZstd(..))
+    }
+}
+
 /// Write one shard from window chunks, one barcode at a time.
 ///
 /// Sites stay at 12 bytes each in the chunks; at most `WRITE_SLICE` records
@@ -353,6 +372,8 @@ fn run_shard_writer_process(
         .arg(out)
         .arg("--compression")
         .arg(compression_name)
+        .arg("--compression-threads")
+        .arg(BLOSC_THREADS.load(std::sync::atomic::Ordering::Relaxed).to_string())
         .env("HDF5_USE_FILE_LOCKING", "FALSE")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

@@ -193,6 +193,7 @@ Measured on chr1–3 before `026c52e` with the older in-process writers. Ratios 
 
 ### 6. `--max-writer-threads` and `--writer-mode`
 - **`--writer-mode process`** (default with more than one shard): one `taps-sc-extract-rs write-shard` child per shard, up to `--max-writer-threads` at a time. Each child streams its shard one cell at a time in bounded slices, so a writer needs roughly 15–60 bytes per site of its shard.
+- **`--compression-threads`** (Blosc codecs only, default 1): Blosc threads per writer. On the test BAM, 1, 2, 4 and 32 threads wrote in the same time (16 shards: 9.9–10.4 s; 1 shard: 53–54 s). Most cell datasets are a single chunk too small for Blosc to split, so parallelism comes from shards.
 - **`--writer-mode thread`**: in-process writers. hdf5-metno takes one process-wide lock for every HDF5 call, so they do not write in parallel; auto caps them at 6.
 - **Auto count**: up to min(shards, CPUs), and only as many as fit the memory budget at about 20 bytes per site of a shard each, or the saved `--test` profile (still memory-bounded). Lower it on network filesystems (NFS/Lustre: 2–4) or spinning disks (1).
 

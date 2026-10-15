@@ -279,3 +279,18 @@ Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Wo
   - chr19 `--no-baq`: Rust equals Python at every cell and position (856,147 CG, 20,043,609 CH calls). `test_chr19_rust_matches_python_per_cell` now requires exact equality.
   - BAQ on, chr19: −18 CG / −167 CH calls. New frozen reference `test_chr19_rust_overlapfix_2026-10-15/`.
   - BAQ on, full mm10 test BAM: CG 30,341,601 → 30,341,182 (−419), CH 814,768,999 → 814,759,288 (−9,711). Run time is unchanged.
+
+## 2026-10-15 — `--compression-threads` in the Rust engine
+
+- New flag, forwarded by the Python CLI. It sets Blosc's thread count in each `write-shard` child, or in-process for thread mode or one shard. It applies only to `blosc` and `blosc-zstd`; LZF and gzip run single-threaded inside HDF5.
+- Measured at T=32, stream mode, full mm10 test BAM (HDF5 write seconds):
+
+  | Codec | Shards | 1 thread | 2 threads (CPUs/writers) | 4 threads | 32 threads |
+  |---|---|---|---|---|---|
+  | Blosc LZ4 L9 | 16 | 9.9 | 10.4 | 10.4 | — |
+  | Blosc LZ4 L9 | 1 | 54.0 | — | — | 53.2 |
+  | Blosc-Zstd | 16 | 24.2 | 23.2 | — | — |
+  | Blosc-Zstd | 1 | — | — | — | 70.9 |
+
+  Output sizes: LZ4 1.4 GB, Zstd 976 MB (LZF 4.2 GB).
+- **No gain**, so the default stays 1. Most cell datasets are a single small chunk, and write time is per-dataset HDF5 work plus shard parallelism, not compression throughput inside a chunk.

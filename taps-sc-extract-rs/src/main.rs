@@ -149,6 +149,11 @@ enum Commands {
         /// HDF5 compression (Rust default: lzf).
         #[arg(long, default_value = "lzf")]
         compression: String,
+        /// Blosc internal threads per shard writer (blosc / blosc-zstd only).
+        /// Default 1: more threads measured no gain (2026-10-15), because most
+        /// cell datasets are a single chunk too small for Blosc to split.
+        #[arg(long)]
+        compression_threads: Option<usize>,
         /// Maximum concurrent shard writers (0 = auto sized from shards, cores, RAM).
         #[arg(long, default_value_t = 0)]
         max_writer_threads: usize,
@@ -217,6 +222,9 @@ enum Commands {
         out: PathBuf,
         #[arg(long, default_value = "lzf")]
         compression: String,
+        /// Blosc internal threads (0 = Blosc default).
+        #[arg(long, default_value_t = 0)]
+        compression_threads: usize,
         /// Stream-mode temp directory holding this shard's chunk_*.bin files.
         #[arg(long, conflicts_with = "stdin")]
         chunk_dir: Option<PathBuf>,
@@ -260,11 +268,15 @@ fn main() -> Result<()> {
             shard,
             out,
             compression,
+            compression_threads,
             chunk_dir,
             stdin,
         } => {
             std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
             let codec = H5Compression::parse(&compression)?;
+            if codec.is_blosc() {
+                crate::h5_out::apply_blosc_threads(compression_threads);
+            }
             let t0 = Instant::now();
             let chunks = match (chunk_dir, stdin) {
                 (Some(d), false) => read_shard_temp_chunks(&d)?,
@@ -415,6 +427,7 @@ fn main() -> Result<()> {
             max_memory_fraction,
             expected_cells,
             compression,
+            compression_threads,
             max_writer_threads,
             writer_mode,
             min_baseq,
@@ -508,6 +521,15 @@ fn main() -> Result<()> {
             let (resolved_memory_mode, mode_src) = (mem_plan.mode.clone(), mem_plan.mode_src);
             let compression_name = compression.clone();
             let compression = H5Compression::parse(&compression)?;
+            let blosc_threads = if compression.is_blosc() {
+                compression_threads.unwrap_or(1).max(1)
+            } else {
+                0
+            };
+            crate::h5_out::BLOSC_THREADS.store(blosc_threads, std::sync::atomic::Ordering::Relaxed);
+            if writer_mode == WriterMode::Thread || n_shards == 1 {
+                crate::h5_out::apply_blosc_threads(blosc_threads);
+            }
             let params = ExtractParams {
                 min_baseq,
                 min_mapq,
@@ -547,7 +569,11 @@ fn main() -> Result<()> {
                 eprintln!("  warning: estimated peak exceeds the memory budget; lower --max-writer-threads or use --memory-mode stream");
             }
             eprintln!("  Chunk size:      {:.1} Mb ({chunk_src})", chunk_bp as f64 / 1e6);
-            eprintln!("  Compression:     {compression_name}");
+            if blosc_threads > 0 {
+                eprintln!("  Compression:     {compression_name} ({blosc_threads} Blosc thread(s) per writer)");
+            } else {
+                eprintln!("  Compression:     {compression_name}");
+            }
             eprintln!("  BAQ:             {}", params.compute_baq);
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
