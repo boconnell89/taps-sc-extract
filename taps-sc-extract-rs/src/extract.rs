@@ -271,9 +271,13 @@ pub fn process_window(
     let win_start = window.start as u32;
     let win_end = window.end as u32;
 
-    let mut mru_ptr: *const u8 = std::ptr::null();
-    let mut mru_len: usize = 0;
-    let mut mru_id: Option<u32> = None;
+    // Cell id per pileup read, indexed by `bam1_t.id`: htslib numbers each read
+    // it stores in this iterator 0, 1, 2, ... and never reuses a number. (The
+    // record's address is reused once htslib recycles its node, so it cannot
+    // identify a read.) Resolved on the read's first call.
+    const CELL_UNRESOLVED: u32 = u32::MAX;
+    const CELL_NONE: u32 = u32::MAX - 1;
+    let mut read_cell: Vec<u32> = Vec::new();
 
     let mut consume_column = |pos: u32, n_plp: i32, col: *const htslib::bam_pileup1_t| {
         if pos < win_start || pos >= win_end || n_plp <= 0 || col.is_null() {
@@ -325,28 +329,25 @@ pub fn process_window(
                 continue;
             };
 
-            let qname = rec.qname();
-            let qptr = qname.as_ptr();
-            let qlen = qname.len();
-            let id_opt = if qptr == mru_ptr && qlen == mru_len {
-                mru_id
-            } else {
-                let bc_bytes = barcode_from_qname_bytes(qname);
-                let valid = if let Some(wl) = whitelist {
-                    let bc = std::str::from_utf8(bc_bytes).unwrap_or("");
-                    wl.contains(bc)
-                } else {
-                    true
+            let read_id = unsafe { (*p.b).id } as usize;
+            if read_id >= read_cell.len() {
+                read_cell.resize(read_id + 1, CELL_UNRESOLVED);
+            }
+            if read_cell[read_id] == CELL_UNRESOLVED {
+                let bc_bytes = barcode_from_qname_bytes(rec.qname());
+                let valid = match whitelist {
+                    Some(wl) => wl.contains(std::str::from_utf8(bc_bytes).unwrap_or("")),
+                    None => true,
                 };
-                let id = if valid {
-                    Some(intern.intern_bytes(bc_bytes))
+                read_cell[read_id] = if valid {
+                    intern.intern_bytes(bc_bytes)
                 } else {
-                    None
+                    CELL_NONE
                 };
-                mru_ptr = qptr;
-                mru_len = qlen;
-                mru_id = id;
-                id
+            }
+            let id_opt = match read_cell[read_id] {
+                CELL_NONE => None,
+                id => Some(id),
             };
 
             let Some(id) = id_opt else {
