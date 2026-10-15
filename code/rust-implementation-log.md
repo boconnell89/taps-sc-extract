@@ -243,7 +243,7 @@ Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Wo
   - `--save-profile` makes the recommendations the defaults on this host.
 - **Open:**
   - Auto shards is 1 below 10k cells, and one shard writes 4–5× slower (61.9 s against 11–16 s).
-  - The Rust-has-more-calls parity gap (31 CG / 309 CH positions on chr19 `--no-baq`) is still unexplained.
+  - (Resolved later the same day: the parity gap was htslib 1.19.1 vs 1.21 overlap clipping. See below.)
   - The 96-core server and the NUMA check have not been run.
   - (Fixed later the same day: memory mode and writer count now account for writer-child memory. See below.)
   - `--compression-threads` is accepted by the Python CLI but ignored by Rust.
@@ -263,3 +263,19 @@ Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Wo
 
   Run time was unchanged in both.
 - Amethyst 1.0.5 (`amethyst_r` env): `createObject` and `indexChr` on a 4-shard chr19 output from process writers ran without per-barcode errors. CG cells and sites match h5py exactly (4,977 / 792,338).
+
+## 2026-10-15 — Parity with the Python engine: htslib 1.21 overlap clipping
+
+- **Symptom.** With `--no-baq` on chr19, Rust had extra calls at 31 CG and 309 CH positions (343 cell-positions, nearly all +1 `t`). At every one, the read's mate overlapped the position but had a **deletion** there.
+- **Cause.** pysam 0.23.3 bundles htslib 1.21, while rust-htslib 0.49 / hts-sys 2.2.1 bundle htslib 1.19.1 (still the newest on crates.io).
+  - htslib 1.21's `tweak_overlap_quality` also down-weights a mate's bases where the other mate has a deletion inside the overlap: ×0.8 on one read, 0 on the other, chosen by QNAME hash.
+  - 1.19.1 skipped those positions ("don't know what to do with indels"), so Rust kept a Q≥20 base that Python drops.
+  - `overlap_push` is identical in both versions. The earlier equal-start and supplementary-read hypotheses were wrong.
+- **Fix.**
+  - `taps-sc-extract-rs/patches/hts-sys-2.2.1-overlap-deletions.patch` replaces that one function with htslib 1.21's.
+  - `install.sh` downloads `hts-sys-2.2.1.crate`, checks its crates.io sha256, extracts it into `vendor/` (git-ignored) and applies the patch.
+  - `Cargo.toml` `[patch.crates-io]` points hts-sys at the vendored copy. A plain `cargo build` now needs `install.sh` to have run once.
+- **Result.**
+  - chr19 `--no-baq`: Rust equals Python at every cell and position (856,147 CG, 20,043,609 CH calls). `test_chr19_rust_matches_python_per_cell` now requires exact equality.
+  - BAQ on, chr19: −18 CG / −167 CH calls. New frozen reference `test_chr19_rust_overlapfix_2026-10-15/`.
+  - BAQ on, full mm10 test BAM: CG 30,341,601 → 30,341,182 (−419), CH 814,768,999 → 814,759,288 (−9,711). Run time is unchanged.

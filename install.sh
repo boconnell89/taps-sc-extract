@@ -44,6 +44,9 @@ if [[ ${#missing[@]} -eq 0 ]]; then
     ls "$PREFIX"/lib/libclang*.so* >/dev/null 2>&1 || missing+=("libclang in $PREFIX/lib")
 fi
 command -v cargo >/dev/null || missing+=("cargo (https://rustup.rs)")
+for tool in curl patch sha256sum; do
+    command -v "$tool" >/dev/null || missing+=("$tool")
+done
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "install.sh: missing:" >&2
     printf '  - %s\n' "${missing[@]}" >&2
@@ -73,6 +76,32 @@ echo "Cores:     $(nproc)  RAM: $(awk '/MemTotal/ {printf "%.0f GB", $2/1048576}
 echo "CPU flags: ${CPU_FLAGS:-unknown}"
 echo "Prefix:    $PREFIX"
 echo "Target:    target-cpu=$TARGET_CPU, -march=$MARCH"
+
+# hts-sys 2.2.1 bundles htslib 1.19.1. Patch in htslib 1.21's overlap clipping so
+# Rust calls match the Python engine (pysam / htslib 1.21); see
+# taps-sc-extract-rs/patches/. Cargo.toml points hts-sys at this copy.
+HTS_VER=2.2.1
+HTS_DIR="$CRATE/vendor/hts-sys-$HTS_VER"
+HTS_PATCH="$CRATE/patches/hts-sys-$HTS_VER-overlap-deletions.patch"
+if [[ ! -f "$HTS_DIR/.taps_patched" ]]; then
+    echo "Vendoring hts-sys $HTS_VER with $(basename "$HTS_PATCH") ..."
+    # crates.io checksum of hts-sys 2.2.1 (Cargo.lock no longer records it once
+    # [patch.crates-io] points at the vendored copy).
+    want="fc7e68eb880b02c80cfb41e8dc7904062a3ea7e27b7c4556e88d648dd2f038da"
+    tmp="$(mktemp -d)"
+    curl -sSfL "https://static.crates.io/crates/hts-sys/hts-sys-$HTS_VER.crate" -o "$tmp/hts-sys.crate"
+    got="$(sha256sum "$tmp/hts-sys.crate" | cut -d' ' -f1)"
+    if [[ "$got" != "$want" ]]; then
+        echo "install.sh: hts-sys-$HTS_VER.crate checksum $got does not match crates.io $want" >&2
+        exit 1
+    fi
+    rm -rf "$HTS_DIR"
+    mkdir -p "$CRATE/vendor"
+    tar -xzf "$tmp/hts-sys.crate" -C "$CRATE/vendor"
+    patch -d "$HTS_DIR" -p1 --forward --quiet < "$HTS_PATCH"
+    touch "$HTS_DIR/.taps_patched"
+    rm -rf "$tmp"
+fi
 
 # Flag changes do not always trigger a rebuild of the vendored C, so start clean.
 (cd "$CRATE" && cargo clean --release -q && cargo build --release)

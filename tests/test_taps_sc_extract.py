@@ -292,10 +292,10 @@ def test_canonical_contig_allowlist():
 # 10. Real BAM smoke test (chr19)
 CHR19_BAM = "/mnt/e/sciMET_TAPS/260731/taps_ucbTn5_sp2.srt.bam"
 CHR19_FASTA = "/mnt/e/refs/mm10/mm10.fa"
-# Rust chr19 output frozen after the barcode-cache fix (see the README in that
-# directory). The older test_chr19_rust_026c52e/ reference has 0.01% of calls
-# under the wrong barcode and is kept only as a record.
-CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_cellfix_2026-10-15/chr19.h5"
+# Rust chr19 output frozen after the barcode-cache fix and the htslib 1.21
+# overlap-clipping patch (see the README in that directory). Older references
+# (test_chr19_rust_026c52e/, test_chr19_rust_cellfix_2026-10-15/) are records.
+CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_overlapfix_2026-10-15/chr19.h5"
 
 
 def _require(*paths):
@@ -395,27 +395,26 @@ def test_chr19_real_bam_smoke_rust(tmp_path):
                 assert np.array_equal(a, b), f"{ctx}/{bc} differs"
 
 
-def test_chr19_rust_python_same_cell_per_call(chr19_python_run, tmp_path):
-    """Rust --no-baq vs Python on chr19: no call may sit under a different barcode.
+def test_chr19_rust_matches_python_per_cell(chr19_python_run, tmp_path):
+    """Rust --no-baq must equal the Python engine on chr19 at every cell and position.
 
-    Wherever the two engines agree on a position's total (t, c summed over
-    cells), every cell must agree too. Positions whose totals differ are the
-    known, separate Rust-has-more-calls gap and are only bounded here.
+    Python never runs BAQ, so --no-baq is the like-for-like setting. Both use
+    htslib 1.21 overlap clipping (Rust through the patched hts-sys).
     """
     py_h5, _ = chr19_python_run
     rs_h5 = tmp_path / "chr19_rust_nobaq.h5"
     _run_rust_chr19(rs_h5, "--no-baq")
 
-    for ctx, max_total_gap in (("CG", 100), ("CH", 1000)):
+    for ctx in ("CG", "CH"):
         py_cells, py_tot = _sites_by_cell(py_h5, ctx)
         rs_cells, rs_tot = _sites_by_cell(rs_h5, ctx)
-        gap = {p for p in set(py_tot) | set(rs_tot) if py_tot.get(p) != rs_tot.get(p)}
         moved = [
             k for k in set(py_cells) | set(rs_cells)
-            if k[1] not in gap and py_cells.get(k) != rs_cells.get(k)
+            if py_tot.get(k[1]) == rs_tot.get(k[1]) and py_cells.get(k) != rs_cells.get(k)
         ]
         assert not moved, f"{ctx}: {len(moved)} calls under a different barcode, e.g. {moved[:3]}"
-        assert len(gap) <= max_total_gap, f"{ctx}: {len(gap)} positions with differing totals"
+        diff = [k for k in set(py_cells) | set(rs_cells) if py_cells.get(k) != rs_cells.get(k)]
+        assert not diff, f"{ctx}: {len(diff)} (cell, pos) differ from Python, e.g. {sorted(diff)[:3]}"
 
 
 def test_sharded_hdf5_writing(tmp_path):

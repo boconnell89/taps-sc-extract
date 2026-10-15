@@ -32,7 +32,7 @@ cd taps-sc-extract
 conda install -c conda-forge hdf5 clang libclang pkg-config   # build dependencies
 ./install.sh            # native build for this CPU, then pip install -e .
 ```
-`install.sh` writes `taps-sc-extract-rs/.cargo/config.toml` for your conda prefix and builds with `-C target-cpu=native` (Rust) and `-O3 -march=native` (the vendored htslib, including BAQ). A native binary can fail with SIGILL on a different CPU, so **rerun `install.sh` on each host**, or use `./install.sh --portable` for an x86-64-v3 build. `./install.sh --smoke-bam BAM --smoke-fasta FA` also extracts chr19:5.0–5.1 Mb as a check.
+`install.sh` downloads hts-sys 2.2.1 and patches in htslib 1.21's read-pair overlap clipping, so Rust calls match the Python engine. It writes `taps-sc-extract-rs/.cargo/config.toml` for your conda prefix and builds with `-C target-cpu=native` (Rust) and `-O3 -march=native` (the vendored htslib, including BAQ). A native binary can fail with SIGILL on a different CPU, so **rerun `install.sh` on each host**, or use `./install.sh --portable` for an x86-64-v3 build. `./install.sh --smoke-bam BAM --smoke-fasta FA` also extracts chr19:5.0–5.1 Mb as a check.
 
 ### Python reference engine only (pip)
 ```bash
@@ -316,7 +316,7 @@ pytest tests/ -v                        # includes chr19 BAM tests when the data
 (cd taps-sc-extract-rs && cargo test --release)
 ```
 
-The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_cellfix_2026-10-15/`) and, per cell, against the Python engine.
+The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_overlapfix_2026-10-15/`), and require Rust `--no-baq` to equal the Python engine at every cell and position.
 
 ---
 

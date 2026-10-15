@@ -23,3 +23,9 @@ tempfile = "3"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# hts-sys 2.2.1 with htslib 1.21's overlap clipping (see
+# patches/hts-sys-2.2.1-overlap-deletions.patch). install.sh downloads the published
+# crate into vendor/ and applies the patch.
+[patch.crates-io]
+hts-sys = { path = "vendor/hts-sys-2.2.1" }

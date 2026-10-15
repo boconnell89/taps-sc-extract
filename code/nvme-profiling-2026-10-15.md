@@ -85,3 +85,7 @@ The processing and write gaps were then fitted as factors of 1.25 and 1.5 to thi
 Recommended flags matched the best rows: `-t 32 --decomp-threads 0 --writer-mode process --max-writer-threads 16`.
 
 Logs: `/home/oconnelb/taps_io_test/logs/fin_*.log`, `step0_*.log`, `prof_*.json`, `wr_rep*.log`.
+
+## Later the same day
+
+The htslib 1.21 overlap-clipping patch removes 419 CG and 9,711 CH calls genome-wide, matching the Python engine, and leaves timing unchanged (41.9 s processing, 12.5 s write at T=32). See `rust-implementation-log.md`.
