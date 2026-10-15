@@ -34,6 +34,19 @@ conda install -c conda-forge hdf5 clang libclang pkg-config   # build dependenci
 ```
 `install.sh` downloads hts-sys 2.2.1 and patches in htslib 1.21's read-pair overlap clipping, so Rust calls match the Python engine. It writes `taps-sc-extract-rs/.cargo/config.toml` for your conda prefix and builds with `-C target-cpu=native` (Rust) and `-O3 -march=native` (the vendored htslib, including BAQ). A native binary can fail with SIGILL on a different CPU, so **rerun `install.sh` on each host**, or use `./install.sh --portable` for an x86-64-v3 build. `./install.sh --smoke-bam BAM --smoke-fasta FA` also extracts chr19:5.0–5.1 Mb as a check.
 
+### Upgrading an existing install
+```bash
+cd taps-sc-extract
+git checkout main
+git pull
+./install.sh            # same options as the first install (--prefix, --portable, --no-pip)
+```
+Rerunning `install.sh` is safe, and is required after every pull: it regenerates `.cargo/config.toml`, rebuilds the Rust core from clean, and reinstalls the Python CLI. It also checks the hts-sys patch. The patched copy in `taps-sc-extract-rs/vendor/` records the checksum of the patch it was built with, so a pull that changes `taps-sc-extract-rs/patches/` makes `install.sh` re-extract and re-patch it. The downloaded `hts-sys-2.2.1.crate` is kept in `vendor/`, so re-patching works without network. The first install on a machine needs `curl`, `patch`, `sha256sum` and access to crates.io.
+
+Upgrading from a checkout older than 2026-10-15 (`026c52e` or earlier): `taps-sc-extract-rs/.cargo/config.toml` is no longer tracked, and `install.sh` now generates it. If you edited that file locally, `git pull` will refuse. Discard the edit with `git checkout -- taps-sc-extract-rs/.cargo/config.toml`, pull, and pass any non-default conda location as `./install.sh --prefix /path/to/env`. Outputs written by Rust builds before 2026-10-15 put about 0.01% of calls under the wrong barcode and differ slightly from the Python engine at read-pair overlaps, so re-extract them (see `code/rust-implementation-log.md`).
+
+After installing or upgrading on a new machine, run `taps-sc-extract --test --save-profile` to measure it and save tuned defaults.
+
 ### Python reference engine only (pip)
 ```bash
 git clone https://github.com/boconnell89/taps-sc-extract.git

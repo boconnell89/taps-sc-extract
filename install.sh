@@ -9,6 +9,9 @@
 #
 # A native build uses instructions of the CPU it was built on. Rerun this script
 # on each host; copying the binary to a different CPU can fail with SIGILL.
+#
+# Upgrading: git pull, then rerun ./install.sh. It always rebuilds from clean, and
+# re-patches vendor/hts-sys-* whenever the patch in patches/ has changed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +29,7 @@ while [[ $# -gt 0 ]]; do
         --prefix) PREFIX="$2"; shift ;;
         --smoke-bam) SMOKE_BAM="$2"; shift ;;
         --smoke-fasta) SMOKE_FASTA="$2"; shift ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -82,25 +85,34 @@ echo "Target:    target-cpu=$TARGET_CPU, -march=$MARCH"
 # taps-sc-extract-rs/patches/. Cargo.toml points hts-sys at this copy.
 HTS_VER=2.2.1
 HTS_DIR="$CRATE/vendor/hts-sys-$HTS_VER"
+HTS_CRATE="$CRATE/vendor/hts-sys-$HTS_VER.crate"
 HTS_PATCH="$CRATE/patches/hts-sys-$HTS_VER-overlap-deletions.patch"
-if [[ ! -f "$HTS_DIR/.taps_patched" ]]; then
-    echo "Vendoring hts-sys $HTS_VER with $(basename "$HTS_PATCH") ..."
-    # crates.io checksum of hts-sys 2.2.1 (Cargo.lock no longer records it once
-    # [patch.crates-io] points at the vendored copy).
-    want="fc7e68eb880b02c80cfb41e8dc7904062a3ea7e27b7c4556e88d648dd2f038da"
-    tmp="$(mktemp -d)"
-    curl -sSfL "https://static.crates.io/crates/hts-sys/hts-sys-$HTS_VER.crate" -o "$tmp/hts-sys.crate"
-    got="$(sha256sum "$tmp/hts-sys.crate" | cut -d' ' -f1)"
-    if [[ "$got" != "$want" ]]; then
-        echo "install.sh: hts-sys-$HTS_VER.crate checksum $got does not match crates.io $want" >&2
-        exit 1
+# crates.io checksum of hts-sys 2.2.1 (Cargo.lock no longer records it once
+# [patch.crates-io] points at the vendored copy).
+HTS_SHA="fc7e68eb880b02c80cfb41e8dc7904062a3ea7e27b7c4556e88d648dd2f038da"
+# The marker holds the checksum of the patch it was built with, so a changed
+# patch (after git pull) re-extracts and re-patches a clean copy.
+PATCH_SHA="$(sha256sum "$HTS_PATCH" | cut -d' ' -f1)"
+if [[ "$(cat "$HTS_DIR/.taps_patched" 2>/dev/null || true)" != "$PATCH_SHA" ]]; then
+    echo "Vendoring hts-sys $HTS_VER with $(basename "$HTS_PATCH") ($PATCH_SHA) ..."
+    mkdir -p "$CRATE/vendor"
+    # Reuse the downloaded crate when it is intact, so re-patching works offline.
+    if [[ "$(sha256sum "$HTS_CRATE" 2>/dev/null | cut -d' ' -f1)" != "$HTS_SHA" ]]; then
+        curl -sSfL "https://static.crates.io/crates/hts-sys/hts-sys-$HTS_VER.crate" -o "$HTS_CRATE.part"
+        got="$(sha256sum "$HTS_CRATE.part" | cut -d' ' -f1)"
+        if [[ "$got" != "$HTS_SHA" ]]; then
+            rm -f "$HTS_CRATE.part"
+            echo "install.sh: hts-sys-$HTS_VER.crate checksum $got does not match crates.io $HTS_SHA" >&2
+            exit 1
+        fi
+        mv "$HTS_CRATE.part" "$HTS_CRATE"
     fi
     rm -rf "$HTS_DIR"
-    mkdir -p "$CRATE/vendor"
-    tar -xzf "$tmp/hts-sys.crate" -C "$CRATE/vendor"
+    tar -xzf "$HTS_CRATE" -C "$CRATE/vendor"
     patch -d "$HTS_DIR" -p1 --forward --quiet < "$HTS_PATCH"
-    touch "$HTS_DIR/.taps_patched"
-    rm -rf "$tmp"
+    echo "$PATCH_SHA" > "$HTS_DIR/.taps_patched"
+else
+    echo "hts-sys $HTS_VER already patched with the current $(basename "$HTS_PATCH")"
 fi
 
 # Flag changes do not always trigger a rebuild of the vendored C, so start clean.

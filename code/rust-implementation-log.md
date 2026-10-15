@@ -294,3 +294,9 @@ Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Wo
 
   Output sizes: LZ4 1.4 GB, Zstd 976 MB (LZF 4.2 GB).
 - **No gain**, so the default stays 1. Most cell datasets are a single small chunk, and write time is per-dataset HDF5 work plus shard parallelism, not compression throughput inside a chunk.
+
+## 2026-10-15 — `install.sh` re-patches hts-sys when the patch changes
+- `vendor/hts-sys-2.2.1/.taps_patched` now holds the sha256 of the patch it was built with. A rerun re-extracts and re-patches a clean copy whenever `patches/hts-sys-2.2.1-overlap-deletions.patch` differs, so an upgrade never builds a stale patch. Checkouts with the earlier empty marker re-patch once.
+- The verified `hts-sys-2.2.1.crate` is kept in `vendor/` and reused, so re-patching needs no network. A corrupt cached crate is downloaded again and checked against the crates.io sha256.
+- Checked: old marker → re-vendor, build and chr19 smoke run; unchanged patch → skip; changed patch with network blocked → re-patch from cache; corrupt cache offline → clean failure; corrupt cache online → re-download.
+- README has a new "Upgrading an existing install" section.

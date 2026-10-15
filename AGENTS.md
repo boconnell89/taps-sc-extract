@@ -84,7 +84,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Key per-read caches on `bam1_t.id`**, the number htslib gives each read it stores in an iterator (0, 1, 2, … never reused within a window). **Never key on the record or QNAME address**: htslib recycles pileup nodes LIFO and `bam_copy1` reuses buffers, so a new read can sit at the previous read's address. A QNAME-pointer cache did this until 2026-10-15 and put ~0.01% of calls under the wrong barcode (see `code/rust-implementation-log.md`).
 - **Per-cell sites arrive in position order** (columns ascend within a window), so `CellMaps::add` appends or adds to the last entry. Keep that invariant; `normalize()` repairs any out-of-order input.
 - **Parity checks must be per cell**, not totals: `test_chr19_rust_matches_python_per_cell` requires Rust `--no-baq` to equal Python exactly on chr19.
-- **htslib version matters for calls.** Rust builds hts-sys 2.2.1 (htslib 1.19.1) patched with htslib 1.21's overlap clipping (`taps-sc-extract-rs/patches/`, applied by `install.sh` into `vendor/`) to match pysam 0.23 (htslib 1.21). Re-check parity whenever pysam or rust-htslib changes.
+- **htslib version matters for calls.** Rust builds hts-sys 2.2.1 (htslib 1.19.1) patched with htslib 1.21's overlap clipping (`taps-sc-extract-rs/patches/`, applied by `install.sh` into `vendor/`, re-applied whenever the patch file's checksum changes) to match pysam 0.23 (htslib 1.21). Re-check parity whenever pysam or rust-htslib changes.
 
 ### F. TAPS Chemistry & Amethyst Schema
 - **TAPS Calling Logic**:
@@ -195,5 +195,6 @@ pytest tests/ -v
 | Missing `master.h5` link target | Relative paths misaligned | Use relative file names `shard_XXX.h5` inside `master.h5` so the directory is portable. |
 | More writer threads, slower HDF5 write and more RAM | hdf5-metno's global lock serializes in-process writers | Use `--writer-mode process` (default with >1 shard). |
 | `failed to load source for dependency hts-sys` | `vendor/hts-sys-2.2.1` missing | Run `./install.sh` once (downloads and patches hts-sys). |
+| Rust calls drift from Python after a pull | `patches/` changed but the build used the old vendored copy | Rerun `./install.sh`; it re-patches `vendor/` when the patch checksum differs from `vendor/hts-sys-*/.taps_patched`. |
 | SIGILL from `taps-sc-extract-rs` | Native build copied to a different CPU | Rerun `./install.sh` on that host, or build with `--portable`. |
 | Timings vary 2× between identical runs | Concurrent builds or other jobs on the box | Never time while compiling; repeat runs and report the spread. |
