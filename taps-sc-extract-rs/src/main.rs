@@ -21,11 +21,15 @@ mod window;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Instant;
 
-use crate::extract::ExtractParams;
+use crate::extract::{estimate_bam_traffic, BamTraffic, ExtractParams};
 use crate::extract_noodles::extract_regions_stats_noodles;
 use crate::fasta::FastFaiReader;
-use crate::h5_out::{assemble_hdf5_from_memory, assemble_hdf5_from_temp, H5Compression};
+use crate::h5_out::{
+    assemble_hdf5_from_memory, assemble_hdf5_from_temp, written_output_bytes, H5Compression,
+};
+use crate::shard_io::ChunkFile;
 use crate::parallel::{
     extract_memory_parallel, extract_stats_parallel, extract_stream_parallel, install_ctrlc,
     new_cancel_flag,
@@ -56,7 +60,8 @@ enum Commands {
         /// Window end (bp, exclusive). Requires --start.
         #[arg(long)]
         end: Option<u64>,
-        #[arg(long, default_value_t = 10)]
+        /// Genomic window size in megabases (Rust default: 100).
+        #[arg(long, default_value_t = 100)]
         chunk_size_mb: u32,
         /// Window workers (Rayon). 0 = auto (`min(nproc, 32)`).
         #[arg(short = 't', long = "workers", default_value_t = 0)]
@@ -110,7 +115,8 @@ enum Commands {
         start: Option<u64>,
         #[arg(long)]
         end: Option<u64>,
-        #[arg(long, default_value_t = 10)]
+        /// Genomic window size in megabases (Rust default: 100).
+        #[arg(long, default_value_t = 100)]
         chunk_size_mb: u32,
         /// Number of HDF5 shard files (0 = auto based on cell count: 1/8/16/32).
         #[arg(long, default_value_t = 0)]
@@ -133,7 +139,8 @@ enum Commands {
         /// Optional expected cell count (auto-detected from whitelist if omitted).
         #[arg(long)]
         expected_cells: Option<usize>,
-        #[arg(long, default_value = "gzip")]
+        /// HDF5 compression (Rust default: lzf).
+        #[arg(long, default_value = "lzf")]
         compression: String,
         /// Maximum parallel shard-writer threads (0 = auto sized from shards, cores, RAM).
         #[arg(long, default_value_t = 0)]
@@ -343,6 +350,7 @@ fn main() -> Result<()> {
                 cell_source.count(),
                 total_genome_mb,
             );
+            let compression_name = compression.clone();
             let compression = H5Compression::parse(&compression)?;
             let params = ExtractParams {
                 min_baseq,
@@ -366,13 +374,26 @@ fn main() -> Result<()> {
             eprintln!("  Shards:          {} ({})", n_shards, shards_src);
             eprintln!("  Writer threads:  {} ({})", writer_threads, writer_src);
             eprintln!("  Memory mode:     {} ({})", resolved_memory_mode, mode_src);
+            eprintln!("  Chunk size:      {chunk_size_mb} Mb");
+            eprintln!("  Compression:     {compression_name}");
             eprintln!("  BAQ:             {}", params.compute_baq);
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
             eprintln!("======================================================================");
-            let t0 = std::time::Instant::now();
-            let (r, h5_path) = match resolved_memory_mode.as_str() {
+            let traffic = match estimate_bam_traffic(&bam, &contig_list) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("warning: BAM read estimate unavailable: {e}");
+                    let bytes = std::fs::metadata(&bam).map(|m| m.len()).unwrap_or(0);
+                    BamTraffic {
+                        mapped_reads: 0,
+                        estimated_bytes: bytes,
+                    }
+                }
+            };
+            let t_process = Instant::now();
+            let (r, pending) = match resolved_memory_mode.as_str() {
                 "memory" => {
                     let (r, mem) = extract_memory_parallel(
                         &bam,
@@ -384,9 +405,7 @@ fn main() -> Result<()> {
                         n_workers,
                         &cancel,
                     )?;
-                    eprintln!("assembling HDF5 from memory (writers≤{writer_threads})…");
-                    let p = assemble_hdf5_from_memory(&mem, &out, compression, writer_threads)?;
-                    (r, p)
+                    (r, PendingOutput::Memory(mem))
                 }
                 "stream" => {
                     let tmp = tempfile::Builder::new()
@@ -404,7 +423,20 @@ fn main() -> Result<()> {
                         n_workers,
                         &cancel,
                     )?;
-                    eprintln!("assembling HDF5 from temp chunks (writers≤{writer_threads})…");
+                    (r, PendingOutput::Stream(tmp))
+                }
+                other => anyhow::bail!("unknown --memory-mode {other} (use stream or memory)"),
+            };
+            let process_s = t_process.elapsed().as_secs_f64();
+            eprintln!(
+                "Extraction workers finished in {process_s:.1}s. Writing {n_shards} shard(s) with {writer_threads} writer(s)."
+            );
+            let t_write = Instant::now();
+            let h5_path = match pending {
+                PendingOutput::Memory(mem) => {
+                    assemble_hdf5_from_memory(&mem, &out, compression, writer_threads)?
+                }
+                PendingOutput::Stream(tmp) => {
                     let p = assemble_hdf5_from_temp(
                         tmp.path(),
                         &out,
@@ -416,13 +448,27 @@ fn main() -> Result<()> {
                         let kept = tmp.keep();
                         eprintln!("kept temp {}", kept.display());
                     }
-                    (r, p)
+                    p
                 }
-                other => anyhow::bail!("unknown --memory-mode {other} (use stream or memory)"),
             };
-            let dt = t0.elapsed();
+            let write_s = t_write.elapsed().as_secs_f64();
+            let out_bytes = written_output_bytes(&h5_path);
+            let total_s = process_s + write_s;
+            print_extraction_summary(
+                &r,
+                &traffic,
+                total_s,
+                process_s,
+                write_s,
+                out_bytes,
+                n_shards,
+                resolved_memory_mode == "stream",
+                crate::autotune::process_peak_rss_mb(),
+            );
+            let read_mb_s = mb_per_s(traffic.estimated_bytes, process_s);
+            let write_mb_s = mb_per_s(out_bytes, write_s);
             println!(
-                "cells={} CG={:.4}% ({}/{}) CH={:.4}% ({}/{}) elapsed_s={:.2} h5={}",
+                "cells={} CG={:.4}% ({}/{}) CH={:.4}% ({}/{}) elapsed_s={:.2} process_s={:.2} write_s={:.2} read_mb_s={:.1} write_mb_s={:.1} h5={}",
                 r.n_cells(),
                 r.stats.cg_pct(),
                 r.stats.cg_c,
@@ -430,10 +476,178 @@ fn main() -> Result<()> {
                 r.stats.ch_pct(),
                 r.stats.ch_c,
                 r.stats.ch_c + r.stats.ch_t,
-                dt.as_secs_f64(),
+                total_s,
+                process_s,
+                write_s,
+                read_mb_s,
+                write_mb_s,
                 h5_path.display()
             );
         }
     }
     Ok(())
+}
+
+enum PendingOutput {
+    Memory(Vec<Vec<ChunkFile>>),
+    Stream(tempfile::TempDir),
+}
+
+fn mb_per_s(bytes: u64, seconds: f64) -> f64 {
+    if seconds <= 0.0 {
+        0.0
+    } else {
+        (bytes as f64) / 1_000_000.0 / seconds
+    }
+}
+
+fn fmt_u64(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Python `:,.Nf` grouping for the summary throughput lines.
+fn fmt_grouped_f64(n: f64, decimals: usize) -> String {
+    let neg = n.is_sign_negative();
+    let n = if n.is_finite() { n.abs() } else { 0.0 };
+    let scale = 10u64.pow(decimals as u32);
+    let scaled = (n * scale as f64).round() as u64;
+    let ip = if decimals == 0 { scaled } else { scaled / scale };
+    let mut body = fmt_u64(ip);
+    if decimals > 0 {
+        let frac = scaled % scale;
+        body.push('.');
+        body.push_str(&format!("{frac:0width$}", width = decimals));
+    }
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+fn print_extraction_summary(
+    r: &crate::extract::WindowResult,
+    traffic: &BamTraffic,
+    total_s: f64,
+    process_s: f64,
+    write_s: f64,
+    out_bytes: u64,
+    n_shards: usize,
+    stream: bool,
+    peak_rss_mb: f64,
+) {
+    let cg_c = r.stats.cg_c;
+    let cg_t = r.stats.cg_t;
+    let chg_c = r.stats.chg_c;
+    let chg_t = r.stats.chg_t;
+    let chh_c = r.stats.chh_c;
+    let chh_t = r.stats.chh_t;
+    let ch_c = r.stats.ch_c;
+    let ch_t = r.stats.ch_t;
+    let cg_all = cg_c + cg_t;
+    let chg_all = chg_c + chg_t;
+    let chh_all = chh_c + chh_t;
+    let ch_all = ch_c + ch_t;
+    let pct = |c: u64, tot: u64| if tot == 0 { 0.0 } else { 100.0 * c as f64 / tot as f64 };
+    let total_calls = cg_all + ch_all;
+    let total_mod = cg_c + ch_c;
+    let reads = traffic.mapped_reads;
+    let reads_per_sec = if total_s > 0.0 { reads as f64 / total_s } else { 0.0 };
+    let reads_per_min = reads_per_sec * 60.0;
+    let cells = r.n_cells();
+    let cells_per_min = if total_s > 0.0 { cells as f64 / (total_s / 60.0) } else { 0.0 };
+    let read_mb = traffic.estimated_bytes as f64 / 1_000_000.0;
+    let write_mb = out_bytes as f64 / 1_000_000.0;
+    let mode = if stream {
+        "Disk-backed temp files"
+    } else {
+        "In-memory IPC"
+    };
+
+    eprintln!("======================================================================");
+    eprintln!("PARALLEL EXTRACTION SUMMARY & GROUND TRUTH COMPARISON");
+    eprintln!("======================================================================");
+    eprintln!("Total Wall Time:       {total_s:.1}s ({:.2} min)", total_s / 60.0);
+    eprintln!("Processing Time:       {process_s:.1}s ({:.2} min)", process_s / 60.0);
+    eprintln!("HDF5 Write Time:       {write_s:.1}s ({:.2} min)", write_s / 60.0);
+    eprintln!(
+        "Read Throughput:       {:.1} MB/s (est. {:.1} MB BAM)",
+        mb_per_s(traffic.estimated_bytes, process_s),
+        read_mb
+    );
+    eprintln!(
+        "Write Throughput:      {:.1} MB/s ({write_mb:.1} MB HDF5)",
+        mb_per_s(out_bytes, write_s)
+    );
+    eprintln!("Total Mapped Reads:    {}", fmt_u64(reads));
+    eprintln!(
+        "Throughput (Reads):    {} reads/min ({} reads/s)",
+        fmt_grouped_f64(reads_per_min, 0),
+        fmt_grouped_f64(reads_per_sec, 0)
+    );
+    eprintln!("Total Unique Barcodes: {}", fmt_u64(cells as u64));
+    eprintln!(
+        "Throughput (Cells):    {} cells/min",
+        fmt_grouped_f64(cells_per_min, 1)
+    );
+    eprintln!("Peak Memory (RSS):     {peak_rss_mb:.1} MB");
+    eprintln!("Shards Written:        {n_shards}");
+    eprintln!("Streaming Mode:        {mode}");
+    eprintln!("----------------------------------------------------------------------");
+    eprintln!(
+        "CpG Methylation:       {:.3}% ({c} / {tot})",
+        pct(cg_c, cg_all),
+        c = fmt_u64(cg_c),
+        tot = fmt_u64(cg_all)
+    );
+    eprintln!(
+        "CHG Methylation:       {:.3}% ({c} / {tot})",
+        pct(chg_c, chg_all),
+        c = fmt_u64(chg_c),
+        tot = fmt_u64(chg_all)
+    );
+    eprintln!(
+        "CHH Methylation:       {:.3}% ({c} / {tot})",
+        pct(chh_c, chh_all),
+        c = fmt_u64(chh_c),
+        tot = fmt_u64(chh_all)
+    );
+    eprintln!(
+        "CH (Combined):         {:.3}% ({c} / {tot})",
+        pct(ch_c, ch_all),
+        c = fmt_u64(ch_c),
+        tot = fmt_u64(ch_all)
+    );
+    eprintln!(
+        "Pooled (All C/G sites):{:.3}% ({c} / {tot})",
+        pct(total_mod, total_calls),
+        c = fmt_u64(total_mod),
+        tot = fmt_u64(total_calls)
+    );
+    eprintln!("======================================================================");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_numbers_match_python_grouping() {
+        assert_eq!(fmt_u64(0), "0");
+        assert_eq!(fmt_u64(999), "999");
+        assert_eq!(fmt_u64(1000), "1,000");
+        assert_eq!(fmt_u64(74_900_000), "74,900,000");
+        assert_eq!(fmt_grouped_f64(15_390_411.4, 0), "15,390,411");
+        assert_eq!(fmt_grouped_f64(1234.56, 1), "1,234.6");
+        assert_eq!(mb_per_s(0, 0.0), 0.0);
+        assert!((mb_per_s(2_000_000, 2.0) - 1.0).abs() < 1e-9);
+    }
 }

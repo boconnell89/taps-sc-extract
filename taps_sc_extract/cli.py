@@ -94,7 +94,10 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--chunk-size-mb",
         type=int,
         default=10,
-        help="Genomic chunk size in megabases (default: 10).",
+        help=(
+            "Genomic chunk size in megabases "
+            "(default: 10 for the Python engine, 100 for the Rust engine)."
+        ),
     )
     parser.add_argument(
         "--shards",
@@ -102,8 +105,9 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=1,
         help=(
             "Number of output HDF5 shard files to write in parallel (default: 1). "
-            "If >1, -o/--out is treated as a directory where shard_000.h5..shard_NNN.h5 and "
-            "a master.h5 (with relative ExternalLinks) will be created."
+            "If >1, -o/--out is a directory of shard_000.h5..shard_NNN.h5 plus master.h5. "
+            "An .h5 file name is written as a directory named after the file stem "
+            "(sample.h5 -> sample/)."
         ),
     )
     parser.add_argument(
@@ -111,7 +115,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["gzip", "gzip-shuffle", "gzip6", "lzf", "none", "blosc", "blosc-zstd"],
         default="gzip",
         help=(
-            "HDF5 dataset compression (default: gzip). "
+            "HDF5 dataset compression (default: gzip for Python, lzf for Rust). "
             "gzip (level 1 deflate) is fast and 100%% portable to Amethyst/rhdf5 with no extra packages. "
             "gzip-shuffle applies byte shuffling before level 1 deflate for high ratio and speed. "
             "gzip6 uses standard level 6 deflate. "
@@ -211,7 +215,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default="auto",
         help=(
             "Extraction backend engine (default: auto). "
-            "'rust' uses the high-performance taps-sc-extract-rs core (2.6x faster, 56%% less RAM); "
+            "'rust' uses the taps-sc-extract-rs core; "
             "'python' runs the reference multiprocessing engine; "
             "'auto' uses rust if available, falling back to python."
         ),
@@ -243,6 +247,64 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args)
 
 
+RUST_DEFAULT_CHUNK_SIZE_MB = 100
+RUST_DEFAULT_COMPRESSION = "lzf"
+
+
+def option_was_set(argv: List[str], option: str) -> bool:
+    """True when the user passed `option` or `option=value` on this argv."""
+    return any(a == option or a.startswith(option + "=") for a in argv)
+
+
+def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
+    """Argv for taps-sc-extract-rs. Rust defaults apply unless the user set the flag."""
+    chunk_mb = (
+        parsed.chunk_size_mb
+        if option_was_set(argv, "--chunk-size-mb")
+        else RUST_DEFAULT_CHUNK_SIZE_MB
+    )
+    compression = (
+        parsed.compression
+        if option_was_set(argv, "--compression")
+        else RUST_DEFAULT_COMPRESSION
+    )
+    cmd = [
+        rust_bin,
+        "extract",
+        "-b", parsed.bam,
+        "-f", parsed.fasta,
+        "-o", parsed.out,
+        "-t", str(parsed.workers),
+        "--chunk-size-mb", str(chunk_mb),
+        "--shards", str(parsed.shards),
+        "--compression", compression,
+        "--max-writer-threads", str(parsed.max_writer_threads),
+        "--min-baseq", str(parsed.min_baseq),
+        "--min-mapq", str(parsed.min_mapq),
+        "--max-depth", str(parsed.max_depth),
+    ]
+    if parsed.chroms:
+        cmd.extend(["-c", parsed.chroms])
+    if parsed.whitelist:
+        cmd.extend(["-w", parsed.whitelist])
+    if parsed.decomp_threads is not None:
+        cmd.extend(["--decomp-threads", str(parsed.decomp_threads)])
+    if parsed.no_baq:
+        cmd.append("--no-baq")
+    if parsed.no_overlap_clip:
+        cmd.append("--no-overlap-clip")
+    if parsed.max_memory_gb:
+        cmd.extend(["--max-memory-gb", str(parsed.max_memory_gb)])
+    if parsed.expected_cells:
+        cmd.extend(["--expected-cells", str(parsed.expected_cells)])
+    if parsed.memory_mode:
+        cmd.extend(["--memory-mode", parsed.memory_mode])
+    elif parsed.no_temp_file:
+        cmd.extend(["--memory-mode", "memory"])
+    cmd.extend(["--trim-r1", str(parsed.trim_r1), "--trim-r2", str(parsed.trim_r2)])
+    return cmd
+
+
 def find_rust_binary() -> Optional[str]:
     """Locate the taps-sc-extract-rs executable."""
     # 1. Check PATH
@@ -259,7 +321,8 @@ def find_rust_binary() -> Optional[str]:
 
 
 def main(args: Optional[List[str]] = None) -> int:
-    parsed = parse_args(args)
+    argv = list(sys.argv[1:] if args is None else args)
+    parsed = parse_args(argv)
     setup_logging(verbose=parsed.verbose, log_file=parsed.log_file)
     logger = logging.getLogger("taps_sc_extract")
     if parsed.trim_r1 < 0 or parsed.trim_r2 < 0:
@@ -287,40 +350,7 @@ def main(args: Optional[List[str]] = None) -> int:
         logger.info(f"Delegating extraction to Rust acceleration core: {rust_bin}")
         import subprocess
 
-        cmd = [
-            rust_bin,
-            "extract",
-            "-b", parsed.bam,
-            "-f", parsed.fasta,
-            "-o", parsed.out,
-            "-t", str(parsed.workers),
-            "--chunk-size-mb", str(parsed.chunk_size_mb),
-            "--shards", str(parsed.shards),
-            "--compression", parsed.compression,
-            "--max-writer-threads", str(parsed.max_writer_threads),
-            "--min-baseq", str(parsed.min_baseq),
-            "--min-mapq", str(parsed.min_mapq),
-            "--max-depth", str(parsed.max_depth),
-        ]
-        if parsed.chroms:
-            cmd.extend(["-c", parsed.chroms])
-        if parsed.whitelist:
-            cmd.extend(["-w", parsed.whitelist])
-        if parsed.decomp_threads is not None:
-            cmd.extend(["--decomp-threads", str(parsed.decomp_threads)])
-        if parsed.no_baq:
-            cmd.append("--no-baq")
-        if parsed.no_overlap_clip:
-            cmd.append("--no-overlap-clip")
-        if parsed.max_memory_gb:
-            cmd.extend(["--max-memory-gb", str(parsed.max_memory_gb)])
-        if parsed.expected_cells:
-            cmd.extend(["--expected-cells", str(parsed.expected_cells)])
-        if parsed.memory_mode:
-            cmd.extend(["--memory-mode", parsed.memory_mode])
-        elif parsed.no_temp_file:
-            cmd.extend(["--memory-mode", "memory"])
-        cmd.extend(["--trim-r1", str(parsed.trim_r1), "--trim-r2", str(parsed.trim_r2)])
+        cmd = build_rust_command(rust_bin, parsed, argv)
 
         try:
             res = subprocess.run(cmd)

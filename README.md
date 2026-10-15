@@ -11,8 +11,8 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 
 ## Key Features
 
-- **Blistering Performance**: Rust acceleration core processes **>15.4 million mapped reads/minute (256,400+ reads/s)** (genome-wide mouse mm10 with 75M reads and 1.11B base calls extracted in **~4.86 minutes** across 24 workers, **2.61× faster** than the multiprocessing Python reference engine).
-- **Predictable, Bounded Memory**: Process-tree memory tracks accurately via `/proc` and plateaus at steady state (~700 MB / worker, ~18 GB total across 24 workers) regardless of genome length.
+- **Rust acceleration core**: Window-parallel extraction with a Python reference engine behind the same CLI. Published reads/minute figures are omitted until the engine is remeasured.
+- **Predictable, Bounded Memory**: Process-tree memory tracks via `/proc` and is reported as peak RSS in the post-run summary.
 - **Auto-Scaled Shard Writer Pool**: Dynamically sizes writer concurrency (`--max-writer-threads 0` auto) to compress all output shards concurrently without bottlenecking disk queue depth.
 - **High-Speed HDF5 Compression Options**: Supports `gzip` (level 1 deflate, 100% portable), `gzip-shuffle` (byte shuffling + level 1 deflate, 25.5× compression ratio), `lzf` (near raw write speed with 87% size reduction), `blosc` (multithreaded LZ4), `blosc-zstd`, and uncompressed `none`.
 - **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
@@ -116,9 +116,9 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--expected-cells` | `int` | `None` | Optional cell count (auto-detected from `-w/--whitelist` cardinality if omitted). |
 | `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes (or Rayon threads in Rust). `0` = auto. |
 | `--decomp-threads` | `int` | `0` | BAM BGZF decompression threads per worker process (`0` for synchronous reading). |
-| `--chunk-size-mb` | `int` | `10` | Genomic window chunk size in megabases. |
-| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). |
-| `--compression` | `str` | `gzip` | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc`, `blosc-zstd`, `none`. |
+| `--chunk-size-mb` | `int` | `10` Python / `100` Rust | Genomic window chunk size in megabases. |
+| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). An `.h5` file name with multiple shards is written to a directory named after the file stem. |
+| `--compression` | `str` | `gzip` Python / `lzf` Rust | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc`, `blosc-zstd`, `none`. |
 | `--max-writer-threads` | `int` | `0` | Maximum parallel shard-writer threads after extraction (`0` = auto-scales up to shard count). |
 | `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk (equivalent to `--memory-mode memory`). |
 | `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
@@ -134,33 +134,24 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 ---
 
-## Performance Benchmark & Flags Guide
+## Performance Flags Guide
 
-### Whole-Genome mm10 Performance Comparison (74.9M Reads, 1.11 Billion Calls)
-
-| Engine / Mode | Wall Time | Elapsed Job Time | Extraction Throughput | Peak RAM | Call Parity |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Python Reference Engine** | 12.70 min (762 s) | 12.70 min | 98.3k reads/s | 18.1 GB | 7,355 cells |
-| **Rust Acceleration Core** | **5.00 min (300 s)** | **4.86 min (292 s)** | **256.4k reads/s** | **31.5 GB** | **100% Match (7,355 cells)** |
-| **Speedup** | **2.54× faster** | **2.61× faster** | **2.61× faster** | Bounded | Exact Bitwise Match |
-
----
+Published engine-versus-engine timings are omitted until the Rust core is remeasured. The run summary prints processing time, HDF5 write time, and estimated read and write MB/s for each job.
 
 ### Compression Algorithm Trade-Offs (`--compression`)
 
 | Algorithm | Extraction + Write Time (`chr1–3`) | Shard Output Size | Compression Ratio | R / Bioconductor Requirements |
 | :--- | :---: | :---: | :---: | :--- |
 | **`none`** | **46.47 s** | 11.0 GB | 1.0× | Native `rhdf5` (No plugins needed) |
-| **`lzf`** | **47.88 s** *(Fastest Compressed)* | 1.4 GB | **7.8×** | `library(rhdf5filters)` |
+| **`lzf`** *(Rust default)* | **47.88 s** *(Fastest Compressed)* | 1.4 GB | **7.8×** | `library(rhdf5filters)` |
 | **`blosc`** (LZ4) | **62.82 s** | 532 MB | **20.7×** | `library(rhdf5filters)` |
-| **`gzip`** *(Default)* | **66.53 s** | 728 MB | **15.1×** | **Native `rhdf5` (Zero extra packages)** |
+| **`gzip`** *(Python default)* | **66.53 s** | 728 MB | **15.1×** | **Native `rhdf5` (Zero extra packages)** |
 | **`gzip-shuffle`** | **76.79 s** | 431 MB | **25.5×** | Native `rhdf5` |
 | **`blosc-zstd`** | **74.71 s** | **385 MB** *(Smallest)* | **28.6×** | `library(rhdf5filters)` |
 
 ### 2. `-t, --workers` (Parallel Worker Threads/Processes)
 - **Mechanism**: Splits the genome into $N$ non-overlapping genomic windows and processes them concurrently.
 - **Recommendation**: Set to $0.75 \times$ to $1.0 \times$ available physical CPU cores (e.g., `24` on a 32-core workstation; `64` on a 96-core server). `0` automatically sizes workers from hardware CPU count and memory budget.
-- **Scaling**: Near-linear scaling up to 64 workers.
 
 ### 3. `--decomp-threads` (BAM BGZF Decompression Threads)
 - **Mechanism**: Allocates background `htslib` threads per worker for BGZF block decompression.
@@ -169,11 +160,11 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
   - **Low Worker Count ($\le 4$ workers, e.g. single-chromosome extractions)**: Use `--decomp-threads 2` to `4`. Spare CPU cores are utilized to decompress BAM blocks ahead of pileup.
 
 ### 3. `--chunk-size-mb` (Genomic Granularity & Load Balancing)
-- **Mechanism**: Defines the window size of each genomic chunk (default: `10` Mb $\to$ 286 chunks for mm10).
+- **Mechanism**: Defines the window size of each genomic chunk (Python default: `10` Mb $\to$ 286 chunks for mm10; Rust default: `100` Mb).
 - **Trade-offs**:
   - **Smaller chunks (e.g., `5` Mb)**: Better load balancing across many workers; prevents workers from idling at the end of chromosomes.
   - **Larger chunks (e.g., `20` Mb)**: Reduces chunk file count and IPC overhead; slightly higher memory usage per chunk.
-- **Recommendation**: `10` Mb is optimal for mammalian genomes (mm10 / hg38).
+- **Recommendation**: The Python engine defaults to `10` Mb. The Rust engine defaults to `100` Mb.
 
 ### 4. `--shards` (Parallel HDF5 Writing & Scalability)
 - **Mechanism**: Partitions cell barcodes deterministically across $N$ shard files (`shard_000.h5`..`shard_NNN.h5`) using `hash(bc) % N` and creates `master.h5` with relative `ExternalLink` references.
@@ -188,7 +179,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 ### 5. `--max-writer-threads` (Shard Writer Concurrency & Storage Optimization)
 - **Mechanism**: Controls the maximum number of parallel worker threads that assemble, compress, and write shard HDF5 files after chunk extraction finishes.
-- **Why it matters for large genomes**: On whole-genome mammalian datasets (>1 billion calls across 16 shards), gzip compression in the writer phase can become the dominant bottleneck. Increasing `--max-writer-threads` from 6 to 16 on high-core NVMe systems allows all shards to compress concurrently, cutting shard assembly time from ~3.5 minutes down to ~1 minute.
+- **Why it matters for large genomes**: On whole-genome mammalian datasets the HDF5 writer can dominate wall time once the site count is large. Writer threads run after extraction and compress shards concurrently, up to the requested `--max-writer-threads`.
 - **Recommended Defaults by Storage Type**:
   - **Local Fast NVMe / PCIe SSD with $\ge 32$ GB RAM**: `--max-writer-threads 8` to `16` &mdash; Compresses all shards simultaneously for maximum throughput.
   - **Standard Workstations (Default)**: `--max-writer-threads 6` &mdash; Safe balance between parallel CPU compression and disk I/O queue depth.

@@ -19,8 +19,9 @@ use rust_htslib::bam::IndexedReader;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub type CancelFlag = Arc<AtomicBool>;
 
@@ -42,6 +43,77 @@ fn check_cancel(flag: &CancelFlag) -> Result<()> {
         bail!("cancelled");
     }
     Ok(())
+}
+
+struct RunClock {
+    start: Instant,
+    last_log: Mutex<Instant>,
+    peak_rss: AtomicU64,
+}
+
+impl RunClock {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last_log: Mutex::new(now),
+            peak_rss: AtomicU64::new(0),
+        }
+    }
+}
+
+fn fmt_usize(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Python-style chunk progress: percent, chunk rate, elapsed, and ETA.
+fn log_extraction_progress(
+    clock: &RunClock,
+    n: usize,
+    k: usize,
+    n_cells: usize,
+    cg_c: u64,
+    cg_t: u64,
+    ch_c: u64,
+    ch_t: u64,
+) {
+    let now = Instant::now();
+    let mut last = clock.last_log.lock().expect("progress clock");
+    let due = k == n || k % 10 == 0 || now.duration_since(*last) >= Duration::from_secs(15);
+    if !due {
+        return;
+    }
+    *last = now;
+    drop(last);
+
+    let elapsed = clock.start.elapsed().as_secs_f64();
+    let pct = if n == 0 { 100.0 } else { 100.0 * k as f64 / n as f64 };
+    let chunk_rate = if elapsed > 0.0 { k as f64 / elapsed * 60.0 } else { 0.0 };
+    let eta_min = if k > 0 && elapsed > 0.0 {
+        ((n - k) as f64 / (k as f64 / elapsed)) / 60.0
+    } else {
+        0.0
+    };
+    let cg_tot = cg_c + cg_t;
+    let cg_pct = if cg_tot == 0 { 0.0 } else { 100.0 * cg_c as f64 / cg_tot as f64 };
+    let ch_tot = ch_c + ch_t;
+    let ch_pct = if ch_tot == 0 { 0.0 } else { 100.0 * ch_c as f64 / ch_tot as f64 };
+    let rss = crate::autotune::process_rss_mb();
+    let rss_bytes = (rss * 1024.0 * 1024.0) as u64;
+    let prev = clock.peak_rss.fetch_max(rss_bytes, Ordering::Relaxed);
+    let peak_mb = prev.max(rss_bytes) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "Extraction: [{k:3}/{n} chunks | {pct:5.1}%] | Rate: {chunk_rate:4.1} chk/min | Elapsed: {elapsed:5.1}s | ETA: {eta_min:4.1}m | Cells: {} | CG: {cg_pct:.1}% | CH: {ch_pct:.2}% | RSS: {rss:.0} MB (Peak: {peak_mb:.0} MB)",
+        fmt_usize(n_cells)
+    );
 }
 
 thread_local! {
@@ -122,6 +194,7 @@ pub fn extract_stats_parallel(
     let n = windows.len();
     let done = AtomicUsize::new(0);
     let total = Mutex::new(WindowResult::empty());
+    let clock = RunClock::new();
 
     install_pool(n_workers, || {
         windows.par_iter().try_for_each(|w| -> Result<()> {
@@ -133,24 +206,17 @@ pub fn extract_stats_parallel(
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
             )?;
-            {
+            let snap = {
                 let mut t = total.lock().expect("stats mutex");
                 if params.accumulate {
                     t.absorb_maps(&r);
                 } else {
                     t.absorb_counts(&r);
                 }
-            }
+                (t.n_cells(), t.stats.cg_c, t.stats.cg_t, t.stats.ch_c, t.stats.ch_t)
+            };
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if k % 5 == 0 || k == n {
-                let t = total.lock().expect("stats mutex");
-                eprintln!(
-                    "Rust extract: [{k}/{n}] cells={} CG={:.2}% CH={:.3}%",
-                    t.n_cells(),
-                    t.stats.cg_pct(),
-                    t.stats.ch_pct()
-                );
-            }
+            log_extraction_progress(&clock, n, k, snap.0, snap.1, snap.2, snap.3, snap.4);
             Ok(())
         })
     })??;
@@ -182,6 +248,7 @@ pub fn extract_stream_parallel(
     let done = AtomicUsize::new(0);
     let n_files = AtomicUsize::new(0);
     let total = Mutex::new(WindowResult::empty());
+    let clock = RunClock::new();
 
     install_pool(n_workers, || {
         windows.par_iter().try_for_each(|w| -> Result<()> {
@@ -195,26 +262,22 @@ pub fn extract_stream_parallel(
             )?;
             let nf = write_window_shards(&temp_dir, w, &r.intern, &r.cells, n_shards)?;
             n_files.fetch_add(nf, Ordering::Relaxed);
-            {
+            let snap = {
                 let mut t = total.lock().expect("stream mutex");
                 t.absorb_counts(&r);
-            }
+                (t.n_cells(), t.stats.cg_c, t.stats.cg_t, t.stats.ch_c, t.stats.ch_t)
+            };
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if k % 5 == 0 || k == n {
-                let t = total.lock().expect("stream mutex");
-                eprintln!(
-                    "Rust extract: [{k}/{n}] cells={} files={} CG={:.2}% CH={:.3}%",
-                    t.n_cells(),
-                    n_files.load(Ordering::Relaxed),
-                    t.stats.cg_pct(),
-                    t.stats.ch_pct()
-                );
-            }
+            log_extraction_progress(&clock, n, k, snap.0, snap.1, snap.2, snap.3, snap.4);
             Ok(())
         })
     })??;
 
     check_cancel(cancel)?;
+    eprintln!(
+        "Extraction workers finished. Temp chunk files: {}",
+        n_files.load(Ordering::Relaxed)
+    );
     Ok(total.into_inner().expect("stream mutex"))
 }
 
@@ -240,6 +303,7 @@ pub fn extract_memory_parallel(
     let total = Mutex::new(WindowResult::empty());
     let mem: Mutex<Vec<Vec<crate::shard_io::ChunkFile>>> =
         Mutex::new((0..n_shards).map(|_| Vec::new()).collect());
+    let clock = RunClock::new();
 
     install_pool(n_workers, || {
         windows.par_iter().try_for_each(|w| -> Result<()> {
@@ -258,20 +322,13 @@ pub fn extract_memory_parallel(
                     m[s].push(cf);
                 }
             }
-            {
+            let snap = {
                 let mut t = total.lock().expect("mem stats");
                 t.absorb_counts(&r);
-            }
+                (t.n_cells(), t.stats.cg_c, t.stats.cg_t, t.stats.ch_c, t.stats.ch_t)
+            };
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if k % 5 == 0 || k == n {
-                let t = total.lock().expect("mem stats");
-                eprintln!(
-                    "Rust extract: [{k}/{n}] cells={} CG={:.2}% CH={:.3}% (memory)",
-                    t.n_cells(),
-                    t.stats.cg_pct(),
-                    t.stats.ch_pct()
-                );
-            }
+            log_extraction_progress(&clock, n, k, snap.0, snap.1, snap.2, snap.3, snap.4);
             Ok(())
         })
     })??;

@@ -429,6 +429,52 @@ pub fn refresh_baq_cache<'a>(
     Ok(cache.as_ref().map(|(_, s)| s.as_slice()))
 }
 
+/// Mapped reads on `contigs`, and an estimated share of the BAM file those reads occupy.
+pub struct BamTraffic {
+    pub mapped_reads: u64,
+    pub estimated_bytes: u64,
+}
+
+pub fn estimate_bam_traffic(bam_path: &Path, contigs: &[&str]) -> Result<BamTraffic> {
+    let mut bam = IndexedReader::from_path(bam_path)
+        .map_err(|e| anyhow::anyhow!("open BAM for idxstats {}: {e}", bam_path.display()))?;
+    let stats = bam
+        .index_stats()
+        .map_err(|e| anyhow::anyhow!("BAM index stats: {e}"))?;
+    let names: Vec<String> = bam
+        .header()
+        .target_names()
+        .into_iter()
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .collect();
+    let want: std::collections::HashSet<&str> = contigs.iter().copied().collect();
+    let mut mapped_reads = 0u64;
+    let mut records = 0u64;
+    for (tid, _len, mapped, unmapped) in stats {
+        records += mapped + unmapped;
+        if tid < 0 {
+            continue;
+        }
+        if let Some(name) = names.get(tid as usize) {
+            if want.contains(name.as_str()) {
+                mapped_reads += mapped;
+            }
+        }
+    }
+    let file_len = std::fs::metadata(bam_path)
+        .with_context(|| format!("stat {}", bam_path.display()))?
+        .len();
+    let estimated_bytes = if records == 0 {
+        file_len
+    } else {
+        ((file_len as u128) * u128::from(mapped_reads) / u128::from(records)) as u64
+    };
+    Ok(BamTraffic {
+        mapped_reads,
+        estimated_bytes,
+    })
+}
+
 pub fn open_bam(path: &Path, decomp_threads: usize) -> Result<IndexedReader> {
     let mut bam = IndexedReader::from_path(path)
         .map_err(|e| anyhow::anyhow!("open BAM {}: {e}", path.display()))?;

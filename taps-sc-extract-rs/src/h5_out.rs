@@ -11,7 +11,7 @@ use hdf5_metno::types::FixedAscii;
 use hdf5_metno::{File, H5Type};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const AMETHYST_VERSION: &str = "amethyst2.0.0";
 
@@ -220,6 +220,103 @@ fn assemble_one_shard_from_temp(
     write_shard_file(shard_h5, &cells, compression)
 }
 
+fn is_h5_filename(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("h5") || ext.eq_ignore_ascii_case("hdf5"))
+}
+
+/// Where HDF5 bytes go.
+///
+/// One shard writes `out` when it is an `.h5` file name, or `out/output.h5`
+/// when `out` is a directory. Several shards write `shard_XXX.h5` plus
+/// `master.h5` into a directory. An `.h5` file name in that case becomes a
+/// sibling directory named by the file stem (`sample.h5` → `sample/`), so
+/// `create_dir` is not asked to turn an existing file into a directory.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OutputTarget {
+    File(PathBuf),
+    ShardDir(PathBuf),
+}
+
+pub fn resolve_output_target(out: &Path, n_shards: usize) -> Result<OutputTarget> {
+    let n_shards = n_shards.max(1);
+    if n_shards == 1 {
+        if out.is_dir() {
+            return Ok(OutputTarget::File(out.join("output.h5")));
+        }
+        if is_h5_filename(out) {
+            if let Some(parent) = out.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("mkdir {}", parent.display()))?;
+                }
+            }
+            return Ok(OutputTarget::File(out.to_path_buf()));
+        }
+        std::fs::create_dir_all(out).with_context(|| format!("mkdir {}", out.display()))?;
+        return Ok(OutputTarget::File(out.join("output.h5")));
+    }
+
+    let dir = if out.is_dir() {
+        out.to_path_buf()
+    } else if is_h5_filename(out) {
+        let stem = out.file_stem().unwrap_or_else(|| out.as_os_str());
+        let parent = match out.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let dir = parent.join(stem);
+        if dir.is_file() {
+            anyhow::bail!(
+                "output {} with {n_shards} shards would write a directory at {}, but that path is a file",
+                out.display(),
+                dir.display()
+            );
+        }
+        if out != dir.as_path() {
+            eprintln!(
+                "Multiple shards: writing shard_XXX.h5 and master.h5 to {} (output path {} names a file)",
+                dir.display(),
+                out.display()
+            );
+        }
+        dir
+    } else if out.exists() && out.is_file() {
+        anyhow::bail!(
+            "output {} is a file; with {n_shards} shards pass a directory or an .h5 path",
+            out.display()
+        );
+    } else {
+        out.to_path_buf()
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    Ok(OutputTarget::ShardDir(dir))
+}
+
+/// Bytes in the file just written, or in `shard_*.h5` + `master.h5` of a shard directory.
+pub fn written_output_bytes(h5_path: &Path) -> u64 {
+    let is_master = h5_path.file_name().and_then(|n| n.to_str()) == Some("master.h5");
+    if !is_master {
+        return std::fs::metadata(h5_path).map(|m| m.len()).unwrap_or(0);
+    }
+    let Some(dir) = h5_path.parent() else {
+        return std::fs::metadata(h5_path).map(|m| m.len()).unwrap_or(0);
+    };
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if name == "master.h5" || (name.starts_with("shard_") && name.ends_with(".h5")) {
+            total += ent.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
 /// Write `shard_XXX.h5` (+ `master.h5` if `n_shards > 1`) from stream temp chunks.
 pub fn assemble_hdf5_from_temp(
     temp_dir: &Path,
@@ -231,33 +328,29 @@ pub fn assemble_hdf5_from_temp(
     std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
     let n_shards = n_shards.max(1);
     let n_writers = n_shards.min(max_writers.max(1)).min(MAX_SHARD_WRITERS);
-    if n_shards == 1 {
-        let path = if out.extension().map(|e| e == "h5").unwrap_or(false) {
-            out.to_path_buf()
-        } else {
-            std::fs::create_dir_all(out).ok();
-            out.join("output.h5")
-        };
-        assemble_one_shard_from_temp(temp_dir, 0, &path, compression)?;
-        return Ok(path);
+    match resolve_output_target(out, n_shards)? {
+        OutputTarget::File(path) => {
+            assemble_one_shard_from_temp(temp_dir, 0, &path, compression)?;
+            Ok(path)
+        }
+        OutputTarget::ShardDir(dir) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(n_writers)
+                .thread_name(|i| format!("taps-h5-{i}"))
+                .build()
+                .context("HDF5 writer pool")?;
+            let temp_dir = temp_dir.to_path_buf();
+            pool.install(|| {
+                (0..n_shards).into_par_iter().try_for_each(|s| {
+                    let p = dir.join(format!("shard_{s:03}.h5"));
+                    let n = assemble_one_shard_from_temp(&temp_dir, s, &p, compression)?;
+                    eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
+                    Ok::<(), anyhow::Error>(())
+                })
+            })?;
+            write_master_h5(&dir, n_shards)
+        }
     }
-    std::fs::create_dir_all(out)?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(n_writers)
-        .thread_name(|i| format!("taps-h5-{i}"))
-        .build()
-        .context("HDF5 writer pool")?;
-    let out = out.to_path_buf();
-    let temp_dir = temp_dir.to_path_buf();
-    pool.install(|| {
-        (0..n_shards).into_par_iter().try_for_each(|s| {
-            let p = out.join(format!("shard_{s:03}.h5"));
-            let n = assemble_one_shard_from_temp(&temp_dir, s, &p, compression)?;
-            eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
-            Ok::<(), anyhow::Error>(())
-        })
-    })?;
-    write_master_h5(&out, n_shards)
 }
 
 pub fn assemble_hdf5_from_memory(
@@ -269,44 +362,69 @@ pub fn assemble_hdf5_from_memory(
     std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
     let n_shards = per_shard.len().max(1);
     let n_writers = n_shards.min(max_writers.max(1)).min(MAX_SHARD_WRITERS);
-    if n_shards == 1 {
-        let path = if out.extension().map(|e| e == "h5").unwrap_or(false) {
-            out.to_path_buf()
-        } else {
-            std::fs::create_dir_all(out).ok();
-            out.join("output.h5")
-        };
-        let mut chunks = per_shard.first().cloned().unwrap_or_default();
-        chunks.sort_by_key(|c| c.chunk_id);
-        let cells = records_from_chunks(&chunks);
-        write_shard_file(&path, &cells, compression)?;
-        return Ok(path);
-    }
-    std::fs::create_dir_all(out)?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(n_writers)
-        .thread_name(|i| format!("taps-h5-{i}"))
-        .build()
-        .context("HDF5 writer pool")?;
-    let out_b = out.to_path_buf();
-    pool.install(|| {
-        per_shard.par_iter().enumerate().try_for_each(|(s, v)| {
-            let mut chunks = v.clone();
+    match resolve_output_target(out, n_shards)? {
+        OutputTarget::File(path) => {
+            let mut chunks = per_shard.first().cloned().unwrap_or_default();
             chunks.sort_by_key(|c| c.chunk_id);
             let cells = records_from_chunks(&chunks);
-            let p = out_b.join(format!("shard_{s:03}.h5"));
-            write_shard_file(&p, &cells, compression)?;
-            eprintln!("HDF5 shard {s:03} cells={} -> {}", cells.len(), p.display());
-            Ok::<(), anyhow::Error>(())
-        })
-    })?;
-    write_master_h5(out, n_shards)
+            write_shard_file(&path, &cells, compression)?;
+            Ok(path)
+        }
+        OutputTarget::ShardDir(dir) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(n_writers)
+                .thread_name(|i| format!("taps-h5-{i}"))
+                .build()
+                .context("HDF5 writer pool")?;
+            pool.install(|| {
+                per_shard.par_iter().enumerate().try_for_each(|(s, v)| {
+                    let mut chunks = v.clone();
+                    chunks.sort_by_key(|c| c.chunk_id);
+                    let cells = records_from_chunks(&chunks);
+                    let p = dir.join(format!("shard_{s:03}.h5"));
+                    write_shard_file(&p, &cells, compression)?;
+                    eprintln!("HDF5 shard {s:03} cells={} -> {}", cells.len(), p.display());
+                    Ok::<(), anyhow::Error>(())
+                })
+            })?;
+            write_master_h5(&dir, n_shards)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shard_io::ChunkCell;
+
+    #[test]
+    fn h5_filename_with_multiple_shards_uses_stem_directory() {
+        let root = std::env::temp_dir().join("taps_rs_out_resolve");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file_out = root.join("sample.h5");
+        std::fs::write(&file_out, b"not a directory").unwrap();
+        match resolve_output_target(&file_out, 4).unwrap() {
+            OutputTarget::ShardDir(dir) => {
+                assert_eq!(dir, root.join("sample"));
+                assert!(dir.is_dir());
+            }
+            OutputTarget::File(_) => panic!("expected a shard directory"),
+        }
+        assert!(file_out.is_file(), "existing .h5 file must be left in place");
+
+        let dir_out = root.join("already_dir");
+        std::fs::create_dir_all(&dir_out).unwrap();
+        match resolve_output_target(&dir_out, 2).unwrap() {
+            OutputTarget::ShardDir(dir) => assert_eq!(dir, dir_out),
+            OutputTarget::File(_) => panic!("expected the existing directory"),
+        }
+        match resolve_output_target(&file_out, 1).unwrap() {
+            OutputTarget::File(p) => assert_eq!(p, file_out),
+            OutputTarget::ShardDir(_) => panic!("one shard writes the .h5 file"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn s10_and_pct() {

@@ -1,6 +1,7 @@
 //! Conservative parameter selection. Explicit CLI values always win.
 
-pub const DEFAULT_CHUNK_SIZE_MB: u32 = 10;
+/// Rust engine default. The Python reference engine stays at 10 Mb.
+pub const DEFAULT_CHUNK_SIZE_MB: u32 = 100;
 pub const MAX_SHARD_WRITERS: usize = 6;
 pub const DEFAULT_ESTIMATED_CELLS: usize = 10_000;
 
@@ -45,6 +46,30 @@ pub fn default_decomp_threads(n_workers: usize) -> usize {
 
 pub fn default_chunk_size_mb() -> u32 {
     DEFAULT_CHUNK_SIZE_MB
+}
+
+fn proc_status_kb(key: &str) -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            let kb = rest.split_whitespace().next()?;
+            return kb.parse().ok();
+        }
+    }
+    None
+}
+
+/// Current resident set of this process, in megabytes (`VmRSS`).
+pub fn process_rss_mb() -> f64 {
+    proc_status_kb("VmRSS:").unwrap_or(0.0) / 1024.0
+}
+
+/// Peak resident set of this process, in megabytes (`VmHWM`).
+pub fn process_peak_rss_mb() -> f64 {
+    match proc_status_kb("VmHWM:") {
+        Some(kb) => kb / 1024.0,
+        None => process_rss_mb(),
+    }
 }
 
 /// Window workers when `--workers` is omitted. Cap at min(nproc, floor((budget-2)/0.7), 64).
@@ -194,8 +219,14 @@ mod tests {
     }
 
     #[test]
-    fn chunk_size_default_is_ten() {
-        assert_eq!(default_chunk_size_mb(), 10);
+    fn chunk_size_default_is_one_hundred() {
+        assert_eq!(default_chunk_size_mb(), 100);
+    }
+
+    #[test]
+    fn rss_reads_proc_status() {
+        assert!(process_rss_mb() > 0.0);
+        assert!(process_peak_rss_mb() >= process_rss_mb());
     }
 
     #[test]

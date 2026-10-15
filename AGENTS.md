@@ -9,7 +9,7 @@
 `taps-sc-extract` is a high-performance Python package and CLI tool for extracting single-cell DNA methylation from TAPS (mC-to-T chemistry) coordinate-sorted BAM files. It writes base-resolution methylation calls into **Amethyst-compatible HDF5 files** (`/CG/<barcode>/1` and `/CH/<barcode>/1`).
 
 ### Target Scale
-- **Workstations**: 32 cores, 32 GB RAM (processes ~75M mapped reads and 1.11B calls across mm10 in **~4.86 minutes** with **~18 GB peak total process-tree RAM** across 24 workers in Rust; ~12.7 minutes in Python reference engine).
+- **Workstations**: 32 cores, 32 GB RAM. Do not quote a reads/minute or speedup figure until the Rust core is remeasured.
 - **Production Servers**: 96 cores, 720 GB RAM (scales to >200k cells and >1B reads).
 
 ---
@@ -34,7 +34,7 @@ taps-sc-extract/
 │   ├── calling.py              # TAPS mC-to-T lookup tables & SAM flag classification
 │   ├── context.py              # Sequence context classifier (CpG, CHG, CHH, CG, CH)
 │   └── barcode.py              # Barcode extraction from QNAME/tags & whitelist parsing
-├── taps-sc-extract-rs/         # High-Performance Rust Acceleration Core (2.6x faster, 56% less RAM)
+├── taps-sc-extract-rs/         # Rust acceleration core
 │   ├── Cargo.toml              # Rust crate manifest (mimalloc, rust-htslib, hdf5-metno, rayon, rustc-hash)
 │   └── src/
 │       ├── main.rs             # Rust CLI entrypoint (extract, stats)

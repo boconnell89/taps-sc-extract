@@ -103,6 +103,33 @@ def get_process_tree_rss_mb() -> float:
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
+def sharded_output_dir(out_h5_path: str) -> str:
+    """Directory that receives ``shard_XXX.h5`` and ``master.h5``.
+
+    An existing directory is used as-is. An ``.h5`` / ``.hdf5`` file name
+    becomes ``<parent>/<stem>/`` so ``os.makedirs`` is not pointed at a file.
+    """
+    if os.path.isdir(out_h5_path):
+        return out_h5_path
+    lower = out_h5_path.lower()
+    if lower.endswith(".h5") or lower.endswith(".hdf5"):
+        parent = os.path.dirname(out_h5_path) or "."
+        stem = os.path.splitext(os.path.basename(out_h5_path))[0]
+        dest = os.path.join(parent, stem)
+        if os.path.isfile(dest):
+            raise FileExistsError(
+                f"Output {out_h5_path} names an HDF5 file and multiple shards were "
+                f"requested, but {dest} exists as a file. Pass a directory, or remove that file."
+            )
+        return dest
+    if os.path.isfile(out_h5_path):
+        raise FileExistsError(
+            f"Output {out_h5_path} is a file. With multiple shards, pass a directory "
+            "or an .h5 path (shards are written to a directory named after the file stem)."
+        )
+    return out_h5_path
+
+
 def _barcode_to_shard(bc: str, n_shards: int) -> int:
     """Deterministically map a cell barcode to a shard index [0, n_shards - 1]."""
     if n_shards <= 1:
@@ -534,6 +561,8 @@ def extract_methylation_parallel(
     Parallel single-cell TAPS methylation extractor.
 
     When n_shards > 1, writes shard_000.h5..shard_NNN.h5 and master.h5.
+    An ``.h5`` file name is turned into a directory named by its stem
+    (``sample.h5`` → ``sample/``) so an existing file is not passed to ``makedirs``.
     When n_shards == 1, writes a single out_h5_path file.
 
     Extraction runs to completion first. Shards are then assembled and written
@@ -606,9 +635,16 @@ def extract_methylation_parallel(
     }
 
     if effective_shards > 1:
-        os.makedirs(out_h5_path, exist_ok=True)
+        out_dir = sharded_output_dir(out_h5_path)
+        if os.path.abspath(out_dir) != os.path.abspath(out_h5_path):
+            logger.info(
+                f"Multiple shards: writing shard_XXX.h5 and master.h5 to {out_dir} "
+                f"(from output path {out_h5_path})."
+            )
+        os.makedirs(out_dir, exist_ok=True)
         shard_filenames = [f"shard_{s:03d}.h5" for s in range(effective_shards)]
-        shard_paths = [os.path.join(out_h5_path, fn) for fn in shard_filenames]
+        shard_paths = [os.path.join(out_dir, fn) for fn in shard_filenames]
+        out_h5_path = out_dir
     else:
         shard_filenames = [os.path.basename(out_h5_path)]
         shard_paths = [out_h5_path]

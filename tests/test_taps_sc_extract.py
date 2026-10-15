@@ -499,6 +499,54 @@ def test_assemble_blosc_compression(tmp_path):
         assert list(ds["pos"]) == [100]
 
 
+def test_rust_command_uses_rust_defaults_unless_set():
+    from taps_sc_extract.cli import build_rust_command, parse_args
+
+    base = ["-b", "in.bam", "-f", "ref.fa", "-o", "out.h5"]
+    parsed = parse_args(base)
+    cmd = build_rust_command("taps-sc-extract-rs", parsed, base)
+    assert cmd[cmd.index("--chunk-size-mb") + 1] == "100"
+    assert cmd[cmd.index("--compression") + 1] == "lzf"
+
+    explicit = base + ["--chunk-size-mb", "10", "--compression", "gzip", "--shards", "4"]
+    parsed = parse_args(explicit)
+    cmd = build_rust_command("taps-sc-extract-rs", parsed, explicit)
+    assert cmd[cmd.index("--chunk-size-mb") + 1] == "10"
+    assert cmd[cmd.index("--compression") + 1] == "gzip"
+    assert cmd[cmd.index("--shards") + 1] == "4"
+
+    equals = base + ["--chunk-size-mb=25", "--compression=none"]
+    parsed = parse_args(equals)
+    cmd = build_rust_command("taps-sc-extract-rs", parsed, equals)
+    assert cmd[cmd.index("--chunk-size-mb") + 1] == "25"
+    assert cmd[cmd.index("--compression") + 1] == "none"
+
+
+def test_sharded_h5_filename_becomes_stem_directory(tmp_path):
+    from taps_sc_extract.parallel_extractor import sharded_output_dir
+
+    h5 = tmp_path / "sample.h5"
+    h5.write_text("existing file")
+    dest = sharded_output_dir(str(h5))
+    assert dest == str(tmp_path / "sample")
+    assert h5.is_file()
+
+    folder = tmp_path / "already"
+    folder.mkdir()
+    assert sharded_output_dir(str(folder)) == str(folder)
+
+    blocked = tmp_path / "blocked.h5"
+    blocked.write_text("x")
+    (tmp_path / "blocked").write_text("not a directory")
+    with pytest.raises(FileExistsError):
+        sharded_output_dir(str(blocked))
+
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x")
+    with pytest.raises(FileExistsError):
+        sharded_output_dir(str(plain))
+
+
 def test_h5_compression_kwargs_blosc_zstd():
     from taps_sc_extract.h5_writer import h5_compression_kwargs
 
