@@ -46,19 +46,6 @@ fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
-use rustc_hash::FxHashMap;
-
-fn write_sites<W: Write>(w: &mut W, map: &FxHashMap<u32, (u32, u32)>) -> std::io::Result<()> {
-    let mut items: Vec<(u32, u32, u32)> = map.iter().map(|(&p, &(t, c))| (p, t, c)).collect();
-    items.sort_unstable_by_key(|x| x.0);
-    write_u32(w, items.len() as u32)?;
-    for (p, t, c) in items {
-        write_u32(w, p)?;
-        write_u32(w, t)?;
-        write_u32(w, c)?;
-    }
-    Ok(())
-}
 
 fn read_sites<R: Read>(r: &mut R) -> std::io::Result<Vec<(u32, u32, u32)>> {
     let n = read_u32(r)? as usize;
@@ -131,14 +118,10 @@ pub fn window_shard_payloads(
         };
         for id in ordered {
             let cell = &cells[id as usize];
-            let mut cg: Vec<(u32, u32, u32)> = cell.cg.iter().map(|(&p, &(t, c))| (p, t, c)).collect();
-            let mut ch: Vec<(u32, u32, u32)> = cell.ch.iter().map(|(&p, &(t, c))| (p, t, c)).collect();
-            cg.sort_unstable_by_key(|x| x.0);
-            ch.sort_unstable_by_key(|x| x.0);
             payload.cells.push(ChunkCell {
                 barcode: intern.name(id).to_string(),
-                cg,
-                ch,
+                cg: cell.cg.clone(),
+                ch: cell.ch.clone(),
             });
         }
         out.push((s, payload));
@@ -194,8 +177,8 @@ pub fn write_window_shards(
             write_u16(&mut w, name.len() as u16)?;
             w.write_all(name)?;
             let cell = &cells[id as usize];
-            write_sites(&mut w, &cell.cg)?;
-            write_sites(&mut w, &cell.ch)?;
+            write_sorted_sites(&mut w, &cell.cg)?;
+            write_sorted_sites(&mut w, &cell.ch)?;
         }
         w.flush()?;
         n_files += 1;
@@ -219,32 +202,92 @@ pub struct ChunkFile {
 
 pub fn read_chunk_file(path: &Path) -> Result<ChunkFile> {
     let mut r = BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    read_chunk_from(&mut r)
+        .with_context(|| format!("read {}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("empty chunk file {}", path.display()))
+}
+
+/// Next `TAPSCK01` record from a stream, or `None` at a clean end of stream.
+pub fn read_chunk_from<R: Read>(r: &mut R) -> Result<Option<ChunkFile>> {
     let mut mag = [0u8; 8];
-    r.read_exact(&mut mag)?;
-    if &mag != MAGIC {
-        bail!("bad magic in {}", path.display());
+    let mut got = 0;
+    while got < mag.len() {
+        let n = r.read(&mut mag[got..])?;
+        if n == 0 {
+            if got == 0 {
+                return Ok(None);
+            }
+            bail!("truncated chunk header");
+        }
+        got += n;
     }
-    let chunk_id = read_u32(&mut r)?;
-    let clen = read_u16(&mut r)? as usize;
+    if &mag != MAGIC {
+        bail!("bad chunk magic");
+    }
+    let chunk_id = read_u32(r)?;
+    let clen = read_u16(r)? as usize;
     let mut cbuf = vec![0u8; clen];
     r.read_exact(&mut cbuf)?;
     let contig = String::from_utf8_lossy(&cbuf).into_owned();
-    let n_cells = read_u32(&mut r)? as usize;
+    let n_cells = read_u32(r)? as usize;
     let mut cells = Vec::with_capacity(n_cells);
     for _ in 0..n_cells {
-        let nlen = read_u16(&mut r)? as usize;
+        let nlen = read_u16(r)? as usize;
         let mut nbuf = vec![0u8; nlen];
         r.read_exact(&mut nbuf)?;
         let barcode = String::from_utf8_lossy(&nbuf).into_owned();
-        let cg = read_sites(&mut r)?;
-        let ch = read_sites(&mut r)?;
+        let cg = read_sites(r)?;
+        let ch = read_sites(r)?;
         cells.push(ChunkCell { barcode, cg, ch });
     }
-    Ok(ChunkFile {
+    Ok(Some(ChunkFile {
         chunk_id,
         contig,
         cells,
-    })
+    }))
+}
+
+/// Read every `TAPSCK01` record from a stream until end of stream.
+pub fn read_all_chunks_from<R: Read>(r: &mut R) -> Result<Vec<ChunkFile>> {
+    let mut out = Vec::new();
+    while let Some(ch) = read_chunk_from(r)? {
+        out.push(ch);
+    }
+    Ok(out)
+}
+
+fn write_sorted_sites<W: Write>(w: &mut W, sites: &[(u32, u32, u32)]) -> std::io::Result<()> {
+    write_u32(w, sites.len() as u32)?;
+    for &(p, t, c) in sites {
+        write_u32(w, p)?;
+        write_u32(w, t)?;
+        write_u32(w, c)?;
+    }
+    Ok(())
+}
+
+/// Serialize an in-memory chunk in the same `TAPSCK01` layout as the temp files.
+pub fn write_chunk_to<W: Write>(w: &mut W, ch: &ChunkFile) -> Result<()> {
+    w.write_all(MAGIC)?;
+    write_u32(w, ch.chunk_id)?;
+    let cb = ch.contig.as_bytes();
+    if cb.len() > u16::MAX as usize {
+        bail!("contig name too long");
+    }
+    write_u16(w, cb.len() as u16)?;
+    w.write_all(cb)?;
+    write_u32(w, ch.cells.len() as u32)?;
+    for cell in &ch.cells {
+        let name = cell.barcode.as_bytes();
+        if name.len() > u16::MAX as usize {
+            bail!("barcode too long");
+        }
+        write_u16(w, name.len() as u16)?;
+        w.write_all(name)?;
+        write_sorted_sites(w, &cell.cg)?;
+        write_sorted_sites(w, &cell.ch)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -279,6 +322,15 @@ mod tests {
         assert_eq!(fa.chunk_id, 3);
         assert_eq!(fa.contig, "chr19");
         assert!(fa.cells.iter().any(|c| c.barcode == "cellA" && c.cg == vec![(100, 0, 1)]));
+
+        let mut buf = Vec::new();
+        write_chunk_to(&mut buf, &fa).unwrap();
+        write_chunk_to(&mut buf, &fa).unwrap();
+        let back = read_all_chunks_from(&mut buf.as_slice()).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1].contig, fa.contig);
+        assert_eq!(back[1].cells.len(), fa.cells.len());
+        assert_eq!(back[1].cells[0].cg, fa.cells[0].cg);
         let _ = fs::remove_dir_all(&dir);
     }
 }

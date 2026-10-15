@@ -1,11 +1,15 @@
 //! Amethyst HDF5 writer: `/CG|CH/<barcode>/1` compound datasets and `master.h5`
 //! relative ExternalLinks.
 //!
-//! Each writer thread owns a private file handle. Concurrent writers are
-//! capped (default 6). Chunk size is `min(len, 65536)`.
+//! hdf5-metno serializes every HDF5 call behind one process-wide lock, so
+//! threads in one process cannot write shards in parallel. With several shards
+//! the default is one `write-shard` child process per shard (each has its own
+//! lock); `WriterMode::Thread` keeps the in-process pool. Chunk size is
+//! `min(len, 65536)`.
 
-use crate::autotune::MAX_SHARD_WRITERS;
-use crate::shard_io::{list_chunk_files, read_chunk_file, shard_dir, ChunkFile};
+use crate::shard_io::{
+    list_chunk_files, read_chunk_file, shard_dir, write_chunk_to, ChunkFile,
+};
 use anyhow::{Context, Result};
 use hdf5_metno::types::FixedAscii;
 use hdf5_metno::{File, H5Type};
@@ -99,14 +103,72 @@ fn write_cell_dataset(
     if recs.is_empty() {
         return Ok(());
     }
+    create_cell_dataset(file, context, barcode, recs.len(), compression)?
+        .write(recs)
+        .map_err(|e| anyhow::anyhow!("write {context}/{barcode}/1: {e}"))?;
+    Ok(())
+}
+
+/// HDF5 chunk length used for every cell dataset.
+const H5_CHUNK: usize = 65536;
+/// Records converted and written per call (a multiple of `H5_CHUNK`, so every
+/// slice starts on a chunk boundary). Bounds the `MethRec` buffer and HDF5's
+/// type-conversion and filter buffers to about 12 MB, whatever the cell size.
+const WRITE_SLICE: usize = 4 * H5_CHUNK;
+
+/// Write one cell's sites from window chunks (`(contig, sites)` in chunk_id
+/// order) in `WRITE_SLICE`-record pieces. Same dataset as `write_cell_dataset`
+/// over the concatenated records.
+fn write_cell_dataset_sliced(
+    file: &File,
+    context: &str,
+    barcode: &str,
+    parts: &[(&str, &[(u32, u32, u32)])],
+    compression: H5Compression,
+) -> Result<()> {
+    let n: usize = parts.iter().map(|(_, s)| s.len()).sum();
+    if n == 0 {
+        return Ok(());
+    }
+    let ds = create_cell_dataset(file, context, barcode, n, compression)?;
+    let mut buf: Vec<MethRec> = Vec::with_capacity(n.min(WRITE_SLICE));
+    let mut start = 0usize;
+    let flush = |buf: &mut Vec<MethRec>, start: &mut usize| -> Result<()> {
+        let end = *start + buf.len();
+        ds.write_slice(buf.as_slice(), *start..end)
+            .map_err(|e| anyhow::anyhow!("write {context}/{barcode}/1 [{}..{end}]: {e}", *start))?;
+        *start = end;
+        buf.clear();
+        Ok(())
+    };
+    for &(contig, sites) in parts {
+        for &(pos, t, c) in sites {
+            buf.push(MethRec::new(contig, pos, t, c));
+            if buf.len() == WRITE_SLICE {
+                flush(&mut buf, &mut start)?;
+            }
+        }
+    }
+    if !buf.is_empty() {
+        flush(&mut buf, &mut start)?;
+    }
+    Ok(())
+}
+
+fn create_cell_dataset(
+    file: &File,
+    context: &str,
+    barcode: &str,
+    n: usize,
+    compression: H5Compression,
+) -> Result<hdf5_metno::Dataset> {
     let g = if file.link_exists(context) {
         file.group(context)?
     } else {
         file.create_group(context)?
     };
     let bc = g.create_group(barcode)?;
-    let n = recs.len();
-    let chunk = n.min(65536);
+    let chunk = n.min(H5_CHUNK);
     let mut b = bc.new_dataset::<MethRec>().shape(n).chunk(chunk);
     b = match compression {
         H5Compression::Gzip(level) => b.deflate(level),
@@ -116,10 +178,7 @@ fn write_cell_dataset(
         H5Compression::BloscZstd(level, shuffle) => b.blosc(hdf5_metno::filters::Blosc::ZStd, level, shuffle),
         H5Compression::None => b,
     };
-    b.create("1")?
-        .write(recs)
-        .map_err(|e| anyhow::anyhow!("write {context}/{barcode}/1: {e}"))?;
-    Ok(())
+    Ok(b.create("1")?)
 }
 
 /// Concatenate window chunks (already in chunk_id order) into Amethyst records.
@@ -164,6 +223,201 @@ pub fn write_shard_file(
     Ok(cells.len())
 }
 
+/// Write one shard from window chunks, one barcode at a time.
+///
+/// Sites stay at 12 bytes each in the chunks; at most `WRITE_SLICE` records
+/// are expanded to 48-byte `MethRec`s at once. Output matches
+/// `write_shard_file(records_from_chunks(..))`: barcodes sorted, CG then CH,
+/// sites in chunk_id order.
+pub fn write_shard_from_chunks(
+    path: &Path,
+    mut chunks: Vec<ChunkFile>,
+    compression: H5Compression,
+) -> Result<usize> {
+    chunks.sort_by_key(|c| c.chunk_id);
+    let mut by_bc: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
+    for (ci, ch) in chunks.iter().enumerate() {
+        for (k, cell) in ch.cells.iter().enumerate() {
+            by_bc
+                .entry(cell.barcode.as_str())
+                .or_default()
+                .push((ci as u32, k as u32));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = File::create(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+    write_version(&file)?;
+    let mut bcs: Vec<&str> = by_bc.keys().copied().collect();
+    bcs.sort_unstable();
+    for bc in &bcs {
+        let refs = &by_bc[bc];
+        let parts = |ctx_cg: bool| -> Vec<(&str, &[(u32, u32, u32)])> {
+            refs.iter()
+                .map(|&(ci, k)| {
+                    let ch = &chunks[ci as usize];
+                    let cell = &ch.cells[k as usize];
+                    let sites = if ctx_cg { &cell.cg } else { &cell.ch };
+                    (ch.contig.as_str(), sites.as_slice())
+                })
+                .collect()
+        };
+        write_cell_dataset_sliced(&file, "CG", bc, &parts(true), compression)?;
+        write_cell_dataset_sliced(&file, "CH", bc, &parts(false), compression)?;
+    }
+    file.flush().ok();
+    Ok(bcs.len())
+}
+
+/// How shard files are written when there is more than one shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterMode {
+    /// One `write-shard` child process per shard; each has its own HDF5 lock.
+    Process,
+    /// In-process rayon pool; all writers share hdf5-metno's global lock.
+    Thread,
+}
+
+impl WriterMode {
+    pub fn parse(s: &str, n_shards: usize) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(if n_shards > 1 { Self::Process } else { Self::Thread }),
+            "process" => Ok(Self::Process),
+            "thread" => Ok(Self::Thread),
+            o => anyhow::bail!("unknown --writer-mode {o} (use auto, process, or thread)"),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Thread => "thread",
+        }
+    }
+}
+
+/// Where a `write-shard` child gets its chunks.
+enum ShardInput {
+    /// Stream-mode temp directory `temp_dir/shard_XXX/`.
+    Dir(PathBuf),
+    /// Memory-mode payloads, sent on the child's stdin.
+    Chunks(Vec<ChunkFile>),
+}
+
+/// What one `write-shard` child reported on its summary line.
+#[derive(Clone, Debug, Default)]
+pub struct WriterReport {
+    pub shard: usize,
+    pub sites: u64,
+    pub peak_rss_mb: f64,
+}
+
+/// Peak RSS of `n_writers` concurrent children, bounded above by the sum of the
+/// `n_writers` largest child peaks.
+pub fn concurrent_writer_peak_mb(reports: &[WriterReport], n_writers: usize) -> f64 {
+    let mut peaks: Vec<f64> = reports.iter().map(|r| r.peak_rss_mb).collect();
+    peaks.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    peaks.iter().take(n_writers.max(1)).sum()
+}
+
+fn parse_writer_line(shard: usize, stderr: &str) -> WriterReport {
+    let mut rep = WriterReport {
+        shard,
+        ..Default::default()
+    };
+    for tok in stderr.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("sites=") {
+            rep.sites = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("peak_rss=").and_then(|v| v.strip_suffix("MB")) {
+            rep.peak_rss_mb = v.parse().unwrap_or(0.0);
+        }
+    }
+    rep
+}
+
+/// Run `taps-sc-extract-rs write-shard` for one shard and wait for it.
+fn run_shard_writer_process(
+    shard: usize,
+    out: &Path,
+    compression_name: &str,
+    input: ShardInput,
+) -> Result<WriterReport> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().context("locate taps-sc-extract-rs for write-shard")?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("write-shard")
+        .arg("--shard")
+        .arg(shard.to_string())
+        .arg("--out")
+        .arg(out)
+        .arg("--compression")
+        .arg(compression_name)
+        .env("HDF5_USE_FILE_LOCKING", "FALSE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let chunks = match input {
+        ShardInput::Dir(d) => {
+            cmd.arg("--chunk-dir").arg(d).stdin(Stdio::null());
+            None
+        }
+        ShardInput::Chunks(c) => {
+            cmd.arg("--stdin").stdin(Stdio::piped());
+            Some(c)
+        }
+    };
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn write-shard for shard {shard:03}"))?;
+    if let Some(chunks) = chunks {
+        let stdin = child.stdin.take().expect("piped stdin");
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, stdin);
+        let sent: Result<()> = chunks.iter().try_for_each(|c| write_chunk_to(&mut w, c));
+        let flushed = w.flush().map_err(anyhow::Error::from);
+        drop(w);
+        drop(chunks);
+        if let Err(e) = sent.and(flushed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.context(format!("send chunks to write-shard {shard:03}")));
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("wait for write-shard {shard:03}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !crate::parallel::QUIET_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) || !output.status.success() {
+        eprint!("{stderr}");
+    }
+    if !output.status.success() {
+        anyhow::bail!("write-shard {shard:03} failed: {}", output.status);
+    }
+    Ok(parse_writer_line(shard, &stderr))
+}
+
+/// Pool of `n_writers` threads, each driving one child process at a time.
+fn write_shards_with_processes(
+    dir: &Path,
+    inputs: Vec<(usize, ShardInput)>,
+    compression_name: &str,
+    n_writers: usize,
+) -> Result<Vec<WriterReport>> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_writers.max(1))
+        .thread_name(|i| format!("taps-h5p-{i}"))
+        .build()
+        .context("HDF5 writer process pool")?;
+    pool.install(|| {
+        inputs
+            .into_par_iter()
+            .map(|(s, input)| {
+                let p = dir.join(format!("shard_{s:03}.h5"));
+                run_shard_writer_process(s, &p, compression_name, input)
+            })
+            .collect()
+    })
+}
+
 pub fn write_master_h5(out_dir: &Path, n_shards: usize) -> Result<std::path::PathBuf> {
     let master_path = out_dir.join("master.h5");
     let file = File::create(&master_path)
@@ -196,28 +450,26 @@ pub fn write_master_h5(out_dir: &Path, n_shards: usize) -> Result<std::path::Pat
     Ok(master_path)
 }
 
+/// Read every chunk file of one stream-mode shard, then delete the directory.
+pub fn read_shard_temp_chunks(dir: &Path) -> Result<Vec<ChunkFile>> {
+    let mut chunks = Vec::new();
+    if dir.is_dir() {
+        for p in list_chunk_files(dir)? {
+            chunks.push(read_chunk_file(&p)?);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    Ok(chunks)
+}
+
 fn assemble_one_shard_from_temp(
     temp_dir: &Path,
     shard: usize,
     shard_h5: &Path,
     compression: H5Compression,
 ) -> Result<usize> {
-    let dir = shard_dir(temp_dir, shard);
-    let mut chunks = Vec::new();
-    if dir.is_dir() {
-        for p in list_chunk_files(&dir)? {
-            chunks.push(read_chunk_file(&p)?);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    chunks.sort_by_key(|c| c.chunk_id);
-    let cells = records_from_chunks(&chunks);
-    if cells.is_empty() {
-        // still create an empty shard so master layout is stable? Python writes empty shard files.
-        write_shard_file(shard_h5, &cells, compression)?;
-        return Ok(0);
-    }
-    write_shard_file(shard_h5, &cells, compression)
+    let chunks = read_shard_temp_chunks(&shard_dir(temp_dir, shard))?;
+    write_shard_from_chunks(shard_h5, chunks, compression)
 }
 
 fn is_h5_filename(path: &Path) -> bool {
@@ -323,71 +575,94 @@ pub fn assemble_hdf5_from_temp(
     out: &Path,
     n_shards: usize,
     compression: H5Compression,
+    compression_name: &str,
     max_writers: usize,
-) -> Result<std::path::PathBuf> {
+    mode: WriterMode,
+) -> Result<(PathBuf, Vec<WriterReport>)> {
     std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
     let n_shards = n_shards.max(1);
-    let n_writers = n_shards.min(max_writers.max(1)).min(MAX_SHARD_WRITERS);
+    let n_writers = n_shards.min(max_writers.max(1));
     match resolve_output_target(out, n_shards)? {
         OutputTarget::File(path) => {
             assemble_one_shard_from_temp(temp_dir, 0, &path, compression)?;
-            Ok(path)
+            Ok((path, Vec::new()))
         }
         OutputTarget::ShardDir(dir) => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n_writers)
-                .thread_name(|i| format!("taps-h5-{i}"))
-                .build()
-                .context("HDF5 writer pool")?;
-            let temp_dir = temp_dir.to_path_buf();
-            pool.install(|| {
-                (0..n_shards).into_par_iter().try_for_each(|s| {
-                    let p = dir.join(format!("shard_{s:03}.h5"));
-                    let n = assemble_one_shard_from_temp(&temp_dir, s, &p, compression)?;
-                    eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
-                    Ok::<(), anyhow::Error>(())
-                })
-            })?;
-            write_master_h5(&dir, n_shards)
+            let reports = match mode {
+                WriterMode::Process => {
+                    let inputs = (0..n_shards)
+                        .map(|s| (s, ShardInput::Dir(shard_dir(temp_dir, s))))
+                        .collect();
+                    write_shards_with_processes(&dir, inputs, compression_name, n_writers)?
+                }
+                WriterMode::Thread => {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(n_writers)
+                        .thread_name(|i| format!("taps-h5-{i}"))
+                        .build()
+                        .context("HDF5 writer pool")?;
+                    let temp_dir = temp_dir.to_path_buf();
+                    pool.install(|| {
+                        (0..n_shards).into_par_iter().try_for_each(|s| {
+                            let p = dir.join(format!("shard_{s:03}.h5"));
+                            let n = assemble_one_shard_from_temp(&temp_dir, s, &p, compression)?;
+                            eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
+                            Ok::<(), anyhow::Error>(())
+                        })
+                    })?;
+                    Vec::new()
+                }
+            };
+            Ok((write_master_h5(&dir, n_shards)?, reports))
         }
     }
 }
 
 pub fn assemble_hdf5_from_memory(
-    per_shard: &[Vec<ChunkFile>],
+    per_shard: Vec<Vec<ChunkFile>>,
     out: &Path,
     compression: H5Compression,
+    compression_name: &str,
     max_writers: usize,
-) -> Result<std::path::PathBuf> {
+    mode: WriterMode,
+) -> Result<(PathBuf, Vec<WriterReport>)> {
     std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
     let n_shards = per_shard.len().max(1);
-    let n_writers = n_shards.min(max_writers.max(1)).min(MAX_SHARD_WRITERS);
+    let n_writers = n_shards.min(max_writers.max(1));
     match resolve_output_target(out, n_shards)? {
         OutputTarget::File(path) => {
-            let mut chunks = per_shard.first().cloned().unwrap_or_default();
-            chunks.sort_by_key(|c| c.chunk_id);
-            let cells = records_from_chunks(&chunks);
-            write_shard_file(&path, &cells, compression)?;
-            Ok(path)
+            let chunks = per_shard.into_iter().next().unwrap_or_default();
+            write_shard_from_chunks(&path, chunks, compression)?;
+            Ok((path, Vec::new()))
         }
         OutputTarget::ShardDir(dir) => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n_writers)
-                .thread_name(|i| format!("taps-h5-{i}"))
-                .build()
-                .context("HDF5 writer pool")?;
-            pool.install(|| {
-                per_shard.par_iter().enumerate().try_for_each(|(s, v)| {
-                    let mut chunks = v.clone();
-                    chunks.sort_by_key(|c| c.chunk_id);
-                    let cells = records_from_chunks(&chunks);
-                    let p = dir.join(format!("shard_{s:03}.h5"));
-                    write_shard_file(&p, &cells, compression)?;
-                    eprintln!("HDF5 shard {s:03} cells={} -> {}", cells.len(), p.display());
-                    Ok::<(), anyhow::Error>(())
-                })
-            })?;
-            write_master_h5(&dir, n_shards)
+            let reports = match mode {
+                WriterMode::Process => {
+                    let inputs = per_shard
+                        .into_iter()
+                        .enumerate()
+                        .map(|(s, v)| (s, ShardInput::Chunks(v)))
+                        .collect();
+                    write_shards_with_processes(&dir, inputs, compression_name, n_writers)?
+                }
+                WriterMode::Thread => {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(n_writers)
+                        .thread_name(|i| format!("taps-h5-{i}"))
+                        .build()
+                        .context("HDF5 writer pool")?;
+                    pool.install(|| {
+                        per_shard.into_par_iter().enumerate().try_for_each(|(s, v)| {
+                            let p = dir.join(format!("shard_{s:03}.h5"));
+                            let n = write_shard_from_chunks(&p, v, compression)?;
+                            eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
+                            Ok::<(), anyhow::Error>(())
+                        })
+                    })?;
+                    Vec::new()
+                }
+            };
+            Ok((write_master_h5(&dir, n_shards)?, reports))
         }
     }
 }
@@ -438,6 +713,46 @@ mod tests {
     }
 
     #[test]
+    fn sliced_write_matches_whole_write() {
+        let dir = std::env::temp_dir().join("taps_rs_h5_sliced");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One cell bigger than WRITE_SLICE, split over two windows and contigs.
+        let big_a: Vec<(u32, u32, u32)> = (0..200_000u32).map(|i| (i * 3 + 1, i % 4, i % 3)).collect();
+        let big_b: Vec<(u32, u32, u32)> = (0..100_001u32).map(|i| (i * 5 + 2, i % 2, i % 5)).collect();
+        let chunks = vec![
+            ChunkFile {
+                chunk_id: 1,
+                contig: "chr2".into(),
+                cells: vec![ChunkCell { barcode: "big".into(), cg: big_b.clone(), ch: vec![(7, 1, 0)] }],
+            },
+            ChunkFile {
+                chunk_id: 0,
+                contig: "chr1".into(),
+                cells: vec![
+                    ChunkCell { barcode: "big".into(), cg: big_a.clone(), ch: vec![] },
+                    ChunkCell { barcode: "small".into(), cg: vec![(5, 0, 1)], ch: vec![] },
+                ],
+            },
+        ];
+        let mut ordered = chunks.clone();
+        ordered.sort_by_key(|c| c.chunk_id);
+        let whole = dir.join("whole.h5");
+        write_shard_file(&whole, &records_from_chunks(&ordered), H5Compression::Lzf).unwrap();
+        let sliced = dir.join("sliced.h5");
+        assert_eq!(write_shard_from_chunks(&sliced, chunks, H5Compression::Lzf).unwrap(), 2);
+        let (fw, fs) = (File::open(&whole).unwrap(), File::open(&sliced).unwrap());
+        for name in ["CG/big/1", "CH/big/1", "CG/small/1"] {
+            let a: Vec<MethRec> = fw.dataset(name).unwrap().read_raw().unwrap();
+            let b: Vec<MethRec> = fs.dataset(name).unwrap().read_raw().unwrap();
+            assert_eq!(a, b, "{name}");
+        }
+        assert_eq!(fs.dataset("CG/big/1").unwrap().size(), 300_001);
+        assert!(!fs.link_exists("CH/small"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn roundtrip_single_file() {
         let dir = std::env::temp_dir().join("taps_rs_h5_rt");
         let _ = std::fs::remove_dir_all(&dir);
@@ -454,6 +769,14 @@ mod tests {
         let cells = records_from_chunks(&chunks);
         let p = dir.join("out.h5");
         write_shard_file(&p, &cells, H5Compression::None).unwrap();
+        let p2 = dir.join("out_stream.h5");
+        write_shard_from_chunks(&p2, chunks.clone(), H5Compression::None).unwrap();
+        let f2 = File::open(&p2).unwrap();
+        for name in ["CG/cellA/1", "CH/cellA/1"] {
+            let a: Vec<MethRec> = File::open(&p).unwrap().dataset(name).unwrap().read_raw().unwrap();
+            let b: Vec<MethRec> = f2.dataset(name).unwrap().read_raw().unwrap();
+            assert_eq!(a, b);
+        }
         let f = File::open(&p).unwrap();
         let ds = f.dataset("CG/cellA/1").unwrap();
         let recs: Vec<MethRec> = ds.read_raw().unwrap();

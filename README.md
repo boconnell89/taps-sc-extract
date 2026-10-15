@@ -11,9 +11,10 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 
 ## Key Features
 
-- **Rust acceleration core**: Window-parallel extraction with a Python reference engine behind the same CLI. Published reads/minute figures are omitted until the engine is remeasured.
-- **Predictable, Bounded Memory**: Process-tree memory tracks via `/proc` and is reported as peak RSS in the post-run summary.
-- **Auto-Scaled Shard Writer Pool**: Dynamically sizes writer concurrency (`--max-writer-threads 0` auto) to compress all output shards concurrently without bottlenecking disk queue depth.
+- **Rust acceleration core**: Window-parallel extraction with a Python reference engine behind the same CLI. Current workstation timings: [`code/nvme-profiling-2026-10-15.md`](code/nvme-profiling-2026-10-15.md).
+- **Bounded memory**: The run summary reports the extraction process's peak RSS and, separately, the shard-writer processes' combined peak.
+- **One writer process per shard**: hdf5-metno serializes every HDF5 call in a process behind one lock. With more than one shard, the Rust engine writes each shard in its own child process (`--writer-mode process`, default), so shards compress and write in parallel.
+- **Machine tuning (`--test`)**: Measures this machine on a built-in synthetic workload, optionally samples your BAM, and recommends `-t`, decompression and writer settings. `--save-profile` makes them the defaults on this host.
 - **High-Speed HDF5 Compression Options**: Supports `gzip` (level 1 deflate, 100% portable), `gzip-shuffle` (byte shuffling + level 1 deflate, 25.5× compression ratio), `lzf` (near raw write speed with 87% size reduction), `blosc` (multithreaded LZ4), `blosc-zstd`, and uncompressed `none`.
 - **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
 - **Single-Pass HDF5 Writer**: Bypasses HDF5 B-tree resizing overhead, writing tens of thousands of cell datasets in **seconds** rather than hours.
@@ -24,7 +25,16 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 
 ## Installation
 
-### Using pip
+### Rust core, built for this machine (recommended)
+```bash
+git clone https://github.com/boconnell89/taps-sc-extract.git
+cd taps-sc-extract
+conda install -c conda-forge hdf5 clang libclang pkg-config   # build dependencies
+./install.sh            # native build for this CPU, then pip install -e .
+```
+`install.sh` writes `taps-sc-extract-rs/.cargo/config.toml` for your conda prefix and builds with `-C target-cpu=native` (Rust) and `-O3 -march=native` (the vendored htslib, including BAQ). A native binary can fail with SIGILL on a different CPU, so **rerun `install.sh` on each host**, or use `./install.sh --portable` for an x86-64-v3 build. `./install.sh --smoke-bam BAM --smoke-fasta FA` also extracts chr19:5.0–5.1 Mb as a check.
+
+### Python reference engine only (pip)
 ```bash
 git clone https://github.com/boconnell89/taps-sc-extract.git
 cd taps-sc-extract
@@ -47,6 +57,13 @@ taps-sc-extract --help
 
 ## Quickstart
 
+### 0. Tune this machine (once per host)
+```bash
+taps-sc-extract --test --save-profile                     # machine only, a few minutes
+taps-sc-extract --test -b sample.srt.bam -f ref.fa -o out/   # also predict time and memory for this BAM
+```
+The report names the limiting factor for each phase (CPU, BAM read, HDF5 write, storage) and recommends flags. `--test-quick` takes about 40 seconds.
+
 ### 1. Standard Parallel Run (Auto Engine: Uses Compiled Rust Core)
 ```bash
 taps-sc-extract \
@@ -54,7 +71,6 @@ taps-sc-extract \
   -f /path/to/reference.fa \
   -o all_cells.h5 \
   -t 24 \
-  --chunk-size-mb 10 \
   --log-file extraction.log
 ```
 
@@ -98,6 +114,8 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
                        [--no-baq] [--no-overlap-clip]
                        [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
+                       [--writer-mode {auto,process,thread}] [--profile-json PROFILE_JSON]
+                       [--test] [--test-quick] [--save-profile] [--test-report TEST_REPORT]
                        [-v] [--version]
 ```
 
@@ -112,14 +130,19 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `-w, -a, --whitelist` | `str` | `None` | Path to optional barcode whitelist or cell annotation file. |
 | `--engine` | `str` | `auto` | Backend engine: `auto` (prefers Rust, fallback Python), `rust` (fastest), `python` (reference). |
 | `--memory-mode` | `str` | `auto` | Memory mode: `auto` (heuristic based on budget/cells), `stream` (disk temp), `memory` (RAM). |
-| `--max-memory-gb` | `float` | `None` | Optional RAM budget in GB (default: 0.6 × available memory). |
+| `--max-memory-gb` | `float` | `None` | Memory budget in GB for the whole run, extraction plus writer processes. Overrides `--max-memory-fraction`. |
+| `--max-memory-fraction` | `float` | `0.6` | Rust: share of available memory the run may use. |
 | `--expected-cells` | `int` | `None` | Optional cell count (auto-detected from `-w/--whitelist` cardinality if omitted). |
 | `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes (or Rayon threads in Rust). `0` = auto. |
-| `--decomp-threads` | `int` | `0` | BAM BGZF decompression threads per worker process (`0` for synchronous reading). |
-| `--chunk-size-mb` | `int` | `10` Python / `100` Rust | Genomic window chunk size in megabases. |
+| `--decomp-threads` | `int` | Rust: 4 / 2 / 0 by worker count; Python: 1 | BAM BGZF decompression threads per worker (`0` = inflate on the worker thread). |
+| `--chunk-size-mb` | `int` | `10` Python / auto Rust | Genomic window size in megabases. Rust auto: about 6 windows per worker, 2–100 Mb. |
 | `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). An `.h5` file name with multiple shards is written to a directory named after the file stem. |
 | `--compression` | `str` | `gzip` Python / `lzf` Rust | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc`, `blosc-zstd`, `none`. |
-| `--max-writer-threads` | `int` | `0` | Maximum parallel shard-writer threads after extraction (`0` = auto-scales up to shard count). |
+| `--max-writer-threads` | `int` | `0` | Maximum concurrent shard writers after extraction (`0` = auto: up to shard count, cores and memory; in-process writers capped at 6). |
+| `--writer-mode` | `str` | `auto` | Rust shard writers: `process` (one child per shard, default when shards > 1) or `thread` (in-process, one shared HDF5 lock). |
+| `--profile-json` | `str` | `None` | Rust: write per-phase CPU use, per-stage and per-window timings and writer memory to JSON. Adds ~5–10% to processing time. |
+| `--test` | `flag` | `False` | Run the tuning probes instead of extracting (see Quickstart 0). `-b/-f` optional. |
+| `--test-quick` / `--save-profile` / `--test-report` | | | Shorter probes; save the machine profile for later runs on this host; also write the report to a file. |
 | `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk (equivalent to `--memory-mode memory`). |
 | `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
 | `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
@@ -136,71 +159,53 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 ## Performance Flags Guide
 
-Published engine-versus-engine timings are omitted until the Rust core is remeasured. The run summary prints processing time, HDF5 write time, and estimated read and write MB/s for each job.
+Current workstation measurements (Rust engine, `5base_ucbTn5_sp2.srt.bam`, 53.5M reads, 7,351 cells, mm10, 16-core / 32-thread Ryzen 9 5900XT, WSL2 ext4 on NVMe): [`code/nvme-profiling-2026-10-15.md`](code/nvme-profiling-2026-10-15.md). The 2026-10-14 starting point is in [`code/nvme-profiling-2026-10-14.md`](code/nvme-profiling-2026-10-14.md). The run summary prints processing time, HDF5 write time, estimated read and write MB/s, and peak memory of the extraction process and the writer processes. **Throughput (Reads)** is mapped records over wall time, including HDF5 write. For a new machine, start with `taps-sc-extract --test`.
 
-### Compression Algorithm Trade-Offs (`--compression`)
+### 1. Compression (`--compression`)
+
+Measured on chr1–3 before `026c52e` with the older in-process writers. Ratios and plugin requirements still apply; the times do not.
 
 | Algorithm | Extraction + Write Time (`chr1–3`) | Shard Output Size | Compression Ratio | R / Bioconductor Requirements |
 | :--- | :---: | :---: | :---: | :--- |
-| **`none`** | **46.47 s** | 11.0 GB | 1.0× | Native `rhdf5` (No plugins needed) |
-| **`lzf`** *(Rust default)* | **47.88 s** *(Fastest Compressed)* | 1.4 GB | **7.8×** | `library(rhdf5filters)` |
-| **`blosc`** (LZ4) | **62.82 s** | 532 MB | **20.7×** | `library(rhdf5filters)` |
-| **`gzip`** *(Python default)* | **66.53 s** | 728 MB | **15.1×** | **Native `rhdf5` (Zero extra packages)** |
-| **`gzip-shuffle`** | **76.79 s** | 431 MB | **25.5×** | Native `rhdf5` |
-| **`blosc-zstd`** | **74.71 s** | **385 MB** *(Smallest)* | **28.6×** | `library(rhdf5filters)` |
+| **`none`** | 46.47 s | 11.0 GB | 1.0× | Native `rhdf5` (No plugins needed) |
+| **`lzf`** *(Rust default)* | 47.88 s | 1.4 GB | **7.8×** | `library(rhdf5filters)` |
+| **`blosc`** (LZ4, level 9: high compression) | 62.82 s | 532 MB | **20.7×** | `library(rhdf5filters)` |
+| **`gzip`** *(Python default)* | 66.53 s | 728 MB | **15.1×** | **Native `rhdf5` (Zero extra packages)** |
+| **`gzip-shuffle`** | 76.79 s | 431 MB | **25.5×** | Native `rhdf5` |
+| **`blosc-zstd`** | 74.71 s | **385 MB** *(Smallest)* | **28.6×** | `library(rhdf5filters)` |
 
-### 2. `-t, --workers` (Parallel Worker Threads/Processes)
-- **Mechanism**: Splits the genome into $N$ non-overlapping genomic windows and processes them concurrently.
-- **Recommendation**: Set to $0.75 \times$ to $1.0 \times$ available physical CPU cores (e.g., `24` on a 32-core workstation; `64` on a 96-core server). `0` automatically sizes workers from hardware CPU count and memory budget.
+### 2. `-t, --workers`
+- **Mechanism**: Rayon threads, each processing genomic windows. Extraction is CPU-bound; with BAQ on, BAQ (`sam_prob_realn`) is about 70% of worker time.
+- **Recommendation**: Use all logical CPUs. On the 16-core / 32-thread test machine, 32 workers ran about 1.4× faster than 16 (SMT). `0` = auto (CPUs, bounded by the memory budget), or the saved `--test` profile.
 
-### 3. `--decomp-threads` (BAM BGZF Decompression Threads)
-- **Mechanism**: Allocates background `htslib` threads per worker for BGZF block decompression.
-- **Tuning by Worker Count**:
-  - **High Worker Count ($\ge 8$ workers, e.g. `-t 24` or `-t 32`)**: Use `--decomp-threads 0` or `1`. Because all CPU cores are already fully saturated processing genomic windows, spawning 24–48 additional threads causes thread oversubscription, context switching, and cache eviction.
-  - **Low Worker Count ($\le 4$ workers, e.g. single-chromosome extractions)**: Use `--decomp-threads 2` to `4`. Spare CPU cores are utilized to decompress BAM blocks ahead of pileup.
+### 3. `--decomp-threads` (BAM BGZF decompression)
+- **Mechanism**: htslib threads per worker that inflate BGZF blocks ahead of the reader.
+- **Recommendation**: Leave it unset. Rust picks 0 at 8 or more workers (inflate runs on the worker thread), 2 at 5–7 and 4 at 1–4. With libdeflate, inflate measured 1–6% of worker time, so extra threads only add contention.
 
-### 3. `--chunk-size-mb` (Genomic Granularity & Load Balancing)
-- **Mechanism**: Defines the window size of each genomic chunk (Python default: `10` Mb $\to$ 286 chunks for mm10; Rust default: `100` Mb).
-- **Trade-offs**:
-  - **Smaller chunks (e.g., `5` Mb)**: Better load balancing across many workers; prevents workers from idling at the end of chromosomes.
-  - **Larger chunks (e.g., `20` Mb)**: Reduces chunk file count and IPC overhead; slightly higher memory usage per chunk.
-- **Recommendation**: The Python engine defaults to `10` Mb. The Rust engine defaults to `100` Mb.
+### 4. `--chunk-size-mb` (window size)
+- **Rust default: auto.** About 6 windows per worker, clamped to 2–100 Mb (mm10: ~28 Mb at 16 workers, ~14 Mb at 32, ~4.7 Mb at 96). Enough windows keep every worker busy to the end; the old fixed 100 Mb gave 37 windows, so 32 workers had a long tail and 96 workers would sit mostly idle.
+- Window size does not change calls (verified per cell at 100, 10 and 2 Mb).
+- The Python engine defaults to `10` Mb.
 
-### 4. `--shards` (Parallel HDF5 Writing & Scalability)
-- **Mechanism**: Partitions cell barcodes deterministically across $N$ shard files (`shard_000.h5`..`shard_NNN.h5`) using `hash(bc) % N` and creates `master.h5` with relative `ExternalLink` references.
-- **Benefits**:
-  - Eliminates single-file HDF5 write lock contention.
-  - Assembles and compresses all $N$ shards **concurrently** in parallel.
-  - Reduces individual file sizes for easier downstream parallelization in R/Amethyst.
-- **Recommendation**:
-  - $\le 10,000$ cells: `--shards 1` (single file) or `--shards 4`.
-  - $10,000$–$50,000$ cells: `--shards 8` or `--shards 16`.
-  - $> 100,000$ cells: `--shards 16` or `--shards 32`.
+### 5. `--shards`
+- **Mechanism**: Partitions barcodes across $N$ shard files by `hash(bc) % N` and writes `master.h5` with relative `ExternalLink`s.
+- **Recommendation**: Depends on the filesystem. On local NVMe, 16 shards wrote 4.2 GB in 11–17 s against 62 s for one shard. On a server filesystem with fewer cells, more shards were much slower, so measure there (`--test` probes the output filesystem). The default stays 1 shard below 10,000 cells.
 
-### 5. `--max-writer-threads` (Shard Writer Concurrency & Storage Optimization)
-- **Mechanism**: Controls the maximum number of parallel worker threads that assemble, compress, and write shard HDF5 files after chunk extraction finishes.
-- **Why it matters for large genomes**: On whole-genome mammalian datasets the HDF5 writer can dominate wall time once the site count is large. Writer threads run after extraction and compress shards concurrently, up to the requested `--max-writer-threads`.
-- **Recommended Defaults by Storage Type**:
-  - **Local Fast NVMe / PCIe SSD with $\ge 32$ GB RAM**: `--max-writer-threads 8` to `16` &mdash; Compresses all shards simultaneously for maximum throughput.
-  - **Standard Workstations (Default)**: `--max-writer-threads 6` &mdash; Safe balance between parallel CPU compression and disk I/O queue depth.
-  - **Network File Systems (NFS / Lustre / GPFS / SMB)**: `--max-writer-threads 2` to `4` &mdash; Minimizes concurrent metadata and lock contention across shared storage nodes.
-  - **Spinning Disk (HDD) or Memory-Constrained Systems**: `--max-writer-threads 1` &mdash; Strict single-thread sequential writing with zero seek contention and minimal RAM.
+### 6. `--max-writer-threads` and `--writer-mode`
+- **`--writer-mode process`** (default with more than one shard): one `taps-sc-extract-rs write-shard` child per shard, up to `--max-writer-threads` at a time. Each child streams its shard one cell at a time in bounded slices, so a writer needs roughly 15–60 bytes per site of its shard.
+- **`--writer-mode thread`**: in-process writers. hdf5-metno takes one process-wide lock for every HDF5 call, so they do not write in parallel; auto caps them at 6.
+- **Auto count**: up to min(shards, CPUs), and only as many as fit the memory budget at about 20 bytes per site of a shard each, or the saved `--test` profile (still memory-bounded). Lower it on network filesystems (NFS/Lustre: 2–4) or spinning disks (1).
 
-### 6. `--no-temp-file` vs. Default Streaming Mode
-- **Default Mode (Disk-Streaming)**:
-  - Workers write compact binary chunk files to fast disk (`/tmp`) as each genomic window finishes.
-  - Each shard reads only its own chunk files in coordinate order and purges them immediately upon writing.
-  - **RAM Usage**: Process-tree RAM scales as $\approx 700\text{ MB / worker}$ (fixed heap buffers + BAM indices) and plateaus at steady state (~18 GB total across 24 workers), never growing linearly with genome size.
-  - **Writer Pool**: Automatically sizes writer concurrency from `MemAvailable` and respects `--max-writer-threads`.
-  - **Recommendation**: Always use for workstations, desktops, and standard production servers.
-- **`--no-temp-file` (In-Memory Mode)**:
-  - Workers pass structured array dictionaries directly over IPC without writing to disk.
-  - **RAM Usage**: Accumulates all chunk arrays directly in memory across the entire run (~25–35 GB for whole-genome mammalian datasets).
-  - **Recommendation**: Use on high-memory servers ($\ge 128$ GB RAM, 64–96 cores) with shared RAM to maximize I/O throughput.
+### 7. `--memory-mode` / `--no-temp-file`
+- **`stream`**: window results go to compact temp files under `--temp-dir`; each writer reads its own shard's files. Lowest memory (about 5 GB peak for the extraction process on the test BAM).
+- **`memory`**: window results stay in RAM and are piped to the writer processes (about 12 GB on the test BAM). Not faster than `stream` on local NVMe; use it when temp storage is slow.
+- **`auto`**: the Rust engine estimates sites from the BAM index's mapped-read count (about 14 per read). It picks memory mode only if the extraction process plus the writer processes fit the budget without fewer writers than stream mode would allow; otherwise stream. The writer count is bounded by the same budget. The config block prints the plan (`Memory plan: ... est. peak ~X GB of Y GB`). Set the budget with `--max-memory-fraction` (default 0.6 of available memory) or `--max-memory-gb`.
 
-### 7. `--temp-dir` (Scratch Space Location)
-- **Mechanism**: Specifies the filesystem location where temporary chunk files are stored during extraction.
-- **Recommendation**: Point to a fast local NVMe SSD or memory-backed filesystem (e.g. `/tmp` or `/dev/shm`). Avoid slow network filesystems (NFS/Lustre) for temporary files.
+### 8. `--temp-dir`
+- Point it at fast local storage. Keep inputs, temp and output off slow network or 9p mounts: on the test machine the same job took 171 s from a 9p-mounted HDD against 95 s from local NVMe (before these upgrades).
+
+### 9. Profiling a run (`--profile-json`)
+Writes per-phase wall and CPU time, utilisation, a per-stage split of worker time (read/inflate, BAQ, pileup, calling), per-window timings and writer memory. Use it to see what limits a run on a new system.
 
 ---
 
@@ -304,11 +309,14 @@ obj_ch <- indexChr(obj, "CH")
 
 ## Running Tests
 
-Run the test suite with `pytest`:
+Run the test suite with `pytest` and `cargo`:
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v                        # includes chr19 BAM tests when the data is present
+(cd taps-sc-extract-rs && cargo test --release)
 ```
+
+The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_cellfix_2026-10-15/`) and, per cell, against the Python engine.
 
 ---
 

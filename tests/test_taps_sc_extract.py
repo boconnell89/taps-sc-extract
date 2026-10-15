@@ -290,21 +290,65 @@ def test_canonical_contig_allowlist():
 
 
 # 10. Real BAM smoke test (chr19)
-def test_chr19_real_bam_smoke(tmp_path):
-    bam_path = "/mnt/e/sciMET_TAPS/260731/taps_ucbTn5_sp2.srt.bam"
-    fasta_path = "/mnt/e/refs/mm10/mm10.fa"
+CHR19_BAM = "/mnt/e/sciMET_TAPS/260731/taps_ucbTn5_sp2.srt.bam"
+CHR19_FASTA = "/mnt/e/refs/mm10/mm10.fa"
+# Rust chr19 output frozen after the barcode-cache fix (see the README in that
+# directory). The older test_chr19_rust_026c52e/ reference has 0.01% of calls
+# under the wrong barcode and is kept only as a record.
+CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_cellfix_2026-10-15/chr19.h5"
 
-    if not os.path.exists(bam_path) or not os.path.exists(fasta_path):
-        pytest.skip("Real BAM or FASTA not available in environment.")
 
-    out_h5 = tmp_path / "chr19_smoke.h5"
+def _require(*paths):
+    for p in paths:
+        if not os.path.exists(p):
+            pytest.skip(f"{p} not available in environment.")
 
+
+@pytest.fixture(scope="module")
+def chr19_python_run(tmp_path_factory):
+    """Python reference engine on chr19 (BAQ is a no-op there), run once per module."""
+    _require(CHR19_BAM, CHR19_FASTA)
+    out_h5 = tmp_path_factory.mktemp("chr19_py") / "chr19_smoke.h5"
     stats = extract_methylation(
-        bam_path=bam_path,
-        fasta_path=fasta_path,
+        bam_path=CHR19_BAM,
+        fasta_path=CHR19_FASTA,
         out_h5_path=str(out_h5),
         chroms=["chr19"],
     )
+    return out_h5, stats
+
+
+def _run_rust_chr19(out_h5, *extra):
+    import subprocess
+    from taps_sc_extract.cli import find_rust_binary
+
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        pytest.skip("Rust binary not built.")
+    subprocess.run(
+        [rust_bin, "extract", "-b", CHR19_BAM, "-f", CHR19_FASTA, "-o", str(out_h5),
+         "-c", "chr19", "-t", "8", "--shards", "1", "--memory-mode", "memory", *extra],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _sites_by_cell(path, ctx):
+    """{(barcode, pos): (t, c)} and {pos: [t, c]} summed over cells."""
+    cells, totals = {}, {}
+    with h5py.File(str(path), "r") as f:
+        for bc in f[ctx]:
+            x = f[ctx][bc]["1"][()]
+            for p, t, c in zip(x["pos"].tolist(), x["t"].tolist(), x["c"].tolist()):
+                cells[(bc, p)] = (t, c)
+                tot = totals.setdefault(p, [0, 0])
+                tot[0] += t
+                tot[1] += c
+    return cells, totals
+
+
+def test_chr19_real_bam_smoke(chr19_python_run):
+    out_h5, stats = chr19_python_run
 
     assert os.path.exists(out_h5)
     assert os.path.getsize(out_h5) > 0
@@ -333,6 +377,45 @@ def test_chr19_real_bam_smoke(tmp_path):
     # CpG rate should be high (~50-80%), CH rate should be low (<2%)
     assert 40.0 <= cg_pct <= 85.0
     assert 0.0 <= ch_pct <= 3.0
+
+
+def test_chr19_real_bam_smoke_rust(tmp_path):
+    """Rust engine on chr19 must reproduce the frozen reference sites exactly."""
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
+    out_h5 = tmp_path / "chr19_rust.h5"
+    _run_rust_chr19(out_h5)
+
+    cols = ["chr", "pos", "t", "c"]
+    with h5py.File(CHR19_RUST_REFERENCE, "r") as ref, h5py.File(str(out_h5), "r") as new:
+        for ctx in ("CG", "CH"):
+            assert sorted(ref[ctx].keys()) == sorted(new[ctx].keys())
+            for bc in ref[ctx]:
+                a = ref[ctx][bc]["1"][()][cols]
+                b = new[ctx][bc]["1"][()][cols]
+                assert np.array_equal(a, b), f"{ctx}/{bc} differs"
+
+
+def test_chr19_rust_python_same_cell_per_call(chr19_python_run, tmp_path):
+    """Rust --no-baq vs Python on chr19: no call may sit under a different barcode.
+
+    Wherever the two engines agree on a position's total (t, c summed over
+    cells), every cell must agree too. Positions whose totals differ are the
+    known, separate Rust-has-more-calls gap and are only bounded here.
+    """
+    py_h5, _ = chr19_python_run
+    rs_h5 = tmp_path / "chr19_rust_nobaq.h5"
+    _run_rust_chr19(rs_h5, "--no-baq")
+
+    for ctx, max_total_gap in (("CG", 100), ("CH", 1000)):
+        py_cells, py_tot = _sites_by_cell(py_h5, ctx)
+        rs_cells, rs_tot = _sites_by_cell(rs_h5, ctx)
+        gap = {p for p in set(py_tot) | set(rs_tot) if py_tot.get(p) != rs_tot.get(p)}
+        moved = [
+            k for k in set(py_cells) | set(rs_cells)
+            if k[1] not in gap and py_cells.get(k) != rs_cells.get(k)
+        ]
+        assert not moved, f"{ctx}: {len(moved)} calls under a different barcode, e.g. {moved[:3]}"
+        assert len(gap) <= max_total_gap, f"{ctx}: {len(gap)} positions with differing totals"
 
 
 def test_sharded_hdf5_writing(tmp_path):
@@ -505,8 +588,9 @@ def test_rust_command_uses_rust_defaults_unless_set():
     base = ["-b", "in.bam", "-f", "ref.fa", "-o", "out.h5"]
     parsed = parse_args(base)
     cmd = build_rust_command("taps-sc-extract-rs", parsed, base)
-    assert cmd[cmd.index("--chunk-size-mb") + 1] == "100"
+    assert cmd[cmd.index("--chunk-size-mb") + 1] == "0"
     assert cmd[cmd.index("--compression") + 1] == "lzf"
+    assert "--decomp-threads" not in cmd
 
     explicit = base + ["--chunk-size-mb", "10", "--compression", "gzip", "--shards", "4"]
     parsed = parse_args(explicit)
@@ -556,3 +640,23 @@ def test_h5_compression_kwargs_blosc_zstd():
     assert kw["compression_opts"][4] == 1
     assert kw["compression_opts"][6] == 5
 
+
+
+def test_test_mode_needs_no_dataset_and_builds_tune_command():
+    from taps_sc_extract.cli import build_tune_command, parse_args
+
+    parsed = parse_args(["--test", "--test-quick", "--save-profile"])
+    cmd = build_tune_command("taps-sc-extract-rs", parsed)
+    assert cmd[:2] == ["taps-sc-extract-rs", "tune"]
+    assert "--quick" in cmd and "--save-profile" in cmd
+    assert "-b" not in cmd
+
+    parsed = parse_args(["--test", "-b", "in.bam", "-f", "ref.fa", "-o", "out_dir/run.h5"])
+    cmd = build_tune_command("taps-sc-extract-rs", parsed)
+    assert cmd[cmd.index("-b") + 1] == "in.bam"
+    assert cmd[cmd.index("--out-dir") + 1] == "out_dir"
+
+    with pytest.raises(SystemExit):
+        parse_args(["--test", "-b", "in.bam"])  # -f missing
+    with pytest.raises(SystemExit):
+        parse_args(["-b", "in.bam", "-f", "ref.fa"])  # -o missing outside --test

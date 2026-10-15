@@ -15,7 +15,9 @@ mod extract_noodles;
 mod fasta;
 mod h5_out;
 mod parallel;
+mod profile;
 mod shard_io;
+mod tune;
 mod window;
 
 use anyhow::Result;
@@ -27,7 +29,8 @@ use crate::extract::{estimate_bam_traffic, BamTraffic, ExtractParams};
 use crate::extract_noodles::extract_regions_stats_noodles;
 use crate::fasta::FastFaiReader;
 use crate::h5_out::{
-    assemble_hdf5_from_memory, assemble_hdf5_from_temp, written_output_bytes, H5Compression,
+    assemble_hdf5_from_memory, assemble_hdf5_from_temp, read_shard_temp_chunks,
+    write_shard_from_chunks, written_output_bytes, H5Compression, WriterMode,
 };
 use crate::shard_io::ChunkFile;
 use crate::parallel::{
@@ -115,8 +118,9 @@ enum Commands {
         start: Option<u64>,
         #[arg(long)]
         end: Option<u64>,
-        /// Genomic window size in megabases (Rust default: 100).
-        #[arg(long, default_value_t = 100)]
+        /// Genomic window size in megabases. 0 = auto: about 6 windows per worker,
+        /// clamped to 2-100 Mb.
+        #[arg(long, default_value_t = 0)]
         chunk_size_mb: u32,
         /// Number of HDF5 shard files (0 = auto based on cell count: 1/8/16/32).
         #[arg(long, default_value_t = 0)]
@@ -133,18 +137,26 @@ enum Commands {
         /// stream = temp chunks then HDF5; memory = keep in RAM; auto = heuristic from budget & cells.
         #[arg(long, default_value = "auto")]
         memory_mode: String,
-        /// Optional memory budget in GB (defaults to conservative 0.6 * MemAvailable).
+        /// Memory budget in GB for the whole process tree (overrides --max-memory-fraction).
         #[arg(long)]
         max_memory_gb: Option<f64>,
+        /// Share of MemAvailable the run may use (default 0.6).
+        #[arg(long)]
+        max_memory_fraction: Option<f64>,
         /// Optional expected cell count (auto-detected from whitelist if omitted).
         #[arg(long)]
         expected_cells: Option<usize>,
         /// HDF5 compression (Rust default: lzf).
         #[arg(long, default_value = "lzf")]
         compression: String,
-        /// Maximum parallel shard-writer threads (0 = auto sized from shards, cores, RAM).
+        /// Maximum concurrent shard writers (0 = auto sized from shards, cores, RAM).
         #[arg(long, default_value_t = 0)]
         max_writer_threads: usize,
+        /// Shard writers: process (one child per shard, each with its own HDF5
+        /// lock), thread (in-process pool sharing one lock), or auto (process
+        /// when there is more than one shard).
+        #[arg(long, default_value = "auto")]
+        writer_mode: String,
         #[arg(long, default_value_t = 20)]
         min_baseq: u8,
         #[arg(long, default_value_t = 0)]
@@ -166,6 +178,51 @@ enum Commands {
         trim_r2: u32,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
+        /// Write per-phase and per-window timings (and writer reports) as JSON.
+        #[arg(long)]
+        profile_json: Option<PathBuf>,
+    },
+    /// Measure this machine (and optionally a dataset) and recommend flags.
+    Tune {
+        /// Where the synthetic BAM, temp files and storage probe go.
+        #[arg(long, default_value = ".")]
+        temp_dir: PathBuf,
+        /// Output filesystem to probe (HDF5 writes land here).
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// Input filesystem to probe (where BAMs live). Defaults to the BAM's directory.
+        #[arg(long)]
+        input_dir: Option<PathBuf>,
+        /// Optional dataset to sample and predict for.
+        #[arg(short = 'b', long)]
+        bam: Option<PathBuf>,
+        #[arg(short = 'f', long, requires = "bam")]
+        fasta: Option<PathBuf>,
+        /// Smaller probes (~1 minute).
+        #[arg(long, default_value_t = false)]
+        quick: bool,
+        /// Save the machine profile for `extract` defaults on this host.
+        #[arg(long, default_value_t = false)]
+        save_profile: bool,
+        /// Also write the profile and report to this file.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+    /// Internal: write one shard file from window chunks (spawned by `extract`).
+    #[command(hide = true)]
+    WriteShard {
+        #[arg(long)]
+        shard: usize,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "lzf")]
+        compression: String,
+        /// Stream-mode temp directory holding this shard's chunk_*.bin files.
+        #[arg(long, conflicts_with = "stdin")]
+        chunk_dir: Option<PathBuf>,
+        /// Read TAPSCK01 chunk records from stdin until EOF.
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
     },
 }
 
@@ -174,6 +231,64 @@ fn main() -> Result<()> {
     let _ = install_ctrlc(cancel.clone());
     let cli = Cli::parse();
     match cli.cmd {
+        Commands::Tune {
+            temp_dir,
+            out_dir,
+            input_dir,
+            bam,
+            fasta,
+            quick,
+            save_profile,
+            report,
+        } => {
+            let input_dir = input_dir
+                .or_else(|| bam.as_ref().and_then(|b| b.parent().map(|p| p.to_path_buf())))
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from("."));
+            tune::run_tune(&tune::TuneArgs {
+                temp_dir,
+                out_dir,
+                input_dir,
+                bam,
+                fasta,
+                quick,
+                save_profile,
+                json: report,
+            })?;
+        }
+        Commands::WriteShard {
+            shard,
+            out,
+            compression,
+            chunk_dir,
+            stdin,
+        } => {
+            std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
+            let codec = H5Compression::parse(&compression)?;
+            let t0 = Instant::now();
+            let chunks = match (chunk_dir, stdin) {
+                (Some(d), false) => read_shard_temp_chunks(&d)?,
+                (None, true) => {
+                    let mut r = std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock());
+                    shard_io::read_all_chunks_from(&mut r)?
+                }
+                _ => anyhow::bail!("write-shard needs exactly one of --chunk-dir or --stdin"),
+            };
+            let read_s = t0.elapsed().as_secs_f64();
+            let sites: u64 = chunks
+                .iter()
+                .flat_map(|c| c.cells.iter())
+                .map(|cell| (cell.cg.len() + cell.ch.len()) as u64)
+                .sum();
+            let t1 = Instant::now();
+            let n = write_shard_from_chunks(&out, chunks, codec)?;
+            eprintln!(
+                "HDF5 shard {shard:03} cells={n} sites={sites} read={read_s:.1}s write={:.1}s peak_rss={:.0}MB -> {}",
+                t1.elapsed().as_secs_f64(),
+                autotune::process_peak_rss_mb(),
+                out.display()
+            );
+        }
         Commands::Stats {
             bam,
             fasta,
@@ -233,6 +348,7 @@ fn main() -> Result<()> {
                 accumulate: dump_sites.is_some(),
                 trim_r1,
                 trim_r2,
+                profile: false,
             };
             eprintln!(
                 "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={compute_baq} overlaps={ignore_overlaps} orphans={ignore_orphans} trim_r1={trim_r1} trim_r2={trim_r2} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
@@ -296,9 +412,11 @@ fn main() -> Result<()> {
             keep_temp,
             memory_mode,
             max_memory_gb,
+            max_memory_fraction,
             expected_cells,
             compression,
             max_writer_threads,
+            writer_mode,
             min_baseq,
             min_mapq,
             max_depth,
@@ -308,13 +426,40 @@ fn main() -> Result<()> {
             trim_r1,
             trim_r2,
             whitelist,
+            profile_json,
         } => {
             let fai = FastFaiReader::open(&fasta)?;
             let contig_list: Vec<&str> = match &chroms {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
                 None => CANONICAL_CONTIGS.to_vec(),
             };
-            let mut windows = plan_windows(&fai, &contig_list, u64::from(chunk_size_mb) * 1_000_000);
+            let wl = match whitelist {
+                Some(p) => Some(barcode::parse_annot(&p)?),
+                None => None,
+            };
+
+            // PR7 Auto-tuning & Phase 1 Writer Auto-scaling
+            let (budget_gb, budget_src) = autotune::system_memory_budget_gb(max_memory_gb, max_memory_fraction);
+            let cell_source = autotune::CellCountSource::resolve(
+                expected_cells,
+                wl.as_ref().map(|w| w.len()),
+                autotune::DEFAULT_ESTIMATED_CELLS,
+            );
+            let saved = tune::load_profile_for_host();
+            let (n_workers, workers_src) = match (&saved, workers) {
+                (Some((p, _)), 0) if p.workers.is_some() => (p.workers.unwrap(), "machine profile"),
+                _ => autotune::resolve_workers_with_budget(workers, budget_gb),
+            };
+            let selected_bp: u64 = contig_list
+                .iter()
+                .filter_map(|c| fai.reference_length(c))
+                .sum();
+            let (chunk_bp, chunk_src) = if chunk_size_mb == 0 {
+                (autotune::auto_chunk_size_bp(selected_bp, n_workers), "auto")
+            } else {
+                (u64::from(chunk_size_mb) * 1_000_000, "explicit")
+            };
+            let mut windows = plan_windows(&fai, &contig_list, chunk_bp);
             if let (Some(s), Some(e)) = (start, end) {
                 let contig = contig_list
                     .first()
@@ -327,29 +472,40 @@ fn main() -> Result<()> {
                     end: e,
                 }];
             }
-            let wl = match whitelist {
-                Some(p) => Some(barcode::parse_annot(&p)?),
-                None => None,
-            };
-
-            // PR7 Auto-tuning & Phase 1 Writer Auto-scaling
-            let (budget_gb, budget_src) = autotune::system_memory_budget_gb(max_memory_gb);
-            let cell_source = autotune::CellCountSource::resolve(
-                expected_cells,
-                wl.as_ref().map(|w| w.len()),
-                autotune::DEFAULT_ESTIMATED_CELLS,
-            );
-            let (n_workers, workers_src) = autotune::resolve_workers_with_budget(workers, budget_gb);
-            let decomp = decomp_threads.unwrap_or_else(|| autotune::default_decomp_threads(n_workers));
+            let decomp = decomp_threads
+                .or_else(|| saved.as_ref().and_then(|(p, _)| p.decomp_threads))
+                .unwrap_or_else(|| autotune::default_decomp_threads(n_workers));
             let (n_shards, shards_src) = autotune::resolve_shards(shards, cell_source.count());
-            let (writer_threads, writer_src) = autotune::resolve_writer_threads(max_writer_threads, n_shards, budget_gb);
-            let total_genome_mb = windows.len() as u64 * u64::from(chunk_size_mb);
-            let (resolved_memory_mode, mode_src) = autotune::resolve_memory_mode(
-                &memory_mode,
+            let writer_mode = WriterMode::parse(&writer_mode, n_shards)?;
+            let traffic = match estimate_bam_traffic(&bam, &contig_list) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("warning: BAM read estimate unavailable: {e}");
+                    let bytes = std::fs::metadata(&bam).map(|m| m.len()).unwrap_or(0);
+                    BamTraffic {
+                        mapped_reads: 0,
+                        estimated_bytes: bytes,
+                    }
+                }
+            };
+            let mem_plan = autotune::plan_memory(&autotune::MemoryInputs {
+                mode: &memory_mode,
                 budget_gb,
-                cell_source.count(),
-                total_genome_mb,
-            );
+                mapped_reads: traffic.mapped_reads,
+                cell_count: cell_source.count(),
+                genome_mb: selected_bp / 1_000_000,
+                n_shards,
+                n_workers,
+                cli_writers: max_writer_threads,
+                profile_writers: if writer_mode == WriterMode::Process {
+                    saved.as_ref().and_then(|(p, _)| p.writers)
+                } else {
+                    None
+                },
+                in_process: writer_mode == WriterMode::Thread,
+            });
+            let (writer_threads, writer_src) = (mem_plan.writers, mem_plan.writers_src);
+            let (resolved_memory_mode, mode_src) = (mem_plan.mode.clone(), mem_plan.mode_src);
             let compression_name = compression.clone();
             let compression = H5Compression::parse(&compression)?;
             let params = ExtractParams {
@@ -363,35 +519,41 @@ fn main() -> Result<()> {
                 accumulate: true,
                 trim_r1,
                 trim_r2,
+                profile: profile_json.is_some(),
             };
             eprintln!("======================================================================");
             eprintln!("taps-sc-extract-rs v{}", env!("CARGO_PKG_VERSION"));
             eprintln!("Configuration:");
             eprintln!("  Memory budget:   {:.1} GB ({})", budget_gb, budget_src);
+            if let Some((_, path)) = &saved {
+                eprintln!("  Machine profile: {}", path.display());
+            }
             eprintln!("  Expected cells:  {} ({})", cell_source.count(), cell_source.label());
             eprintln!("  Workers:         {} ({})", n_workers, workers_src);
             eprintln!("  Decomp threads:  {} per worker", decomp);
             eprintln!("  Shards:          {} ({})", n_shards, shards_src);
-            eprintln!("  Writer threads:  {} ({})", writer_threads, writer_src);
+            eprintln!("  Writers:         {} {} ({})", writer_threads, writer_mode.label(), writer_src);
             eprintln!("  Memory mode:     {} ({})", resolved_memory_mode, mode_src);
-            eprintln!("  Chunk size:      {chunk_size_mb} Mb");
+            eprintln!(
+                "  Memory plan:     ~{:.0}M sites; extraction ~{:.1} GB, writers {} x ~{:.1} GB; est. peak ~{:.1} GB of {:.1} GB",
+                mem_plan.est_sites / 1e6,
+                mem_plan.extract_gb,
+                writer_threads,
+                mem_plan.writer_each_gb,
+                mem_plan.peak_gb,
+                budget_gb
+            );
+            if mem_plan.peak_gb > budget_gb {
+                eprintln!("  warning: estimated peak exceeds the memory budget; lower --max-writer-threads or use --memory-mode stream");
+            }
+            eprintln!("  Chunk size:      {:.1} Mb ({chunk_src})", chunk_bp as f64 / 1e6);
             eprintln!("  Compression:     {compression_name}");
             eprintln!("  BAQ:             {}", params.compute_baq);
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
             eprintln!("======================================================================");
-            let traffic = match estimate_bam_traffic(&bam, &contig_list) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("warning: BAM read estimate unavailable: {e}");
-                    let bytes = std::fs::metadata(&bam).map(|m| m.len()).unwrap_or(0);
-                    BamTraffic {
-                        mapped_reads: 0,
-                        estimated_bytes: bytes,
-                    }
-                }
-            };
+            let cpu_start = profile::cpu_times();
             let t_process = Instant::now();
             let (r, pending) = match resolved_memory_mode.as_str() {
                 "memory" => {
@@ -428,30 +590,42 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unknown --memory-mode {other} (use stream or memory)"),
             };
             let process_s = t_process.elapsed().as_secs_f64();
+            let cpu_after_process = profile::cpu_times();
             eprintln!(
-                "Extraction workers finished in {process_s:.1}s. Writing {n_shards} shard(s) with {writer_threads} writer(s)."
+                "Extraction workers finished in {process_s:.1}s. Writing {n_shards} shard(s) with {writer_threads} {} writer(s).",
+                writer_mode.label()
             );
             let t_write = Instant::now();
-            let h5_path = match pending {
+            let (h5_path, writer_reports) = match pending {
                 PendingOutput::Memory(mem) => {
-                    assemble_hdf5_from_memory(&mem, &out, compression, writer_threads)?
+                    assemble_hdf5_from_memory(
+                        mem,
+                        &out,
+                        compression,
+                        &compression_name,
+                        writer_threads,
+                        writer_mode,
+                    )?
                 }
                 PendingOutput::Stream(tmp) => {
-                    let p = assemble_hdf5_from_temp(
+                    let res = assemble_hdf5_from_temp(
                         tmp.path(),
                         &out,
                         n_shards,
                         compression,
+                        &compression_name,
                         writer_threads,
+                        writer_mode,
                     )?;
                     if keep_temp {
                         let kept = tmp.keep();
                         eprintln!("kept temp {}", kept.display());
                     }
-                    p
+                    res
                 }
             };
             let write_s = t_write.elapsed().as_secs_f64();
+            let cpu_end = profile::cpu_times();
             let out_bytes = written_output_bytes(&h5_path);
             let total_s = process_s + write_s;
             print_extraction_summary(
@@ -464,7 +638,42 @@ fn main() -> Result<()> {
                 n_shards,
                 resolved_memory_mode == "stream",
                 crate::autotune::process_peak_rss_mb(),
+                crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
+                writer_reports.len(),
             );
+            if let Some(path) = &profile_json {
+                let rp = profile::RunProfile {
+                    config: vec![
+                        ("version", env!("CARGO_PKG_VERSION").to_string()),
+                        ("workers", n_workers.to_string()),
+                        ("decomp_threads", decomp.to_string()),
+                        ("chunk_bp", chunk_bp.to_string()),
+                        ("windows", windows.len().to_string()),
+                        ("shards", n_shards.to_string()),
+                        ("writer_mode", writer_mode.label().to_string()),
+                        ("writers", writer_threads.to_string()),
+                        ("memory_mode", resolved_memory_mode.clone()),
+                        ("compression", compression_name.clone()),
+                        ("baq", params.compute_baq.to_string()),
+                        ("bam", bam.display().to_string()),
+                        ("nproc", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).to_string()),
+                    ],
+                    process_s,
+                    write_s,
+                    cpu_start,
+                    cpu_after_process,
+                    cpu_end,
+                    workers: n_workers,
+                    writers: writer_threads,
+                    result: &r,
+                    windows: &windows,
+                    writer_reports: &writer_reports,
+                    peak_rss_mb: crate::autotune::process_peak_rss_mb(),
+                    writer_peak_mb: crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
+                };
+                profile::write_profile_json(path, &rp)?;
+                eprintln!("Profile JSON:          {}", path.display());
+            }
             let read_mb_s = mb_per_s(traffic.estimated_bytes, process_s);
             let write_mb_s = mb_per_s(out_bytes, write_s);
             println!(
@@ -543,6 +752,8 @@ fn print_extraction_summary(
     n_shards: usize,
     stream: bool,
     peak_rss_mb: f64,
+    writer_peak_mb: f64,
+    n_writer_procs: usize,
 ) {
     let cg_c = r.stats.cg_c;
     let cg_t = r.stats.cg_t;
@@ -599,6 +810,11 @@ fn print_extraction_summary(
         fmt_grouped_f64(cells_per_min, 1)
     );
     eprintln!("Peak Memory (RSS):     {peak_rss_mb:.1} MB");
+    if n_writer_procs > 0 {
+        eprintln!(
+            "Writer Peak RSS:       {writer_peak_mb:.1} MB ({n_writer_procs} child processes; concurrent upper bound)"
+        );
+    }
     eprintln!("Shards Written:        {n_shards}");
     eprintln!("Streaming Mode:        {mode}");
     eprintln!("----------------------------------------------------------------------");

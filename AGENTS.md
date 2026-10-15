@@ -9,7 +9,7 @@
 `taps-sc-extract` is a high-performance Python package and CLI tool for extracting single-cell DNA methylation from TAPS (mC-to-T chemistry) coordinate-sorted BAM files. It writes base-resolution methylation calls into **Amethyst-compatible HDF5 files** (`/CG/<barcode>/1` and `/CH/<barcode>/1`).
 
 ### Target Scale
-- **Workstations**: 32 cores, 32 GB RAM. Do not quote a reads/minute or speedup figure until the Rust core is remeasured.
+- **Workstations**: 16 cores / 32 threads, ~60 GB RAM on this host. Latest snapshot: [`code/nvme-profiling-2026-10-15.md`](code/nvme-profiling-2026-10-15.md); the 2026-10-14 starting point is [`code/nvme-profiling-2026-10-14.md`](code/nvme-profiling-2026-10-14.md). On a new machine run `taps-sc-extract --test` before quoting or tuning anything.
 - **Production Servers**: 96 cores, 720 GB RAM (scales to >200k cells and >1B reads).
 
 ---
@@ -21,6 +21,9 @@ taps-sc-extract/
 ├── pyproject.toml              # Build config, dependencies, CLI entrypoint (taps-sc-extract)
 ├── README.md                   # User documentation and performance guide
 ├── AGENTS.md                   # This AI developer reference
+├── install.sh                  # Host-optimised build (native CPU flags), writes .cargo/config.toml
+├── code/nvme-profiling-*.md    # Dated workstation timing snapshots
+├── code/rust-implementation-log.md  # Dated record of Rust engine changes and measurements
 ├── scripts/
 │   └── benchmark_ab.py         # Automated A/B performance benchmark (Python vs Rust)
 ├── taps_sc_extract/            # Reference Python extraction engine
@@ -35,15 +38,20 @@ taps-sc-extract/
 │   ├── context.py              # Sequence context classifier (CpG, CHG, CHH, CG, CH)
 │   └── barcode.py              # Barcode extraction from QNAME/tags & whitelist parsing
 ├── taps-sc-extract-rs/         # Rust acceleration core
-│   ├── Cargo.toml              # Rust crate manifest (mimalloc, rust-htslib, hdf5-metno, rayon, rustc-hash)
+│   ├── Cargo.toml              # Rust crate manifest (mimalloc, rust-htslib+libdeflate, hdf5-metno, rayon, libc)
+│   ├── .cargo/config.toml.in   # Template install.sh fills (conda prefix, target CPU, forced CFLAGS)
 │   └── src/
-│       ├── main.rs             # Rust CLI entrypoint (extract, stats)
-│       ├── extract.rs          # Column-wise bam_mplp samtools-style pileup & BAQ
-│       ├── parallel.rs         # Rayon thread pool & cancellation tokens
-│       ├── accumulate.rs       # Barcode intern & FxHashMap cell position maps
-│       ├── h5_out.rs           # Amethyst structured array HDF5 generator & master.h5 (Blosc, LZF, Gzip)
-│       ├── shard_io.rs         # Compact binary intermediate chunk partition files
-│       └── autotune.rs         # Hardware & memory budget auto-tuning heuristics
+│       ├── main.rs             # Rust CLI: extract, stats, tune, write-shard (hidden, spawned by extract)
+│       ├── extract.rs          # bam_plp pileup, BAQ, calling callback, shared BAQ contig refs, stage timing
+│       ├── extract_noodles.rs  # Slower pure-Rust reference pileup (noodles)
+│       ├── parallel.rs         # Rayon window pool, thread-local readers, cancellation
+│       ├── window.rs           # Genomic window planner
+│       ├── accumulate.rs       # Barcode intern & per-cell sorted (pos, t, c) site vectors
+│       ├── h5_out.rs           # Amethyst HDF5 writer: sliced cell datasets, process-per-shard writers, master.h5
+│       ├── shard_io.rs         # TAPSCK01 chunk format (temp files and writer stdin)
+│       ├── autotune.rs         # Worker / window / writer / memory-mode defaults
+│       ├── profile.rs          # --profile-json output
+│       └── tune.rs             # --test: machine probes on a synthetic BAM, dataset sampling, saved profile
 └── tests/
     └── test_taps_sc_extract.py # Pytest unit & integration test suite
 ```
@@ -67,11 +75,17 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Always use `FastFaiReader`**: Pure Python / Rust binary byte `seek()` and `read()` using `.fai` offsets is 100% process-safe.
 
 ### D. Memory Bounding & Shard Writer Concurrency
-- **Accurate Process-Tree Accounting**: Memory is monitored across the entire process tree (`/proc/<pid>/statm` or `sys_info`).
-- **Disk-Streaming vs. Memory Mode**: In `stream` mode (default), intermediate chunks are partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin` and purged on write. In `memory` mode, maps are kept in RAM.
-- **Auto-Scaled Shard Writer Pool**: Sized from memory budget and shard count (`--max-writer-threads 0` auto) to compress all output shards concurrently without bottlenecking disk queue depth.
+- **Process-tree accounting**: The summary reports the extraction process's peak RSS and the writer children's combined peak (each `write-shard` child reports its own peak). Count both when sizing memory.
+- **Disk-Streaming vs. Memory Mode**: In `stream` mode, intermediate chunks are partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin` and purged on write. In `memory` mode, per-window payloads stay in RAM and are piped to the writers.
+- **HDF5 global lock**: hdf5-metno wraps every HDF5 call in one process-wide `ReentrantMutex` (`hdf5-metno-sys` `LOCK`), compression included. Threads in one process never write HDF5 in parallel. Parallel writing means one `write-shard` child process per shard (`--writer-mode process`, the default with >1 shard). In-process (`thread`) writers are auto-capped at 6.
+- **Bounded writer memory**: `write_shard_from_chunks` writes one cell at a time in `WRITE_SLICE` (4 × 65,536-record) slices. Never build a whole shard's or a whole cell's `MethRec` vector.
 
-### E. TAPS Chemistry & Amethyst Schema
+### E. Per-Read State in the Pileup Callback
+- **Key per-read caches on `bam1_t.id`**, the number htslib gives each read it stores in an iterator (0, 1, 2, … never reused within a window). **Never key on the record or QNAME address**: htslib recycles pileup nodes LIFO and `bam_copy1` reuses buffers, so a new read can sit at the previous read's address. A QNAME-pointer cache did this until 2026-10-15 and put ~0.01% of calls under the wrong barcode (see `code/rust-implementation-log.md`).
+- **Per-cell sites arrive in position order** (columns ascend within a window), so `CellMaps::add` appends or adds to the last entry. Keep that invariant; `normalize()` repairs any out-of-order input.
+- **Parity checks must be per cell**, not totals: `test_chr19_rust_python_same_cell_per_call`.
+
+### F. TAPS Chemistry & Amethyst Schema
 - **TAPS Calling Logic**:
   - Original Top strand (`OT`, `+`): Reference `C` $\to$ Read `T` is **Methylated** (`c += 1`), Read `C` is **Unmethylated** (`t += 1`).
   - Original Bottom strand (`OB`, `-`): Reference `G` $\to$ Read `A` is **Methylated** (`c += 1`), Read `G` is **Unmethylated** (`t += 1`).
@@ -99,6 +113,15 @@ taps-sc-extract -b sample.srt.bam -f ref.fa -o output.h5 -t 24 --engine python
 
 # 4. Automated A/B performance comparison
 python3 scripts/benchmark_ab.py -b sample.srt.bam -f ref.fa -c chr1,chr2,chr3 -t 24 --shards 16
+
+# 5. Tune a new machine (synthetic workload; add -b/-f/-o to sample a dataset)
+taps-sc-extract --test --save-profile
+
+# 6. Where does the time go? (per-stage and per-window timings)
+taps-sc-extract -b sample.srt.bam -f ref.fa -o out/ --shards 16 --profile-json run_profile.json
+
+# 7. Build the Rust core for this host
+./install.sh --no-pip
 ```
 
 ### Python Programmatic API
@@ -151,8 +174,11 @@ obj_ch <- indexChr(obj, "CH")
 # Run all unit tests
 pytest tests/ -k "not test_chr19_real_bam_smoke" -v
 
-# Run full test suite including BAM integration smoke test
+# Run full test suite including chr19 BAM tests (Python smoke, Rust frozen reference, Rust-vs-Python per cell)
 pytest tests/ -v
+
+# Rust unit tests
+(cd taps-sc-extract-rs && cargo test --release)
 ```
 
 ---
@@ -166,3 +192,6 @@ pytest tests/ -v
 | Memory spike / OOM | Loading all chunks into RAM | Ensure `use_temp_files=True` (default) and use `--shards 16`. |
 | `Chunk size must be <= data shape` | `chunks=(65536,)` on a cell with 10 calls | Use `chunk_size = min(len(records), 65536)`. |
 | Missing `master.h5` link target | Relative paths misaligned | Use relative file names `shard_XXX.h5` inside `master.h5` so the directory is portable. |
+| More writer threads, slower HDF5 write and more RAM | hdf5-metno's global lock serializes in-process writers | Use `--writer-mode process` (default with >1 shard). |
+| SIGILL from `taps-sc-extract-rs` | Native build copied to a different CPU | Rerun `./install.sh` on that host, or build with `--portable`. |
+| Timings vary 2× between identical runs | Concurrent builds or other jobs on the box | Never time while compiling; repeat runs and report the spread. |

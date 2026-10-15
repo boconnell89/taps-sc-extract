@@ -28,9 +28,14 @@ use anyhow::{Context as AnyhowContext, Result};
 use rust_htslib::bam::pileup::Alignment;
 use rust_htslib::bam::{IndexedReader, Read, Record};
 use rust_htslib::htslib;
+use rustc_hash::FxHashMap;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::os::raw::c_char;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
 pub struct CallStats {
@@ -112,6 +117,43 @@ pub struct WindowResult {
     pub intern: BarcodeIntern,
     /// Parallel to `intern.names()`. Empty when `ExtractParams.accumulate` is false.
     pub cells: Vec<CellMaps>,
+    /// Filled when `ExtractParams.profile` is true (record counts always).
+    pub timing: WindowTiming,
+    /// Per-window `(chunk_id, timing)` collected by the parallel drivers when profiling.
+    pub window_timings: Vec<(u32, WindowTiming)>,
+}
+
+/// Where one window's time went (seconds on the worker thread).
+#[derive(Clone, Debug, Default)]
+pub struct WindowTiming {
+    /// BAM records read in the window (after `fetch`).
+    pub records: u64,
+    /// Records that passed the filters and entered the pileup.
+    pub pushed: u64,
+    pub total_s: f64,
+    /// FASTA window fetch plus BAM index seek.
+    pub setup_s: f64,
+    /// `bam.read`: BGZF inflate and record decode.
+    pub read_s: f64,
+    /// Flag/MAPQ/orphan filters and `sam_prob_realn` (BAQ).
+    pub baq_s: f64,
+    /// `bam_plp_push` / `bam_plp_next` and overlap clipping, excluding calling.
+    pub pileup_s: f64,
+    /// Per-column calling callback: context, strand, trim, barcode, cell maps.
+    pub call_s: f64,
+}
+
+impl WindowTiming {
+    pub fn add(&mut self, o: &WindowTiming) {
+        self.records += o.records;
+        self.pushed += o.pushed;
+        self.total_s += o.total_s;
+        self.setup_s += o.setup_s;
+        self.read_s += o.read_s;
+        self.baq_s += o.baq_s;
+        self.pileup_s += o.pileup_s;
+        self.call_s += o.call_s;
+    }
 }
 
 impl WindowResult {
@@ -120,6 +162,8 @@ impl WindowResult {
             stats: CallStats::default(),
             intern: BarcodeIntern::default(),
             cells: Vec::new(),
+            timing: WindowTiming::default(),
+            window_timings: Vec::new(),
         }
     }
 
@@ -130,6 +174,7 @@ impl WindowResult {
     /// Merge counts and interned barcode names (not per-pos maps).
     pub fn absorb_counts(&mut self, other: &WindowResult) {
         self.stats.merge(&other.stats);
+        self.timing.add(&other.timing);
         for name in other.intern.names() {
             self.intern.intern_str(name);
         }
@@ -138,6 +183,7 @@ impl WindowResult {
     /// Merge counts and per-pos cell maps (barcode-string intern remap).
     pub fn absorb_maps(&mut self, other: &WindowResult) {
         self.stats.merge(&other.stats);
+        self.timing.add(&other.timing);
         merge_window_cells(&mut self.intern, &mut self.cells, &other.intern, &other.cells);
     }
 }
@@ -157,6 +203,8 @@ pub struct ExtractParams {
     pub trim_r1: u32,
     /// Drop this many 5' sequenced bases of read 2 (default 10).
     pub trim_r2: u32,
+    /// Time each stage of every window (`WindowResult.timing`).
+    pub profile: bool,
 }
 
 impl Default for ExtractParams {
@@ -172,6 +220,7 @@ impl Default for ExtractParams {
             accumulate: false,
             trim_r1: DEFAULT_TRIM_R1,
             trim_r2: DEFAULT_TRIM_R2,
+            profile: false,
         }
     }
 }
@@ -206,9 +255,8 @@ fn accept_record(rec: &mut Record, params: &ExtractParams, baq_ptr: *const c_cha
     if flags & FLAG_FILTER != 0 {
         return false;
     }
-    if params.compute_baq && !baq_ptr.is_null() {
-        let _ = unsafe { htslib::sam_prob_realn(rec.inner_mut(), baq_ptr, baq_len, BAQ_FLAGS) };
-    }
+    // MAPQ and orphan tests only reject. A rejected read is never pushed, so
+    // testing before BAQ leaves calls unchanged and skips the HMM for it.
     if rec.mapq() < params.min_mapq {
         return false;
     }
@@ -217,6 +265,9 @@ fn accept_record(rec: &mut Record, params: &ExtractParams, baq_ptr: *const c_cha
         && (flags & htslib::BAM_FPROPER_PAIR as u16) == 0
     {
         return false;
+    }
+    if params.compute_baq && !baq_ptr.is_null() {
+        let _ = unsafe { htslib::sam_prob_realn(rec.inner_mut(), baq_ptr, baq_len, BAQ_FLAGS) };
     }
     true
 }
@@ -233,6 +284,9 @@ pub fn process_window(
     params: &ExtractParams,
     baq_ref: Option<&[u8]>,
 ) -> Result<WindowResult> {
+    let profile = params.profile;
+    let t_window = Instant::now();
+    let mut timing = WindowTiming::default();
     let pad = 2u64;
     let ref_len = fasta
         .reference_length(&window.contig)
@@ -245,6 +299,10 @@ pub fn process_window(
 
     bam.fetch((window.contig.as_str(), window.start, window.end))
         .map_err(|e| anyhow::anyhow!("BAM fetch: {e}"))?;
+
+    if profile {
+        timing.setup_s = t_window.elapsed().as_secs_f64();
+    }
 
     let (baq_ptr, baq_len) = match baq_ref {
         Some(s) if params.compute_baq => (s.as_ptr() as *const c_char, s.len() as i64),
@@ -361,6 +419,18 @@ pub fn process_window(
         }
     };
 
+    // Calling time, accumulated per column only when profiling.
+    let call_ns = Cell::new(0u64);
+    let mut consume_column = |pos: u32, n_plp: i32, col: *const htslib::bam_pileup1_t| {
+        if profile {
+            let t = Instant::now();
+            consume_column(pos, n_plp, col);
+            call_ns.set(call_ns.get() + t.elapsed().as_nanos() as u64);
+        } else {
+            consume_column(pos, n_plp, col);
+        }
+    };
+
     let drain_ready = |plp: htslib::bam_plp_t, consume: &mut dyn FnMut(u32, i32, *const htslib::bam_pileup1_t)| -> Result<()> {
         loop {
             let mut tid = 0i32;
@@ -381,18 +451,37 @@ pub fn process_window(
     };
 
     let mut rec = Record::new();
+    // Stage clock: `lap` returns seconds since the previous lap when profiling.
+    let mut mark = Instant::now();
+    let mut lap = |on: bool| -> f64 {
+        if !on {
+            return 0.0;
+        }
+        let now = Instant::now();
+        let d = now.duration_since(mark).as_secs_f64();
+        mark = now;
+        d
+    };
+    let mut plp_s = 0.0f64;
     loop {
-        match bam.read(&mut rec) {
+        let got = bam.read(&mut rec);
+        timing.read_s += lap(profile);
+        match got {
             None => break,
             Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
             Some(Ok(())) => {
-                if !accept_record(&mut rec, params, baq_ptr, baq_len) {
+                timing.records += 1;
+                let keep = accept_record(&mut rec, params, baq_ptr, baq_len);
+                timing.baq_s += lap(profile);
+                if !keep {
                     continue;
                 }
+                timing.pushed += 1;
                 if unsafe { htslib::bam_plp_push(plp, rec.inner()) } < 0 {
                     anyhow::bail!("bam_plp_push failed");
                 }
                 drain_ready(plp, &mut consume_column)?;
+                plp_s += lap(profile);
             }
         }
     }
@@ -400,34 +489,105 @@ pub fn process_window(
         anyhow::bail!("bam_plp_push(EOF) failed");
     }
     drain_ready(plp, &mut consume_column)?;
+    plp_s += lap(profile);
+    for cell in cells.iter_mut() {
+        cell.normalize();
+    }
+    if profile {
+        timing.call_s = call_ns.get() as f64 * 1e-9;
+        timing.pileup_s = (plp_s - timing.call_s).max(0.0);
+        timing.total_s = t_window.elapsed().as_secs_f64();
+    }
 
     Ok(WindowResult {
         stats,
         intern,
         cells,
+        timing,
+        window_timings: Vec::new(),
     })
 }
 
-/// Keep one full-contig sequence for `sam_prob_realn` (must start at coordinate 0).
-pub fn refresh_baq_cache<'a>(
-    fasta: &FastFaiReader,
-    cache: &'a mut Option<(String, Vec<u8>)>,
-    contig: &str,
-) -> Result<Option<&'a [u8]>> {
-    let need = cache
-        .as_ref()
-        .map(|(c, _)| c.as_str() != contig)
-        .unwrap_or(true);
-    if need {
-        let len = fasta
+/// Full-contig sequences for `sam_prob_realn` (each must start at coordinate 0),
+/// shared by all workers. A contig is fetched once, by the first window that
+/// needs it, and dropped when its last window releases it.
+pub struct BaqRefs<'a> {
+    fasta: &'a FastFaiReader,
+    slots: FxHashMap<String, BaqSlot>,
+}
+
+struct BaqSlot {
+    seq: Mutex<Option<Arc<[u8]>>>,
+    remaining: AtomicUsize,
+}
+
+impl<'a> BaqRefs<'a> {
+    pub fn new(fasta: &'a FastFaiReader, windows: &[Window]) -> Self {
+        let mut slots: FxHashMap<String, BaqSlot> = FxHashMap::default();
+        for w in windows {
+            slots
+                .entry(w.contig.clone())
+                .or_insert_with(|| BaqSlot {
+                    seq: Mutex::new(None),
+                    remaining: AtomicUsize::new(0),
+                })
+                .remaining
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Self { fasta, slots }
+    }
+
+    /// Sequence for `contig`. Pair every call with `release`.
+    pub fn acquire(&self, contig: &str) -> Result<Arc<[u8]>> {
+        let slot = self
+            .slots
+            .get(contig)
+            .ok_or_else(|| anyhow::anyhow!("contig {contig} not in window plan"))?;
+        let mut guard = slot.seq.lock().expect("BAQ ref mutex");
+        if let Some(seq) = guard.as_ref() {
+            return Ok(Arc::clone(seq));
+        }
+        let len = self
+            .fasta
             .reference_length(contig)
             .ok_or_else(|| anyhow::anyhow!("contig {contig} missing in FASTA"))?;
-        let seq = fasta
+        let seq: Arc<[u8]> = self
+            .fasta
             .fetch(contig, 0, len)
-            .with_context(|| format!("FASTA BAQ fetch {contig}"))?;
-        *cache = Some((contig.to_string(), seq));
+            .with_context(|| format!("FASTA BAQ fetch {contig}"))?
+            .into();
+        *guard = Some(Arc::clone(&seq));
+        Ok(seq)
     }
-    Ok(cache.as_ref().map(|(_, s)| s.as_slice()))
+
+    /// One window on `contig` is done. The last one drops the shared copy.
+    pub fn release(&self, contig: &str) {
+        if let Some(slot) = self.slots.get(contig) {
+            if slot.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                *slot.seq.lock().expect("BAQ ref mutex") = None;
+            }
+        }
+    }
+}
+
+/// `process_window` with the BAQ reference taken from (and returned to) `baq_refs`.
+pub fn process_window_with_baq(
+    bam: &mut IndexedReader,
+    fasta: &FastFaiReader,
+    baq_refs: &BaqRefs,
+    window: &Window,
+    whitelist: Option<&HashSet<String>>,
+    params: &ExtractParams,
+) -> Result<WindowResult> {
+    let baq_ref = if params.compute_baq {
+        Some(baq_refs.acquire(&window.contig)?)
+    } else {
+        None
+    };
+    let r = process_window(bam, fasta, window, whitelist, params, baq_ref.as_deref());
+    drop(baq_ref);
+    baq_refs.release(&window.contig);
+    r
 }
 
 /// Mapped reads on `contigs`, and an estimated share of the BAM file those reads occupy.
@@ -495,33 +655,11 @@ pub fn extract_regions_stats(
 ) -> Result<WindowResult> {
     let fasta = FastFaiReader::open(fasta_path)?;
     let mut bam = open_bam(bam_path, params.decomp_threads)?;
-    let mut total = WindowResult {
-        stats: CallStats::default(),
-        intern: BarcodeIntern::default(),
-        cells: Vec::new(),
-    };
-    // Full-contig cache for sam_prob_realn (pysam fetches 0..MAX_POS per tid).
-    let mut baq_cache: Option<(String, Vec<u8>)> = None;
+    let mut total = WindowResult::empty();
+    // Full-contig reference for sam_prob_realn (pysam fetches 0..MAX_POS per tid).
+    let baq_refs = BaqRefs::new(&fasta, windows);
     for (i, w) in windows.iter().enumerate() {
-        let baq_ref = if params.compute_baq {
-            let need_fetch = baq_cache
-                .as_ref()
-                .map(|(c, _)| c.as_str() != w.contig)
-                .unwrap_or(true);
-            if need_fetch {
-                let len = fasta.reference_length(&w.contig).ok_or_else(|| {
-                    anyhow::anyhow!("contig {} missing in FASTA", w.contig)
-                })?;
-                let seq = fasta
-                    .fetch(&w.contig, 0, len)
-                    .with_context(|| format!("FASTA BAQ fetch {}", w.contig))?;
-                baq_cache = Some((w.contig.clone(), seq));
-            }
-            baq_cache.as_ref().map(|(_, s)| s.as_slice())
-        } else {
-            None
-        };
-        let r = process_window(&mut bam, &fasta, w, whitelist, params, baq_ref)?;
+        let r = process_window_with_baq(&mut bam, &fasta, &baq_refs, w, whitelist, params)?;
         total.stats.merge(&r.stats);
         if params.accumulate {
             merge_window_cells(&mut total.intern, &mut total.cells, &r.intern, &r.cells);
@@ -556,35 +694,13 @@ pub fn extract_windows_to_temp(
 ) -> Result<WindowResult> {
     let fasta = FastFaiReader::open(fasta_path)?;
     let mut bam = open_bam(bam_path, params.decomp_threads)?;
-    let mut total = WindowResult {
-        stats: CallStats::default(),
-        intern: BarcodeIntern::default(),
-        cells: Vec::new(),
-    };
-    let mut baq_cache: Option<(String, Vec<u8>)> = None;
+    let mut total = WindowResult::empty();
+    let baq_refs = BaqRefs::new(&fasta, windows);
     let mut n_files = 0usize;
     for (i, w) in windows.iter().enumerate() {
-        let baq_ref = if params.compute_baq {
-            let need_fetch = baq_cache
-                .as_ref()
-                .map(|(c, _)| c.as_str() != w.contig)
-                .unwrap_or(true);
-            if need_fetch {
-                let len = fasta.reference_length(&w.contig).ok_or_else(|| {
-                    anyhow::anyhow!("contig {} missing in FASTA", w.contig)
-                })?;
-                let seq = fasta
-                    .fetch(&w.contig, 0, len)
-                    .with_context(|| format!("FASTA BAQ fetch {}", w.contig))?;
-                baq_cache = Some((w.contig.clone(), seq));
-            }
-            baq_cache.as_ref().map(|(_, s)| s.as_slice())
-        } else {
-            None
-        };
         let mut p = params.clone();
         p.accumulate = true;
-        let r = process_window(&mut bam, &fasta, w, whitelist, &p, baq_ref)?;
+        let r = process_window_with_baq(&mut bam, &fasta, &baq_refs, w, whitelist, &p)?;
         n_files += crate::shard_io::write_window_shards(temp_dir, w, &r.intern, &r.cells, n_shards)?;
         total.stats.merge(&r.stats);
         for name in r.intern.names() {

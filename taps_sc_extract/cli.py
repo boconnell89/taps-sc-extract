@@ -50,17 +50,20 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-b", "--bam",
-        required=True,
-        help="Path to coordinate-sorted, indexed TAPS BAM file (.bam with .bai).",
+        default=None,
+        help=(
+            "Path to coordinate-sorted, indexed TAPS BAM file (.bam with .bai). "
+            "Required unless --test runs without a dataset."
+        ),
     )
     parser.add_argument(
         "-f", "--fasta",
-        required=True,
+        default=None,
         help="Path to reference FASTA file (indexed with .fai).",
     )
     parser.add_argument(
         "-o", "--out",
-        required=True,
+        default=None,
         help="Output Amethyst-compatible HDF5 file path (.h5).",
     )
     parser.add_argument(
@@ -87,8 +90,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--decomp-threads",
         type=int,
-        default=1,
-        help="Number of BAM decompression threads per worker process (default: 1).",
+        default=None,
+        help=(
+            "BAM decompression threads per worker (default: Rust picks 4/2/0 by worker "
+            "count; the Python engine uses 1)."
+        ),
     )
     parser.add_argument(
         "--chunk-size-mb",
@@ -96,7 +102,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=10,
         help=(
             "Genomic chunk size in megabases "
-            "(default: 10 for the Python engine, 100 for the Rust engine)."
+            "(default: 10 for the Python engine; Rust sizes windows from the worker count)."
         ),
     )
     parser.add_argument(
@@ -138,9 +144,27 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Maximum parallel shard-writer threads after extraction (default: 0 = auto). "
+            "Maximum concurrent shard writers after extraction (default: 0 = auto). "
             "Auto scales up to shard count, available CPU cores, and memory budget. "
             "Suggested: 8-16 for NVMe/SSD, 2-4 for HDD or network filesystems (NFS/Lustre)."
+        ),
+    )
+    parser.add_argument(
+        "--profile-json",
+        default=None,
+        help=(
+            "Rust engine: write per-phase CPU use, per-stage and per-window timings, "
+            "and shard-writer memory to this JSON file."
+        ),
+    )
+    parser.add_argument(
+        "--writer-mode",
+        choices=["auto", "process", "thread"],
+        default="auto",
+        help=(
+            "Rust shard writers: process (one child process per shard, each with its own "
+            "HDF5 lock), thread (in-process pool sharing one lock), or auto (process when "
+            "there is more than one shard)."
         ),
     )
     parser.add_argument(
@@ -230,7 +254,16 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--max-memory-gb",
         type=float,
         default=None,
-        help="Optional memory budget in GB for auto-tuning.",
+        help="Memory budget in GB for the whole run (overrides --max-memory-fraction).",
+    )
+    parser.add_argument(
+        "--max-memory-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Rust engine: share of available memory the run may use, extraction plus "
+            "writer processes (default: 0.6)."
+        ),
     )
     parser.add_argument(
         "--expected-cells",
@@ -238,16 +271,46 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional expected cell count (auto-detected from whitelist if provided).",
     )
+    test = parser.add_argument_group(
+        "tuning (--test)",
+        "Measure this machine with a built-in synthetic workload (no data needed) and "
+        "recommend -t, --decomp-threads and writer settings. Add -b/-f to also sample "
+        "that dataset and predict run time and memory. Needs the Rust engine.",
+    )
+    test.add_argument("--test", action="store_true", help="Run the tuning probes instead of extracting.")
+    test.add_argument("--test-quick", action="store_true", help="Smaller probes (~40 s instead of a few minutes).")
+    test.add_argument(
+        "--save-profile",
+        action="store_true",
+        help=(
+            "Save the machine profile to ~/.config/taps-sc-extract/machine_profile.toml; "
+            "later Rust runs on this host take default -t / writer counts from it."
+        ),
+    )
+    test.add_argument("--test-report", default=None, help="Also write the profile and report to this file.")
+    test.add_argument(
+        "--temp-dir-test",
+        dest="test_temp_dir",
+        default=None,
+        help="Directory for the synthetic data and temp-filesystem probe (default: --temp-dir or current directory).",
+    )
     parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
 
-    return parser.parse_args(args)
+    ns = parser.parse_args(args)
+    if not ns.test:
+        missing = [f for f, v in (("-b/--bam", ns.bam), ("-f/--fasta", ns.fasta), ("-o/--out", ns.out)) if not v]
+        if missing:
+            parser.error("the following arguments are required: " + ", ".join(missing))
+    elif bool(ns.bam) != bool(ns.fasta):
+        parser.error("--test with a dataset needs both -b and -f")
+    return ns
 
 
-RUST_DEFAULT_CHUNK_SIZE_MB = 100
+RUST_DEFAULT_CHUNK_SIZE_MB = 0  # auto: sized from worker count
 RUST_DEFAULT_COMPRESSION = "lzf"
 
 
@@ -279,6 +342,7 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         "--shards", str(parsed.shards),
         "--compression", compression,
         "--max-writer-threads", str(parsed.max_writer_threads),
+        "--writer-mode", parsed.writer_mode,
         "--min-baseq", str(parsed.min_baseq),
         "--min-mapq", str(parsed.min_mapq),
         "--max-depth", str(parsed.max_depth),
@@ -293,8 +357,12 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.append("--no-baq")
     if parsed.no_overlap_clip:
         cmd.append("--no-overlap-clip")
+    if parsed.profile_json:
+        cmd.extend(["--profile-json", parsed.profile_json])
     if parsed.max_memory_gb:
         cmd.extend(["--max-memory-gb", str(parsed.max_memory_gb)])
+    if parsed.max_memory_fraction:
+        cmd.extend(["--max-memory-fraction", str(parsed.max_memory_fraction)])
     if parsed.expected_cells:
         cmd.extend(["--expected-cells", str(parsed.expected_cells)])
     if parsed.memory_mode:
@@ -302,6 +370,24 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
     elif parsed.no_temp_file:
         cmd.extend(["--memory-mode", "memory"])
     cmd.extend(["--trim-r1", str(parsed.trim_r1), "--trim-r2", str(parsed.trim_r2)])
+    return cmd
+
+
+def build_tune_command(rust_bin: str, parsed) -> List[str]:
+    """Argv for `taps-sc-extract-rs tune` from `taps-sc-extract --test ...`."""
+    temp_dir = parsed.test_temp_dir or parsed.temp_dir or "."
+    out_dir = "."
+    if parsed.out:
+        out_dir = parsed.out if os.path.isdir(parsed.out) else (os.path.dirname(parsed.out) or ".")
+    cmd = [rust_bin, "tune", "--temp-dir", temp_dir, "--out-dir", out_dir]
+    if parsed.bam:
+        cmd.extend(["-b", parsed.bam, "-f", parsed.fasta])
+    if parsed.test_quick:
+        cmd.append("--quick")
+    if parsed.save_profile:
+        cmd.append("--save-profile")
+    if parsed.test_report:
+        cmd.extend(["--report", parsed.test_report])
     return cmd
 
 
@@ -337,6 +423,13 @@ def main(args: Optional[List[str]] = None) -> int:
 
     # Resolve engine
     rust_bin = find_rust_binary()
+    if parsed.test:
+        if not rust_bin:
+            logger.error("--test needs the Rust engine ('taps-sc-extract-rs'); run ./install.sh first.")
+            return 1
+        import subprocess
+
+        return subprocess.run(build_tune_command(rust_bin, parsed)).returncode
     use_rust = False
     if parsed.engine == "rust":
         if not rust_bin:
@@ -372,7 +465,7 @@ def main(args: Optional[List[str]] = None) -> int:
             chroms=chroms_list,
             whitelist_path=parsed.whitelist,
             n_workers=parsed.workers,
-            decomp_threads=parsed.decomp_threads or 1,
+            decomp_threads=parsed.decomp_threads if parsed.decomp_threads is not None else 1,
             chunk_size_mb=parsed.chunk_size_mb,
             n_shards=parsed.shards,
             use_temp_files=(parsed.memory_mode != "memory" and not parsed.no_temp_file),

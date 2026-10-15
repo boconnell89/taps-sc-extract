@@ -7,9 +7,7 @@
 //!   `shard_XXX/chunk_YYYYYY.bin` or merged by barcode string after join.
 //! - Cancellation is `Arc<AtomicBool>`; workers only load it.
 
-use crate::extract::{
-    open_bam, process_window, refresh_baq_cache, ExtractParams, WindowResult,
-};
+use crate::extract::{open_bam, process_window_with_baq, BaqRefs, ExtractParams, WindowResult};
 use crate::fasta::FastFaiReader;
 use crate::shard_io::{prepare_shard_dirs, write_window_shards};
 use crate::window::Window;
@@ -24,6 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub type CancelFlag = Arc<AtomicBool>;
+
+/// Suppress per-window progress lines (set by `tune`, which runs many short extractions).
+pub static QUIET_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 pub fn new_cancel_flag() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
@@ -85,6 +86,9 @@ fn log_extraction_progress(
     ch_c: u64,
     ch_t: u64,
 ) {
+    if QUIET_PROGRESS.load(Ordering::Relaxed) {
+        return;
+    }
     let now = Instant::now();
     let mut last = clock.last_log.lock().expect("progress clock");
     let due = k == n || k % 10 == 0 || now.duration_since(*last) >= Duration::from_secs(15);
@@ -118,50 +122,37 @@ fn log_extraction_progress(
 
 thread_local! {
     static TLS_BAM: RefCell<Option<(PathBuf, usize, IndexedReader)>> = const { RefCell::new(None) };
-    static TLS_BAQ: RefCell<Option<(String, Vec<u8>)>> = const { RefCell::new(None) };
 }
 
 fn with_thread_bam<R>(
     bam_path: &Path,
     decomp: usize,
-    f: impl FnOnce(&mut IndexedReader, &mut Option<(String, Vec<u8>)>) -> Result<R>,
+    f: impl FnOnce(&mut IndexedReader) -> Result<R>,
 ) -> Result<R> {
     TLS_BAM.with(|bam_cell| {
-        TLS_BAQ.with(|baq_cell| {
-            {
-                let mut slot = bam_cell.borrow_mut();
-                let need = match slot.as_ref() {
-                    None => true,
-                    Some((p, d, _)) => p.as_path() != bam_path || *d != decomp,
-                };
-                if need {
-                    let bam = open_bam(bam_path, decomp)?;
-                    *slot = Some((bam_path.to_path_buf(), decomp, bam));
-                    *baq_cell.borrow_mut() = None;
-                }
-            }
-            let mut bam_slot = bam_cell.borrow_mut();
-            let bam = &mut bam_slot.as_mut().unwrap().2;
-            let mut baq_slot = baq_cell.borrow_mut();
-            f(bam, &mut baq_slot)
-        })
+        let mut slot = bam_cell.borrow_mut();
+        let need = match slot.as_ref() {
+            None => true,
+            Some((p, d, _)) => p.as_path() != bam_path || *d != decomp,
+        };
+        if need {
+            let bam = open_bam(bam_path, decomp)?;
+            *slot = Some((bam_path.to_path_buf(), decomp, bam));
+        }
+        f(&mut slot.as_mut().unwrap().2)
     })
 }
 
 fn process_one(
     bam_path: &Path,
     fasta: &FastFaiReader,
+    baq_refs: &BaqRefs,
     window: &Window,
     whitelist: Option<&HashSet<String>>,
     params: &ExtractParams,
 ) -> Result<WindowResult> {
-    with_thread_bam(bam_path, params.decomp_threads, |bam, cache| {
-        let baq_ref = if params.compute_baq {
-            refresh_baq_cache(fasta, cache, &window.contig)?
-        } else {
-            None
-        };
-        process_window(bam, fasta, window, whitelist, params, baq_ref)
+    with_thread_bam(bam_path, params.decomp_threads, |bam| {
+        process_window_with_baq(bam, fasta, baq_refs, window, whitelist, params)
     })
 }
 
@@ -188,6 +179,7 @@ pub fn extract_stats_parallel(
     cancel: &CancelFlag,
 ) -> Result<WindowResult> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
+    let baq_refs = BaqRefs::new(fasta.as_ref(), windows);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
     let bam_path = bam_path.to_path_buf();
     let params = params.clone();
@@ -202,6 +194,7 @@ pub fn extract_stats_parallel(
             let r = process_one(
                 &bam_path,
                 fasta.as_ref(),
+                &baq_refs,
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
@@ -212,6 +205,9 @@ pub fn extract_stats_parallel(
                     t.absorb_maps(&r);
                 } else {
                     t.absorb_counts(&r);
+                if params.profile {
+                    t.window_timings.push((w.chunk_id, r.timing.clone()));
+                }
                 }
                 (t.n_cells(), t.stats.cg_c, t.stats.cg_t, t.stats.ch_c, t.stats.ch_t)
             };
@@ -239,6 +235,7 @@ pub fn extract_stream_parallel(
 ) -> Result<WindowResult> {
     prepare_shard_dirs(temp_dir, n_shards)?;
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
+    let baq_refs = BaqRefs::new(fasta.as_ref(), windows);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
     let bam_path = bam_path.to_path_buf();
     let temp_dir = temp_dir.to_path_buf();
@@ -256,6 +253,7 @@ pub fn extract_stream_parallel(
             let r = process_one(
                 &bam_path,
                 fasta.as_ref(),
+                &baq_refs,
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
@@ -265,6 +263,9 @@ pub fn extract_stream_parallel(
             let snap = {
                 let mut t = total.lock().expect("stream mutex");
                 t.absorb_counts(&r);
+                if params.profile {
+                    t.window_timings.push((w.chunk_id, r.timing.clone()));
+                }
                 (t.n_cells(), t.stats.cg_c, t.stats.cg_t, t.stats.ch_c, t.stats.ch_t)
             };
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -293,6 +294,7 @@ pub fn extract_memory_parallel(
     cancel: &CancelFlag,
 ) -> Result<(WindowResult, Vec<Vec<crate::shard_io::ChunkFile>>)> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
+    let baq_refs = BaqRefs::new(fasta.as_ref(), windows);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
     let bam_path = bam_path.to_path_buf();
     let mut params = params.clone();
@@ -311,6 +313,7 @@ pub fn extract_memory_parallel(
             let r = process_one(
                 &bam_path,
                 fasta.as_ref(),
+                &baq_refs,
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
@@ -325,6 +328,9 @@ pub fn extract_memory_parallel(
             let snap = {
                 let mut t = total.lock().expect("mem stats");
                 t.absorb_counts(&r);
+                if params.profile {
+                    t.window_timings.push((w.chunk_id, r.timing.clone()));
+                }
                 (t.n_cells(), t.stats.cg_c, t.stats.cg_t, t.stats.ch_c, t.stats.ch_t)
             };
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;

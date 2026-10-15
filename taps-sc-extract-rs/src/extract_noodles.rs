@@ -199,6 +199,8 @@ pub fn process_window_noodles(
     }
 
     Ok(WindowResult {
+        timing: Default::default(),
+        window_timings: Vec::new(),
         stats,
         intern,
         cells,
@@ -221,6 +223,8 @@ pub fn extract_regions_stats_noodles(
         .map_err(|e| anyhow::anyhow!("noodles header: {e}"))?;
 
     let mut total = WindowResult {
+        timing: Default::default(),
+        window_timings: Vec::new(),
         stats: CallStats::default(),
         intern: BarcodeIntern::default(),
         cells: Vec::new(),

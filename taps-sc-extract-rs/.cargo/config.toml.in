@@ -1,0 +1,14 @@
+# Template for install.sh, which writes .cargo/config.toml from it. The PREFIX
+# placeholder becomes the conda prefix providing libhdf5, libclang, pkg-config.
+# TARGET_CPU / MARCH become "native" (default) or "x86-64-v3" (--portable), so a
+# plain `cargo build --release` in this checkout matches install.sh.
+[build]
+rustflags = ["-C", "target-cpu=@TARGET_CPU@"]
+
+[env]
+PKG_CONFIG_PATH = { value = "@PREFIX@/lib/pkgconfig", relative = false, force = true }
+LIBCLANG_PATH = { value = "@PREFIX@/lib", relative = false, force = true }
+HDF5_DIR = { value = "@PREFIX@", relative = false, force = true }
+# Vendored C (htslib incl. sam_prob_realn, libdeflate, LZF/Blosc filters) via the
+# cc crate. Forced so an activated conda env's CFLAGS (-march=nocona -O2) does not win.
+CFLAGS = { value = "-O3 -march=@MARCH@ -fPIC", force = true }

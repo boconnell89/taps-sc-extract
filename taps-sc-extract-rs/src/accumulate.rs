@@ -49,38 +49,83 @@ impl BarcodeIntern {
     }
 }
 
-/// Per-cell CG/CH maps: 1-based pos → (t unmethylated, c methylated).
+/// Per-cell CG/CH sites: `(1-based pos, t unmethylated, c methylated)`, sorted
+/// by position with one entry per position.
+///
+/// Pileup columns arrive in position order, so a call either lands on the last
+/// entry (same position, another read) or appends a new one: no hashing and no
+/// sort. A position arriving out of order (not expected from `bam_plp`) marks
+/// the cell for a sort-and-merge in `normalize`.
 #[derive(Clone, Debug, Default)]
 pub struct CellMaps {
-    pub cg: FxHashMap<u32, (u32, u32)>,
-    pub ch: FxHashMap<u32, (u32, u32)>,
+    pub cg: Vec<(u32, u32, u32)>,
+    pub ch: Vec<(u32, u32, u32)>,
+    unsorted: bool,
+}
+
+#[inline]
+fn add_site(v: &mut Vec<(u32, u32, u32)>, pos: u32, t: u32, c: u32) -> bool {
+    match v.last_mut() {
+        Some(last) if last.0 == pos => {
+            last.1 += t;
+            last.2 += c;
+            false
+        }
+        Some(last) if last.0 > pos => {
+            v.push((pos, t, c));
+            true
+        }
+        _ => {
+            v.push((pos, t, c));
+            false
+        }
+    }
+}
+
+fn sort_merge(v: &mut Vec<(u32, u32, u32)>) {
+    v.sort_unstable_by_key(|x| x.0);
+    let mut out: Vec<(u32, u32, u32)> = Vec::with_capacity(v.len());
+    for &(p, t, c) in v.iter() {
+        match out.last_mut() {
+            Some(last) if last.0 == p => {
+                last.1 += t;
+                last.2 += c;
+            }
+            _ => out.push((p, t, c)),
+        }
+    }
+    *v = out;
 }
 
 impl CellMaps {
+    #[inline]
     pub fn add(&mut self, ctx: Context, pos_1based: u32, meth: u8) {
-        let m = match ctx {
+        let v = match ctx {
             Context::Cg => &mut self.cg,
             Context::Ch => &mut self.ch,
         };
-        let e = m.entry(pos_1based).or_insert((0, 0));
-        if meth == 1 {
-            e.1 += 1;
-        } else {
-            e.0 += 1;
+        let (t, c) = if meth == 1 { (0, 1) } else { (1, 0) };
+        if add_site(v, pos_1based, t, c) {
+            self.unsorted = true;
+        }
+    }
+
+    /// Restore the sorted, one-entry-per-position invariant if `add` saw an
+    /// out-of-order position. No-op otherwise.
+    pub fn normalize(&mut self) {
+        if self.unsorted {
+            sort_merge(&mut self.cg);
+            sort_merge(&mut self.ch);
+            self.unsorted = false;
         }
     }
 
     pub fn merge_from(&mut self, other: &CellMaps) {
-        for (&pos, &(t, c)) in &other.cg {
-            let e = self.cg.entry(pos).or_insert((0, 0));
-            e.0 += t;
-            e.1 += c;
-        }
-        for (&pos, &(t, c)) in &other.ch {
-            let e = self.ch.entry(pos).or_insert((0, 0));
-            e.0 += t;
-            e.1 += c;
-        }
+        self.cg.extend_from_slice(&other.cg);
+        self.ch.extend_from_slice(&other.ch);
+        sort_merge(&mut self.cg);
+        sort_merge(&mut self.ch);
+        self.unsorted = false;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -108,10 +153,10 @@ pub fn write_sites_tsv(
             continue;
         }
         let cell = &cells[i];
-        for (&pos, &(t, c)) in &cell.cg {
+        for &(pos, t, c) in &cell.cg {
             rows.push((name.as_str(), "CG", pos, t, c));
         }
-        for (&pos, &(t, c)) in &cell.ch {
+        for &(pos, t, c) in &cell.ch {
             rows.push((name.as_str(), "CH", pos, t, c));
         }
     }
@@ -162,10 +207,23 @@ mod tests {
         a.add(Context::Cg, 100, 1);
         a.add(Context::Cg, 100, 0);
         a.add(Context::Ch, 200, 0);
-        assert_eq!(a.cg.get(&100), Some(&(1, 1)));
+        assert_eq!(a.cg, vec![(100, 1, 1)]);
         let mut b = CellMaps::default();
         b.add(Context::Cg, 100, 1);
+        b.add(Context::Cg, 50, 0);
         a.merge_from(&b);
-        assert_eq!(a.cg.get(&100), Some(&(1, 2)));
+        assert_eq!(a.cg, vec![(50, 1, 0), (100, 1, 2)]);
+    }
+
+    #[test]
+    fn out_of_order_add_normalizes() {
+        let mut a = CellMaps::default();
+        a.add(Context::Ch, 10, 0);
+        a.add(Context::Ch, 20, 1);
+        a.add(Context::Ch, 15, 0);
+        a.add(Context::Ch, 20, 0);
+        a.add(Context::Ch, 10, 1);
+        a.normalize();
+        assert_eq!(a.ch, vec![(10, 1, 1), (15, 1, 0), (20, 1, 1)]);
     }
 }

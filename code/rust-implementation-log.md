@@ -181,5 +181,85 @@ CH `indexChr` used the CG barcode list (Amethyst `h5paths` from `/CG`); CH-only 
 4. **Phase 2 Hot-Loop MRU Barcode Caching**: Avoids redundant ASCII string scanning and intern hash queries for consecutive pileup columns on the same read (>90% cache hit rate).
 5. **Phase 3 Compression Filters**: Supports `gzip` (level 1 deflate), `gzip-shuffle` (byte shuffling + level 1 deflate), `gzip6`, and `none`.
 
+## 2026-10-14 9:47pm — Workstation remeasure (`026c52e`)
+
+Full numbers: [`nvme-profiling-2026-10-14.md`](nvme-profiling-2026-10-14.md). Dataset `5base_ucbTn5_sp2.srt.bam`, 53.5M mapped, 7,351 cells, `-t 32 --decomp-threads 0 --engine rust`, LZF.
+
+- E: 9p HDD, BAQ on, 100 Mb, memory, 16 shards: **171.2 s** wall (80.0 process / 91.3 write), 312,209 reads/s.
+- WSL NVMe ext4, same settings: **95.0 s** (63.5 / 31.5), 562,565 reads/s. `/dev/sdd` ~1% util; BAM was page-cached.
+- WSL NVMe, `--no-baq --chunk-size-mb 10` (test): **45.3 s** (13.8 / 31.6), 1,178,919 reads/s. HDF5 write did not move. `--no-baq` changes CG/CH rates (more bases pass Q20); not a production default.
+- Process limiter with BAQ on: `sam_prob_realn` plus 37 coarse windows. After `--no-baq` and 10 Mb windows, HDF5 (~14.7k LZF datasets) is ~70% of wall.
 
 
+
+
+## 2026-10-15 — Fixed: Rust put a small share of calls under the wrong barcode
+
+**Affects every Rust-engine HDF5 written before this fix, including `026c52e` and all `260731/` Rust extracts. Python-engine output is not affected.**
+
+- **Cause.** The callback cached the read's barcode keyed on the QNAME pointer and length. htslib recycles pileup nodes LIFO, and `bam_copy1` reuses the data buffer. A read pushed after the cached read was freed could land at the same address, with a QNAME of the same length, and take the old read's barcode.
+- **Fix.** Key the cache on `bam1_t.id`. htslib numbers every read it stores in the iterator 0, 1, 2, … and never reuses a number within a window.
+- **Size** (chr19, BAQ on, against `test_chr19_rust_026c52e`):
+  - 79 of 837,906 CG calls (0.009%) and 2,914 of 19,956,092 CH calls (0.015%) moved to their correct barcode.
+  - Every per-position total (t and c summed over cells) is unchanged, so global and per-region methylation percentages are unaffected. Per-cell analyses saw the small misattribution.
+- **Against Python** (`--no-baq`, chr19):
+  - Before the fix, 86 CG and 2,756 CH positions had calls under a different cell with the same position total.
+  - After it, zero.
+  - A separate gap remains: 31 CG and 309 CH positions where Rust has more calls than Python. Its cause is still open (see the upgrade plan, Parity).
+- **Tests.**
+  - New frozen reference: `test_chr19_rust_cellfix_2026-10-15/`.
+  - `test_chr19_rust_python_same_cell_per_call` now fails if any call changes barcode between engines. The frozen-reference test alone could not catch this class of bug.
+
+## 2026-10-15 — Rust upgrade steps 0–5 and Phase 5 (working tree on `026c52e`)
+
+Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Work order: `taps-sc-extract-rust-upgrade-plan.md`, as revised in the approved plan.
+
+- **Headline, T=32, 16 shards, NVMe:** wall 95.0 s → 52.7–57.7 s. Processing 63.5 → 40–42 s; HDF5 write 31.5 → 11–17 s; extraction-process peak 29.7 → 4.9 GB (stream) or 11.5 GB (memory). All calls are identical except the barcode fix above.
+- **Step 0:** 10 Mb windows took 63.5 s → 54.1 s with BAQ on and 22.0 → 13.8 s with `--no-baq`. Totals were unchanged. BAQ is about 75% of processing.
+- **Step 1:**
+  - libdeflate on.
+  - MAPQ/orphan tests run before `sam_prob_realn`.
+  - BAQ contigs shared (`BaqRefs`, released after a contig's last window).
+  - Rust decomp auto is 0 at 8 or more workers; the Python CLI no longer forces 1.
+  - `default_workers` no longer capped at 64.
+  - Lifting the 6-writer clamp made in-process writing worse (16 writers: 86 s, 47 GB), so auto in-process writers stay capped at 6 (`MAX_AUTO_WRITERS`).
+- **Step 2:** `--chunk-size-mb 0` (default) = about 6 windows per worker, 2–100 Mb. Per-cell output is identical at 100, 10 and 2 Mb (chr19).
+- **Step 3 (shared BGZF pool):** not built. Inflate is 1–6% of worker time, and rust-htslib's `ThreadPool` is `Arc<RefCell>` (not `Sync`).
+- **Step 4a:**
+  - hdf5-metno's process-wide lock serializes all in-process HDF5 calls, so each shard now gets its own `write-shard` child process.
+  - Memory mode pipes `TAPSCK01` chunks to the child's stdin; stream mode passes the temp directory.
+  - Cells are written one at a time in 262,144-record slices.
+  - Each child reports its peak RSS, and the summary prints the writer total.
+  - Step 4b (direct chunk write) is not needed.
+- **Step 5:**
+  - `install.sh` writes `.cargo/config.toml` from `config.toml.in`, holding the conda prefix, `target-cpu`, and a forced `CFLAGS="-O3 -march=…"`. The conda env's own `CFLAGS` (`-march=nocona -O2`) otherwise won over native.
+  - About 7% gain at T=32.
+- **Phase 5:** per-cell sites became sorted `Vec<(pos, t, c)>` filled in column order (no hashing). Processing 45.0 → 40.4 s; `--no-baq` 16.6 → 10.0 s. Callback cost fell 310 → 126 worker-seconds (no-BAQ).
+- **BAQ-gating experiment** (`sam_prob_realn` only on 99/147/83/163 reads): no gain, because 99% of records are callable, and 2 CH calls changed. Removed.
+- **`--profile-json`:** per-phase CPU and utilisation, per-stage worker time (read, BAQ, pileup, calling), per-window timings, writer memory. Adds about 5–10% to processing.
+- **`--test` (`tune`):**
+  - Synthetic TAPS BAM → per-read stage cost, worker scaling, memory bandwidth, storage per filesystem, HDF5 writers in-process vs per process.
+  - Optional dataset sampling with time and memory prediction.
+  - `--save-profile` makes the recommendations the defaults on this host.
+- **Open:**
+  - Auto shards is 1 below 10k cells, and one shard writes 4–5× slower (61.9 s against 11–16 s).
+  - The Rust-has-more-calls parity gap (31 CG / 309 CH positions on chr19 `--no-baq`) is still unexplained.
+  - The 96-core server and the NUMA check have not been run.
+  - (Fixed later the same day: memory mode and writer count now account for writer-child memory. See below.)
+  - `--compression-threads` is accepted by the Python CLI but ignored by Rust.
+  - The `--test` prediction factors (1.25 processing, 1.5 write) were fitted to this one run and are not yet checked on another dataset.
+
+## 2026-10-15 — Memory plan covers the writer processes
+
+- `autotune::plan_memory` picks memory vs stream mode and the writer count together, so the extraction process plus the concurrent `write-shard` children fit the budget.
+- Inputs: mapped reads from the BAM index (about 14 sites per read), memory-mode extraction at 18 B/site, stream extraction at 1 GB + 0.15 GB per worker, and each writer at 20 B/site of its shard plus 0.1 GB. All are measured on 2026-10-15, with margin added.
+- New `--max-memory-fraction` (default 0.6 of MemAvailable); `--max-memory-gb` still overrides it. The plan prints in the config block.
+- Full mm10 test BAM:
+
+  | Budget | Chosen | Estimated peak | Measured |
+  |---|---|---|---|
+  | 34.2 GB | memory, 16 writers | 31.0 GB | 11.3 + 10.4 = 21.6 GB |
+  | 0.3 → 16.8 GB | stream, 15 writers | 16.5 GB | 4.5 + 10.1 = 14.6 GB |
+
+  Run time was unchanged in both.
+- Amethyst 1.0.5 (`amethyst_r` env): `createObject` and `indexChr` on a 4-shard chr19 output from process writers ran without per-barcode errors. CG cells and sites match h5py exactly (4,977 / 792,338).
