@@ -300,3 +300,8 @@ Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Wo
 - The verified `hts-sys-2.2.1.crate` is kept in `vendor/` and reused, so re-patching needs no network. A corrupt cached crate is downloaded again and checked against the crates.io sha256.
 - Checked: old marker → re-vendor, build and chr19 smoke run; unchanged patch → skip; changed patch with network blocked → re-patch from cache; corrupt cache offline → clean failure; corrupt cache online → re-download.
 - README has a new "Upgrading an existing install" section.
+
+## 2026-10-15 — Complexity cutoffs (`--complexity`, `--min-complexity`, `--max-complexity`)
+- Both engines read a complexity file (`rank barcode total_reads unique_reads percent`, whitespace-separated, optional header, `.gz` accepted) and keep barcodes whose unique-read count (column 4) is within the inclusive bounds. With `--whitelist` too, a cell must pass both. A warning is printed when no read matches the filter (for example a barcode format that differs from the QNAME prefix).
+- The filter acts at call time, the same place as the whitelist, so kept cells' calls equal an unfiltered run. Rust also skips BAQ for reads of filtered cells. They are still pushed into the pileup, so depth caps and overlap pairing are unchanged.
+- Tests: Rust and Python unit tests (bounds, header, short rows, `.gz`, intersection); chr19 BAQ-on filtered run equals the frozen reference on kept cells; chr19 `--no-baq` filtered Rust equals Python on kept cells.

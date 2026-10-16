@@ -96,6 +96,16 @@ enum Commands {
         trim_r2: u32,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
+        /// Complexity file (rank, barcode, total, unique reads, %); keeps barcodes
+        /// whose unique-read count (column 4) is within --min/--max-complexity.
+        #[arg(long)]
+        complexity: Option<PathBuf>,
+        /// Keep cells with at least this many unique reads (needs --complexity).
+        #[arg(long)]
+        min_complexity: Option<f64>,
+        /// Keep cells with at most this many unique reads (needs --complexity).
+        #[arg(long)]
+        max_complexity: Option<f64>,
         /// Pileup engine: rust-htslib (htslib) or noodles (pure Rust CIGAR walk).
         #[arg(long, default_value = "htslib")]
         pileup: String,
@@ -183,6 +193,16 @@ enum Commands {
         trim_r2: u32,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
+        /// Complexity file (rank, barcode, total, unique reads, %); keeps barcodes
+        /// whose unique-read count (column 4) is within --min/--max-complexity.
+        #[arg(long)]
+        complexity: Option<PathBuf>,
+        /// Keep cells with at least this many unique reads (needs --complexity).
+        #[arg(long)]
+        min_complexity: Option<f64>,
+        /// Keep cells with at most this many unique reads (needs --complexity).
+        #[arg(long)]
+        max_complexity: Option<f64>,
         /// Write per-phase and per-window timings (and writer reports) as JSON.
         #[arg(long)]
         profile_json: Option<PathBuf>,
@@ -319,6 +339,9 @@ fn main() -> Result<()> {
             trim_r1,
             trim_r2,
             whitelist,
+            complexity,
+            min_complexity,
+            max_complexity,
             pileup,
             dump_sites,
         } => {
@@ -340,10 +363,12 @@ fn main() -> Result<()> {
                     end: e,
                 }];
             }
-            let wl = match whitelist {
-                Some(p) => Some(barcode::parse_annot(&p)?),
-                None => None,
-            };
+            let wl = barcode::load_cell_filter(
+                whitelist.as_deref(),
+                complexity.as_deref(),
+                min_complexity,
+                max_complexity,
+            )?;
             let ignore_overlaps = !no_overlap_clip;
             let ignore_orphans = !no_ignore_orphans;
             let compute_baq = !no_baq;
@@ -439,6 +464,9 @@ fn main() -> Result<()> {
             trim_r1,
             trim_r2,
             whitelist,
+            complexity,
+            min_complexity,
+            max_complexity,
             profile_json,
         } => {
             let fai = FastFaiReader::open(&fasta)?;
@@ -446,10 +474,12 @@ fn main() -> Result<()> {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
                 None => CANONICAL_CONTIGS.to_vec(),
             };
-            let wl = match whitelist {
-                Some(p) => Some(barcode::parse_annot(&p)?),
-                None => None,
-            };
+            let wl = barcode::load_cell_filter(
+                whitelist.as_deref(),
+                complexity.as_deref(),
+                min_complexity,
+                max_complexity,
+            )?;
 
             // PR7 Auto-tuning & Phase 1 Writer Auto-scaling
             let (budget_gb, budget_src) = autotune::system_memory_budget_gb(max_memory_gb, max_memory_fraction);
@@ -667,6 +697,12 @@ fn main() -> Result<()> {
                 crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
                 writer_reports.len(),
             );
+            if wl.is_some() && r.n_cells() == 0 {
+                eprintln!(
+                    "WARNING: no reads matched the barcode filter (--whitelist / --complexity). \
+                     Check that its barcodes use the same format as the QNAME prefix before ':'."
+                );
+            }
             if let Some(path) = &profile_json {
                 let rp = profile::RunProfile {
                     config: vec![

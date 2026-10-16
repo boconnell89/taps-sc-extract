@@ -10,6 +10,7 @@ publish = false
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
+flate2 = "1"
 hdf5-metno = { version = "0.14", features = ["blosc", "blosc-lz4", "blosc-zstd", "lzf"] }
 libc = "0.2"
 md-5 = "0.10"

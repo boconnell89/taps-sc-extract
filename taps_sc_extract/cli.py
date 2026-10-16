@@ -81,6 +81,23 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to optional barcode whitelist or annotation file (first column = barcode).",
     )
     parser.add_argument(
+        "--complexity",
+        default=None,
+        help=(
+            "Complexity file: rank, barcode, total reads, unique reads, percent (whitespace-separated). "
+            "With --min-complexity / --max-complexity, keeps barcodes whose unique-read count "
+            "(column 4) is in range. Combined with --whitelist, both must pass."
+        ),
+    )
+    parser.add_argument(
+        "--min-complexity", type=float, default=None,
+        help="Keep cells with at least this many unique reads (needs --complexity).",
+    )
+    parser.add_argument(
+        "--max-complexity", type=float, default=None,
+        help="Keep cells with at most this many unique reads (needs --complexity).",
+    )
+    parser.add_argument(
         "-t", "--threads", "--workers",
         dest="workers",
         type=int,
@@ -351,6 +368,12 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.extend(["-c", parsed.chroms])
     if parsed.whitelist:
         cmd.extend(["-w", parsed.whitelist])
+    if parsed.complexity:
+        cmd.extend(["--complexity", parsed.complexity])
+    if parsed.min_complexity is not None:
+        cmd.extend(["--min-complexity", f"{parsed.min_complexity:g}"])
+    if parsed.max_complexity is not None:
+        cmd.extend(["--max-complexity", f"{parsed.max_complexity:g}"])
     if parsed.decomp_threads is not None:
         cmd.extend(["--decomp-threads", str(parsed.decomp_threads)])
     if parsed.no_baq:
@@ -466,6 +489,9 @@ def main(args: Optional[List[str]] = None) -> int:
             out_h5_path=parsed.out,
             chroms=chroms_list,
             whitelist_path=parsed.whitelist,
+            complexity_path=parsed.complexity,
+            min_complexity=parsed.min_complexity,
+            max_complexity=parsed.max_complexity,
             n_workers=parsed.workers,
             decomp_threads=parsed.decomp_threads if parsed.decomp_threads is not None else 1,
             chunk_size_mb=parsed.chunk_size_mb,

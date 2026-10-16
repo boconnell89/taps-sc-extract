@@ -9,7 +9,7 @@ import numpy as np
 import pysam
 import pytest
 
-from taps_sc_extract.barcode import extract_barcode, parse_annot
+from taps_sc_extract.barcode import extract_barcode, load_cell_filter, parse_annot, parse_complexity
 from taps_sc_extract.cli import parse_args
 from taps_sc_extract.calling import (
     OB_FLAGS,
@@ -289,6 +289,57 @@ def test_canonical_contig_allowlist():
     assert "chr1_GL456210_random" not in CANONICAL_CONTIGS
 
 
+# 9b. Complexity file cutoffs (same rules as Rust barcode::parse_complexity)
+COMPLEXITY_TXT = (
+    "rank\tbarcode\ttotal\tunique\tpct\n"
+    "1\tAAA_I1\t1000\t900\t90.0\n"
+    "2\tCCC_I1\t500\t400\t80.0\n"
+    "# comment\n\n"
+    "3\tGGG_I1\t100\t50\t50.0\n"
+)
+
+
+def test_complexity_parse_bounds_and_errors(tmp_path):
+    import gzip
+
+    p = tmp_path / "c.txt"
+    p.write_text(COMPLEXITY_TXT)
+    assert parse_complexity(str(p)) == ({"AAA_I1", "CCC_I1", "GGG_I1"}, 3)
+    assert parse_complexity(str(p), 400, 900)[0] == {"AAA_I1", "CCC_I1"}
+    assert parse_complexity(str(p), None, 399)[0] == {"GGG_I1"}
+
+    gz = tmp_path / "c.txt.gz"
+    with gzip.open(gz, "wt") as f:
+        f.write(COMPLEXITY_TXT)
+    wl = tmp_path / "wl.txt"
+    wl.write_text("CCC_I1 extra\nGGG_I1\nTTT_I1\n")
+    assert load_cell_filter(str(wl), str(gz), 100, None) == {"CCC_I1"}
+    assert load_cell_filter() is None
+    with pytest.raises(ValueError):
+        load_cell_filter(None, None, 1, None)
+
+    short = tmp_path / "short.txt"
+    short.write_text("1\tAAA\t10\n")
+    with pytest.raises(ValueError):
+        parse_complexity(str(short))
+    bad = tmp_path / "bad.txt"
+    bad.write_text("1\tAAA\t10\t5\t50\n2\tCCC\t10\tx\t50\n")
+    with pytest.raises(ValueError):
+        parse_complexity(str(bad))
+
+
+def test_cli_forwards_complexity_flags():
+    from taps_sc_extract.cli import build_rust_command
+
+    argv = ["-b", "x.bam", "-f", "x.fa", "-o", "out", "--complexity", "c.txt",
+            "--min-complexity", "1000", "--max-complexity", "50000.5"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    i = cmd.index("--complexity")
+    assert cmd[i + 1] == "c.txt"
+    assert cmd[cmd.index("--min-complexity") + 1] == "1000"
+    assert cmd[cmd.index("--max-complexity") + 1] == "50000.5"
+
+
 # 10. Real BAM smoke test (chr19)
 CHR19_BAM = "/mnt/e/sciMET_TAPS/260731/taps_ucbTn5_sp2.srt.bam"
 CHR19_FASTA = "/mnt/e/refs/mm10/mm10.fa"
@@ -415,6 +466,55 @@ def test_chr19_rust_matches_python_per_cell(chr19_python_run, tmp_path):
         assert not moved, f"{ctx}: {len(moved)} calls under a different barcode, e.g. {moved[:3]}"
         diff = [k for k in set(py_cells) | set(rs_cells) if py_cells.get(k) != rs_cells.get(k)]
         assert not diff, f"{ctx}: {len(diff)} (cell, pos) differ from Python, e.g. {sorted(diff)[:3]}"
+
+
+def _complexity_from_reference(path, out_txt):
+    """Complexity file over the frozen chr19 reference's cells (unique = CG sites).
+    Returns the cutoff that keeps roughly the upper half of cells."""
+    with h5py.File(str(path), "r") as f:
+        sizes = sorted(((f["CG"][bc]["1"].shape[0], bc) for bc in f["CG"]), reverse=True)
+    with open(out_txt, "w") as fh:
+        for rank, (n, bc) in enumerate(sizes, 1):
+            fh.write(f"{rank}\t{bc}\t{n}\t{n}\t100.0\n")
+    return sizes[len(sizes) // 2][0]
+
+
+def test_chr19_rust_complexity_filter_keeps_calls(tmp_path):
+    """Filtered BAQ-on run equals the frozen reference on the kept cells.
+
+    Reads of excluded cells skip BAQ but stay in the pileup, so kept cells'
+    calls (depth caps, mate overlaps) are unchanged.
+    """
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
+    cx = tmp_path / "chr19.complexity.txt"
+    cutoff = _complexity_from_reference(CHR19_RUST_REFERENCE, cx)
+    out_h5 = tmp_path / "chr19_filtered.h5"
+    _run_rust_chr19(out_h5, "--complexity", str(cx), "--min-complexity", str(cutoff))
+
+    cols = ["chr", "pos", "t", "c"]
+    with h5py.File(CHR19_RUST_REFERENCE, "r") as ref, h5py.File(str(out_h5), "r") as new:
+        kept = {bc for bc in ref["CG"] if ref["CG"][bc]["1"].shape[0] >= cutoff}
+        assert 0 < len(kept) < len(ref["CG"])
+        for ctx in ("CG", "CH"):
+            assert set(new[ctx].keys()) == kept & set(ref[ctx].keys())
+            for bc in new[ctx]:
+                assert np.array_equal(ref[ctx][bc]["1"][()][cols], new[ctx][bc]["1"][()][cols]), f"{ctx}/{bc}"
+
+
+def test_chr19_rust_complexity_filter_matches_python(chr19_python_run, tmp_path):
+    """With --no-baq, filtered Rust equals Python on the kept cells (both filter at call time)."""
+    py_h5, _ = chr19_python_run
+    _require(CHR19_RUST_REFERENCE)
+    cx = tmp_path / "chr19.complexity.txt"
+    cutoff = _complexity_from_reference(CHR19_RUST_REFERENCE, cx)
+    keep, _ = parse_complexity(str(cx), cutoff, None)
+    rs_h5 = tmp_path / "chr19_filtered_nobaq.h5"
+    _run_rust_chr19(rs_h5, "--no-baq", "--complexity", str(cx), "--min-complexity", str(cutoff))
+    for ctx in ("CG", "CH"):
+        py_cells, _ = _sites_by_cell(py_h5, ctx)
+        rs_cells, _ = _sites_by_cell(rs_h5, ctx)
+        py_kept = {k: v for k, v in py_cells.items() if k[0] in keep}
+        assert rs_cells == py_kept, f"{ctx}: filtered Rust differs from Python on kept cells"
 
 
 def test_sharded_hdf5_writing(tmp_path):

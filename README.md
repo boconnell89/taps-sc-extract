@@ -129,6 +129,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
                        [--writer-mode {auto,process,thread}] [--profile-json PROFILE_JSON]
                        [--test] [--test-quick] [--save-profile] [--test-report TEST_REPORT]
+                       [--complexity COMPLEXITY] [--min-complexity N] [--max-complexity N]
                        [-v] [--version]
 ```
 
@@ -140,12 +141,14 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `-f, --fasta` | `str` | *Required* | Path to reference FASTA (`.fa` + `.fai`). |
 | `-o, --out` | `str` | *Required* | Output `.h5` file path or output directory (when `--shards > 1`). |
 | `-c, --chroms` | `str` | `None` | Comma-separated contigs (e.g. `chr1,chr2` or `chr19`). Default: canonical autosomes + `chrX`, `chrY`. |
-| `-w, -a, --whitelist` | `str` | `None` | Path to optional barcode whitelist or cell annotation file. |
+| `-w, -a, --whitelist` | `str` | `None` | Path to optional barcode whitelist or cell annotation file (first column = barcode; `.gz` accepted). |
+| `--complexity` | `str` | `None` | Complexity file: `rank barcode total_reads unique_reads percent` per line (whitespace-separated, `.gz` accepted). Keeps barcodes whose unique-read count (column 4) is within `--min-complexity` / `--max-complexity`. With `-w`, a cell must pass both. |
+| `--min-complexity` / `--max-complexity` | `float` | `None` | Inclusive unique-read bounds for `--complexity` (either may be omitted). Filtered cells are left out of the HDF5; kept cells' calls are identical to an unfiltered run. Rust also skips BAQ for filtered cells' reads. |
 | `--engine` | `str` | `auto` | Backend engine: `auto` (prefers Rust, fallback Python), `rust` (fastest), `python` (reference). |
 | `--memory-mode` | `str` | `auto` | Memory mode: `auto` (heuristic based on budget/cells), `stream` (disk temp), `memory` (RAM). |
 | `--max-memory-gb` | `float` | `None` | Memory budget in GB for the whole run, extraction plus writer processes. Overrides `--max-memory-fraction`. |
 | `--max-memory-fraction` | `float` | `0.6` | Rust: share of available memory the run may use. |
-| `--expected-cells` | `int` | `None` | Optional cell count (auto-detected from `-w/--whitelist` cardinality if omitted). |
+| `--expected-cells` | `int` | `None` | Optional cell count (auto-detected from the `-w` / `--complexity` filter's barcode count if omitted). |
 | `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes (or Rayon threads in Rust). `0` = auto. |
 | `--decomp-threads` | `int` | Rust: 4 / 2 / 0 by worker count; Python: 1 | BAM BGZF decompression threads per worker (`0` = inflate on the worker thread). |
 | `--chunk-size-mb` | `int` | `10` Python / auto Rust | Genomic window size in megabases. Rust auto: about 6 windows per worker, 2–100 Mb. |

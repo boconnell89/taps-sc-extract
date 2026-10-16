@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 import numpy as np
 import pysam
 
-from .barcode import extract_barcode, parse_annot
+from .barcode import extract_barcode, load_cell_filter
 from .calling import (
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
@@ -44,6 +44,9 @@ def extract_methylation(
     out_h5_path: str,
     chroms: Optional[Iterable[str]] = None,
     whitelist_path: Optional[str] = None,
+    complexity_path: Optional[str] = None,
+    min_complexity: Optional[float] = None,
+    max_complexity: Optional[float] = None,
     min_base_quality: int = 20,
     min_mapq: int = 0,
     max_depth: int = 250,
@@ -62,6 +65,9 @@ def extract_methylation(
         out_h5_path: Output HDF5 file path.
         chroms: Iterable of chromosome names to process (defaults to CANONICAL_CONTIGS).
         whitelist_path: Optional path to barcode whitelist / annotation file.
+        complexity_path: Optional complexity file (rank, barcode, total, unique, %).
+        min_complexity / max_complexity: Keep barcodes whose unique-read count
+            (column 4) is within these bounds (inclusive).
         min_base_quality: Minimum base quality for pileup (default 20).
         min_mapq: Minimum mapping quality (default 0).
         max_depth: Maximum pileup depth (default 250).
@@ -74,11 +80,9 @@ def extract_methylation(
     Returns:
         Summary dictionary with counts, methylation percentages, and performance metrics.
     """
-    whitelist: Optional[Set[str]] = None
-    if whitelist_path:
-        logger.info(f"Loading barcode whitelist from {whitelist_path}...")
-        whitelist = parse_annot(whitelist_path)
-        logger.info(f"Loaded {len(whitelist)} barcodes into whitelist.")
+    whitelist: Optional[Set[str]] = load_cell_filter(
+        whitelist_path, complexity_path, min_complexity, max_complexity
+    )
 
     # Open BAM and FASTA
     bam = pysam.AlignmentFile(bam_path, "rb")
@@ -323,6 +327,11 @@ def extract_methylation(
     logger.info(f"Total Mapped Reads:    {total_target_reads:,}")
     logger.info(f"Throughput (Reads):    {reads_per_min:,.0f} reads/min ({total_target_reads/total_elapsed:,.0f} reads/s)")
     logger.info(f"Total Unique Barcodes: {len(all_barcodes):,}")
+    if whitelist is not None and not all_barcodes:
+        logger.warning(
+            "No reads matched the barcode filter (--whitelist / --complexity). "
+            "Check that its barcodes use the same format as the QNAME prefix before ':'."
+        )
     logger.info(f"Throughput (Cells):    {cells_per_min:,.1f} cells/min")
     logger.info(f"Peak Memory (RSS):     {final_peak_rss:.1f} MB")
     logger.info("-" * 70)

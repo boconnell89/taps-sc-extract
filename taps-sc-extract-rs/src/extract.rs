@@ -250,7 +250,13 @@ extern "C" {
     fn bam_plp_init_overlaps(iter: htslib::bam_plp_t) -> std::os::raw::c_int;
 }
 
-fn accept_record(rec: &mut Record, params: &ExtractParams, baq_ptr: *const c_char, baq_len: i64) -> bool {
+fn accept_record(
+    rec: &mut Record,
+    params: &ExtractParams,
+    baq_ptr: *const c_char,
+    baq_len: i64,
+    whitelist: Option<&HashSet<String>>,
+) -> bool {
     let flags = rec.flags();
     if flags & FLAG_FILTER != 0 {
         return false;
@@ -266,7 +272,14 @@ fn accept_record(rec: &mut Record, params: &ExtractParams, baq_ptr: *const c_cha
     {
         return false;
     }
-    if params.compute_baq && !baq_ptr.is_null() {
+    // A read from a filtered-out cell is still pushed (depth caps and overlap
+    // pairing stay the same), but its BAQ is skipped: BAQ only changes this
+    // read's own qualities, and overlap tweaks pair it only with its mate,
+    // which has the same barcode. Kept cells' calls are unchanged.
+    let excluded = whitelist.is_some_and(|wl| {
+        !wl.contains(std::str::from_utf8(barcode_from_qname_bytes(rec.qname())).unwrap_or(""))
+    });
+    if params.compute_baq && !baq_ptr.is_null() && !excluded {
         let _ = unsafe { htslib::sam_prob_realn(rec.inner_mut(), baq_ptr, baq_len, BAQ_FLAGS) };
     }
     true
@@ -471,7 +484,7 @@ pub fn process_window(
             Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
             Some(Ok(())) => {
                 timing.records += 1;
-                let keep = accept_record(&mut rec, params, baq_ptr, baq_len);
+                let keep = accept_record(&mut rec, params, baq_ptr, baq_len, whitelist);
                 timing.baq_s += lap(profile);
                 if !keep {
                     continue;
