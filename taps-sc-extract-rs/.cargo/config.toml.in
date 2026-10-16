@@ -11,4 +11,6 @@ LIBCLANG_PATH = { value = "@PREFIX@/lib", relative = false, force = true }
 HDF5_DIR = { value = "@PREFIX@", relative = false, force = true }
 # Vendored C (htslib incl. sam_prob_realn, libdeflate, LZF/Blosc filters) via the
 # cc crate. Forced so an activated conda env's CFLAGS (-march=nocona -O2) does not win.
-CFLAGS = { value = "-O3 -march=@MARCH@ -fPIC", force = true }
+# -ffp-contract=off: no fused multiply-adds, so BAQ (probaln.c) gives the same
+# result on every CPU and matches the SIMD BAQ kernel bit for bit.
+CFLAGS = { value = "-O3 -march=@MARCH@ -fPIC -ffp-contract=off", force = true }

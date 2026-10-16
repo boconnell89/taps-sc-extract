@@ -367,3 +367,7 @@ Balanced and hash-sharded outputs are identical per cell (701.7M sites over 900 
 - Speed-up research (Grok measured, Gemini estimated; reports in `scratch/baq-speed/`, not in git): buffer reuse 1.01×, float 1.04× (not exact), AVX2 4-read prototype with only the forward pass vectorised 1.18–1.32× and bit-exact. No library implements the same HMM.
 - Shipped build on the full test BAM (one run each): `taps` processing 20.6 s, total 32.6 s, HMM on 28.2% of reads; `taps-partial` 11.7 s / 24.1 s, 8.5%. CpG/CH totals identical to the experiment build.
 - `--test`: machine probes now time `taps-full` (HMM cost per read is a CPU property; synthetic reads would mostly skip it). With `-b`, the dataset sample runs the default and reports the share of reads that ran the HMM (27% on the test BAM; predicted processing 16 s vs 20.6 s measured). Profile JSON stages gain `baq_reads`.
+
+## 2026-10-16 — Vendored C built with `-ffp-contract=off`
+
+`install.sh`'s CFLAGS now include `-ffp-contract=off`. GCC's default for GNU C contracts `a*b+c` into FMA under `-march=native`; `probaln.o` had 16 `vfmadd`, now 0. BAQ results therefore no longer depend on whether the build host has FMA, and the scalar HMM and the planned SIMD kernel do the same IEEE operations. All three frozen chr19 references (`taps`, `taps-full`, `htslib`) are unchanged. Existing installs pick it up on the next `./install.sh`.
