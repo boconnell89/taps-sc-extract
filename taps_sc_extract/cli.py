@@ -228,12 +228,15 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--baq",
-        choices=["taps", "htslib"],
+        choices=["taps", "taps-full", "taps-partial", "htslib"],
         default=None,
-        help="BAQ reference (Rust engine). 'taps' (default) masks the methylation-"
-        "convertible base (C on OT reads, G on OB reads) so C-to-T conversions are not "
-        "treated as mismatches; 'htslib' uses the plain reference like samtools/asTair, "
-        "which lowers methylated calls.",
+        help="BAQ mode (Rust engine). The taps modes mask the methylation-convertible "
+        "base (C on OT reads, G on OB reads) so C-to-T conversions are not treated as "
+        "mismatches. 'taps' (default) skips reads that already match that reference "
+        "exactly (~2x faster than 'taps-full', which runs every read); 'taps-partial' "
+        "runs only reads with an indel or clip (~4x faster, 0.06%% of CG calls differ). "
+        "'htslib' uses the plain reference like samtools/asTair, which lowers "
+        "methylated calls.",
     )
     parser.add_argument(
         "--no-overlap-clip",

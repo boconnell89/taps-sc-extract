@@ -289,9 +289,13 @@ pub struct CpuRun {
     pub reads_per_s: f64,
 }
 
+/// Machine probes time the BAQ HMM on every read (`TapsFull`): its cost per
+/// read is a property of the CPU. How many reads skip it depends on the data,
+/// which only the dataset sample (`-b`) measures.
 fn tune_params(baq: bool, profile: bool) -> ExtractParams {
     ExtractParams {
         compute_baq: baq,
+        baq_mode: crate::extract::BaqMode::TapsFull,
         decomp_threads: 0,
         accumulate: true,
         profile,
@@ -609,6 +613,8 @@ pub struct DatasetSample {
     /// Largest cell's share of the sample's sites.
     pub max_cell_share: f64,
     pub baq_share: f64,
+    /// Share of sampled reads that ran the BAQ HMM under the default `--baq taps`.
+    pub baq_read_share: f64,
     /// Worker-thread seconds per read with all workers busy.
     pub thread_s_per_read: f64,
 }
@@ -665,7 +671,8 @@ fn sample_dataset(bam_path: &Path, fasta: &Path, workers: usize, target_reads: u
             }
         }
     }
-    let (r, mem, secs) = run_extract(bam_path, fasta, &windows, &tune_params(true, true), workers, 1)?;
+    let params = ExtractParams { baq_mode: crate::extract::BaqMode::Taps, ..tune_params(true, true) };
+    let (r, mem, secs) = run_extract(bam_path, fasta, &windows, &params, workers, 1)?;
     anyhow::ensure!(r.timing.records > 0, "dataset sample read no records");
     let reads = r.timing.records.max(1);
     let calls = r.stats.cg_c + r.stats.cg_t + r.stats.ch_c + r.stats.ch_t;
@@ -691,6 +698,7 @@ fn sample_dataset(bam_path: &Path, fasta: &Path, workers: usize, target_reads: u
         calls_per_read: calls as f64 / reads as f64,
         cells: r.n_cells(),
         baq_share: if t.total_s > 0.0 { t.baq_s / t.total_s } else { 0.0 },
+        baq_read_share: t.baq_reads as f64 / reads as f64,
         thread_s_per_read: t.total_s / reads as f64,
     })
 }
@@ -1017,9 +1025,10 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         );
         let _ = writeln!(
             rpt,
-            "Per read: {:.2} calls, {:.2} new sites; BAQ {:.0}% of worker time",
+            "Per read: {:.2} calls, {:.2} new sites; BAQ HMM ran on {:.0}% of reads (--baq taps), {:.0}% of worker time",
             d.calls_per_read,
             d.sites_per_read,
+            100.0 * d.baq_read_share,
             100.0 * d.baq_share
         );
         let _ = writeln!(

@@ -125,7 +125,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--no-temp-file] [--temp-dir TEMP_DIR]
                        [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
-                       [--no-baq] [--baq {taps,htslib}] [--no-overlap-clip]
+                       [--no-baq] [--baq {taps,taps-full,taps-partial,htslib}] [--no-overlap-clip]
                        [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
                        [--writer-mode {auto,process,thread}] [--profile-json PROFILE_JSON]
                        [--test] [--test-quick] [--save-profile] [--test-report TEST_REPORT]
@@ -166,7 +166,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--min-mapq` | `int` | `0` | Minimum mapping quality for alignment filtering. |
 | `--max-depth` | `int` | `250` | Maximum pileup depth. |
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
-| `--baq` | `taps`\|`htslib` | `taps` | BAQ reference (Rust engine). `taps` realigns OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `htslib` is samtools/asTair BAQ on the plain reference; it treats each methylated C (read as T) as a mismatch and under-calls methylation (chr19 CpG 66.48% vs 67.24% `taps`, 67.07% no BAQ). Same speed. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
+| `--baq` | `taps`\|`taps-full`\|`taps-partial`\|`htslib` | `taps` | BAQ mode (Rust engine). The `taps` modes realign OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `taps` skips reads that already match that reference exactly (~2× faster than `taps-full`, 0.0007% of CG calls differ); `taps-full` runs every read; `taps-partial` only reads with an indel or clip (~4×, 0.06%). `htslib` is samtools/asTair BAQ on the plain reference and under-calls methylation. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
 | `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
 | `--trim-r1` | `int` | `0` | Drop this many 5′ sequenced bases of read 1 before calling. |
@@ -250,7 +250,7 @@ $$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
 
 BAQ (htslib `sam_prob_realn`) realigns each read to the reference with a profile HMM and lowers base qualities where the alignment is uncertain; bases that fall below `--min-baseq` are not called. On the plain reference, a methylated C read as T (A on OB) is a mismatch, so BAQ lowers quality at and around methylated sites and drops methylated calls preferentially.
 
-The default `--baq taps` gives the HMM a reference with the convertible base masked to `N`: every `C` for OT reads and every `G` for OB reads, in all contexts (CpG and CH). `N` scores as neither match nor mismatch in the HMM, so a converted or unconverted base costs nothing, while indels and other mismatches still lower quality. Only BAQ sees the masked reference; calling uses the real one.
+The `taps` modes give the HMM a reference with the convertible base masked to `N`: every `C` for OT reads and every `G` for OB reads, in all contexts (CpG and CH). `N` scores as neither match nor mismatch in the HMM, so a converted or unconverted base costs nothing, while indels and other mismatches still lower quality. Only BAQ sees the masked reference; calling uses the real one.
 
 chr19, change in calls against `--no-baq`:
 
@@ -258,9 +258,18 @@ chr19, change in calls against `--no-baq`:
 |---|---:|---:|---:|---:|---:|---:|
 | off (`--no-baq`) | 574,228 | 281,919 | 67.07 | 59,592 | 19,984,017 | 0.297 |
 | `--baq htslib` | −3.00% | −0.37% | 66.48 | −4.93% | −0.42% | 0.284 |
-| `--baq taps` (default) | −0.07% | −0.84% | 67.24 | −0.60% | −0.38% | 0.297 |
+| `--baq taps-full` | −0.07% | −0.84% | 67.24 | −0.60% | −0.38% | 0.297 |
 
-BAQ is most of the processing time (full test BAM: 46 s with BAQ, 8.4 s without, at `-t 32`); both BAQ modes cost the same.
+BAQ is most of the processing time. About 72% of reads have an all-M CIGAR and match the masked reference at every A/C/G/T base; for those the HMM mostly lowers end bases that the R2 trim or `--min-baseq` drop anyway. The default `--baq taps` skips them. Full test BAM (53.5M reads, `-t 32 --shards 16`, two runs each):
+
+| BAQ | Processing | Total wall | CpG % | CG cell-sites differing from `taps-full` |
+|---|---:|---:|---:|---:|
+| `taps-full` (HMM on every read) | 41–45 s | 55–58 s | 71.615 | — |
+| `taps` (default) | 19–23 s | 32–35 s | 71.615 | 172 of 25.9M (0.0007%) |
+| `taps-partial` (indel/clip reads only) | 11 s | 24 s | 71.585 | 15,671 (0.06%) |
+| `--no-baq` | 7.5–8.8 s | 20–23 s | 71.543 | 64,056 (0.25%) |
+
+`htslib` costs the same as `taps-full`.
 
 ---
 
@@ -351,7 +360,7 @@ pytest tests/ -v                        # includes chr19 BAM tests when the data
 (cd taps-sc-extract-rs && cargo test --release)
 ```
 
-The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_tapsbaq_2026-10-16/`, TAPS-aware BAQ; `--baq htslib` against `test_chr19_rust_overlapfix_2026-10-15/`), and require Rust `--no-baq` to equal the Python engine at every cell and position.
+The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_tapsskip_2026-10-16/`, default BAQ; `--baq taps-full` against `test_chr19_rust_tapsbaq_2026-10-16/`, `--baq htslib` against `test_chr19_rust_overlapfix_2026-10-15/`), and require Rust `--no-baq` to equal the Python engine at every cell and position.
 
 ---
 

@@ -345,19 +345,21 @@ def test_cli_forwards_baq_mode():
 
     base = ["-b", "x.bam", "-f", "x.fa", "-o", "out"]
     assert "--baq" not in build_rust_command("taps-sc-extract-rs", parse_args(base), base)
-    argv = base + ["--baq", "htslib"]
-    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
-    assert cmd[cmd.index("--baq") + 1] == "htslib"
+    for mode in ("taps-full", "taps-partial", "htslib"):
+        argv = base + ["--baq", mode]
+        cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+        assert cmd[cmd.index("--baq") + 1] == mode
 
 
 # 10. Real BAM smoke test (chr19)
 CHR19_BAM = "/mnt/e/sciMET_TAPS/260731/taps_ucbTn5_sp2.srt.bam"
 CHR19_FASTA = "/mnt/e/refs/mm10/mm10.fa"
-# Rust chr19 output with TAPS-aware BAQ, the default (see the README in that
-# directory). The htslib-BAQ reference is what `--baq htslib` must still give.
-# Older references (test_chr19_rust_026c52e/, test_chr19_rust_cellfix_2026-10-15/)
-# are records.
-CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_tapsbaq_2026-10-16/chr19.h5"
+# Rust chr19 output with the default BAQ (`--baq taps`, see the README in that
+# directory). `--baq taps-full` and `--baq htslib` must still give their frozen
+# references. Older references (test_chr19_rust_026c52e/,
+# test_chr19_rust_cellfix_2026-10-15/) are records.
+CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_tapsskip_2026-10-16/chr19.h5"
+CHR19_RUST_REFERENCE_TAPS_FULL = "/mnt/e/sciMET_TAPS/test_chr19_rust_tapsbaq_2026-10-16/chr19.h5"
 CHR19_RUST_REFERENCE_HTSLIB = "/mnt/e/sciMET_TAPS/test_chr19_rust_overlapfix_2026-10-15/chr19.h5"
 
 
@@ -454,11 +456,19 @@ def _assert_same_sites(ref_path, new_path):
 
 
 def test_chr19_real_bam_smoke_rust(tmp_path):
-    """Rust engine (TAPS-aware BAQ) on chr19 must reproduce the frozen reference exactly."""
+    """Rust engine (default BAQ) on chr19 must reproduce the frozen reference exactly."""
     _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
     out_h5 = tmp_path / "chr19_rust.h5"
     _run_rust_chr19(out_h5)
     _assert_same_sites(CHR19_RUST_REFERENCE, out_h5)
+
+
+def test_chr19_rust_taps_full_baq_unchanged(tmp_path):
+    """--baq taps-full (HMM on every read) gives its frozen reference."""
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE_TAPS_FULL)
+    out_h5 = tmp_path / "chr19_rust_taps_full.h5"
+    _run_rust_chr19(out_h5, "--baq", "taps-full")
+    _assert_same_sites(CHR19_RUST_REFERENCE_TAPS_FULL, out_h5)
 
 
 def test_chr19_rust_htslib_baq_unchanged(tmp_path):

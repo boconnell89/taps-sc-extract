@@ -98,9 +98,11 @@ enum Commands {
         /// flag is currently a no-op; we do not copy that).
         #[arg(long, default_value_t = false)]
         no_baq: bool,
-        /// BAQ reference: `taps` masks the methylation-convertible base (C on
-        /// OT reads, G on OB reads) so conversions are not penalised; `htslib`
-        /// uses the plain reference (samtools/asTair; under-calls methylation).
+        /// BAQ mode. The `taps*` modes mask the methylation-convertible base (C
+        /// on OT reads, G on OB reads) so conversions are not penalised.
+        /// `taps` skips reads that already match that reference exactly;
+        /// `taps-full` runs every read; `taps-partial` only reads with an indel
+        /// or clip. `htslib` uses the plain reference (under-calls methylation).
         #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
         baq: BaqMode,
         /// Drop this many 5' sequenced bases of read 1 before calling.
@@ -200,7 +202,7 @@ enum Commands {
         /// Disable BAQ. Default is on (do not copy Python's current no-op).
         #[arg(long, default_value_t = false)]
         no_baq: bool,
-        /// BAQ reference: `taps` (masked convertible base) or `htslib` (plain).
+        /// BAQ mode: taps (default), taps-full, taps-partial or htslib.
         #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
         baq: BaqMode,
         /// Drop this many 5' sequenced bases of read 1 before calling.

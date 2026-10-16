@@ -357,3 +357,13 @@ Balanced and hash-sharded outputs are identical per cell (701.7M sites over 900 
 - Full BAM (`-t 32 --shards 16`): CpG 71.62% taps vs 70.86% htslib (71.54% no BAQ); CH 1.238% vs 1.181%. 31.09M vs 30.34M CG calls. Processing 40.8 s taps vs 45.9 s htslib, one run each; peak extract RSS 12.5 vs 11.7 GB.
 - Python engine: unchanged (it never applies BAQ); the CLI logs a note when BAQ is requested there, and forwards `--baq` to Rust.
 - Context-skip measurement (temporary build, not shipped): returning early on CH columns gives CG-only output identical per cell; full BAM `-t 32 --shards 16`: no BAQ 22.1 s → 6.0 s, BAQ 58.0 s → 42.6 s, peak RSS ~21 GB → ~3–5 GB. The pileup walk and BAQ still run for every read.
+
+## 2026-10-16 — Default BAQ skips reads that already match; `--baq taps-full|taps-partial`
+
+- `--baq taps` (default) runs the TAPS-masked HMM only for reads that are not (all-M CIGAR and equal to the masked reference at every A/C/G/T position) (`BaqMode::wants`). `--baq taps-full` is the previous default (every read); `--baq taps-partial` runs only reads with an indel or clip (~8%, the bcftools-style idea).
+- Grok's sampler on 200k chr19 primaries: 72.1% of reads are all-M with no masked mismatch; BAQ still changes some QUAL on 98.6% of them, mostly the 5 end bases, but only 0.29% of them lose a Q≥20 base.
+- Full test BAM, `-t 32 --shards 16`, two runs each: processing taps-full 41.2/45.1 s, taps 19.1/22.7 s, taps-partial 11.3/11.4 s, no BAQ 8.8/7.5 s. BAQ CPU 975–1,051 s → 326 s (taps) → 97 s (partial). CG cell-sites differing from taps-full: 172 / 25.9M (taps), 15,671 (partial), 64,056 (no BAQ). CpG 71.615% / 71.615% / 71.585% / 71.543%.
+- chr19: taps differs from taps-full at 4 of 806,646 CG and 964 of 18.8M CH cell-sites. New frozen default reference `test_chr19_rust_tapsskip_2026-10-16/`; `test_chr19_rust_tapsbaq_2026-10-16/` is now the `taps-full` reference.
+- Speed-up research (Grok measured, Gemini estimated; reports in `scratch/baq-speed/`, not in git): buffer reuse 1.01×, float 1.04× (not exact), AVX2 4-read prototype with only the forward pass vectorised 1.18–1.32× and bit-exact. No library implements the same HMM.
+- Shipped build on the full test BAM (one run each): `taps` processing 20.6 s, total 32.6 s, HMM on 28.2% of reads; `taps-partial` 11.7 s / 24.1 s, 8.5%. CpG/CH totals identical to the experiment build.
+- `--test`: machine probes now time `taps-full` (HMM cost per read is a CPU property; synthetic reads would mostly skip it). With `-b`, the dataset sample runs the default and reports the share of reads that ran the HMM (27% on the test BAM; predicted processing 16 s vs 20.6 s measured). Profile JSON stages gain `baq_reads`.

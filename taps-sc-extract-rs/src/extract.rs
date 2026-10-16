@@ -9,8 +9,9 @@
 //! - `ignore_orphans`: skip paired-but-not-proper
 //! - `compute_baq`: `sam_prob_realn(b, full_contig, len, BAQ_APPLY|BAQ_EXTEND)`
 //!   (flag 3). The reference must start at contig coordinate 0. With
-//!   `BaqMode::Taps` (the default) the reference has the strand's convertible
-//!   base masked to N; see `BaqMode`.
+//!   the TAPS modes the reference has the strand's convertible base masked to
+//!   N, and the default `BaqMode::Taps` skips reads that already match it
+//!   exactly; see `BaqMode`.
 //! - `ignore_overlaps`: `bam_plp_init_overlaps` (zeros the lower-quality
 //!   overlapping mate base; pysam then drops it via `min_base_quality`)
 //!
@@ -132,6 +133,8 @@ pub struct WindowTiming {
     pub records: u64,
     /// Records that passed the filters and entered the pileup.
     pub pushed: u64,
+    /// Records that ran the BAQ HMM.
+    pub baq_reads: u64,
     pub total_s: f64,
     /// FASTA window fetch plus BAM index seek.
     pub setup_s: f64,
@@ -149,6 +152,7 @@ impl WindowTiming {
     pub fn add(&mut self, o: &WindowTiming) {
         self.records += o.records;
         self.pushed += o.pushed;
+        self.baq_reads += o.baq_reads;
         self.total_s += o.total_s;
         self.setup_s += o.setup_s;
         self.read_s += o.read_s;
@@ -239,11 +243,19 @@ impl Default for ExtractParams {
 /// (chr19: -3.0% methylated vs -0.4% unmethylated CpG calls).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum BaqMode {
+    /// TAPS-masked BAQ (see `TapsFull`), skipped for reads that are all-M and
+    /// match the masked reference at every base (~72% of reads). Full-genome
+    /// test BAM: 172 of 25.9M CG cell-sites differ from `TapsFull`, processing
+    /// ~2x faster.
+    Taps,
     /// Mask the convertible base: OT reads see every reference C as N, OB reads
     /// every G (all contexts, CpG and CH). N scores as neither match nor
     /// mismatch in the HMM (`probaln.c`), so methylation state does not affect
-    /// BAQ, while indels and real mismatches still do.
-    Taps,
+    /// BAQ, while indels and real mismatches still do. Every read runs the HMM.
+    TapsFull,
+    /// TAPS-masked BAQ only for reads with an indel or clip in the CIGAR
+    /// (~8%). ~4x faster than `TapsFull`; 0.06% of CG cell-sites differ.
+    TapsPartial,
     /// htslib's plain reference (samtools/asTair behaviour; biased for TAPS).
     Htslib,
 }
@@ -252,9 +264,56 @@ impl BaqMode {
     pub fn label(self) -> &'static str {
         match self {
             BaqMode::Taps => "taps",
+            BaqMode::TapsFull => "taps-full",
+            BaqMode::TapsPartial => "taps-partial",
             BaqMode::Htslib => "htslib",
         }
     }
+
+    /// Run the HMM on this read? (`seq` is the reference BAQ would use.)
+    #[inline]
+    fn wants(self, rec: &Record, seq: &[u8]) -> bool {
+        match self {
+            BaqMode::TapsFull | BaqMode::Htslib => true,
+            BaqMode::TapsPartial => !cigar_all_match(rec),
+            BaqMode::Taps => !(cigar_all_match(rec) && matches_masked_ref(rec, seq)),
+        }
+    }
+}
+
+/// CIGAR is only M operations (no clip, indel or skip).
+#[inline]
+fn cigar_all_match(rec: &Record) -> bool {
+    rec.raw_cigar().iter().all(|&c| c & 0xf == htslib::BAM_CMATCH)
+}
+
+/// Every read base equals the reference base where the reference is A/C/G/T
+/// (masked N positions match anything; a read N is a mismatch). Assumes an
+/// all-M CIGAR, so read base i sits at `pos + i`.
+#[inline]
+fn matches_masked_ref(rec: &Record, refseq: &[u8]) -> bool {
+    let n = rec.seq_len();
+    let Ok(pos) = usize::try_from(rec.pos()) else {
+        return false;
+    };
+    let Some(r) = refseq.get(pos..pos + n) else {
+        return false;
+    };
+    let raw = rec.seq().encoded;
+    for (i, &rb) in r.iter().enumerate() {
+        // BAM 4-bit codes: A=1 C=2 G=4 T=8, high nibble first.
+        let want = match rb {
+            b'A' => 1,
+            b'C' => 2,
+            b'G' => 4,
+            b'T' => 8,
+            _ => continue,
+        };
+        if (raw[i / 2] >> (4 * (1 - (i & 1)))) & 0xf != want {
+            return false;
+        }
+    }
+    true
 }
 
 /// Bottom-strand (OB) read for TAPS-aware BAQ: read 1 reverse or read 2
@@ -300,6 +359,7 @@ fn accept_record(
     params: &ExtractParams,
     baq_ref: Option<&BaqRef>,
     whitelist: Option<&HashSet<String>>,
+    baq_reads: &mut u64,
 ) -> bool {
     let flags = rec.flags();
     if flags & FLAG_FILTER != 0 {
@@ -325,6 +385,10 @@ fn accept_record(
     });
     if let Some(r) = baq_ref.filter(|_| params.compute_baq && !excluded) {
         let seq = if baq_is_ob(flags) { &r.ob } else { &r.ot };
+        if !params.baq_mode.wants(rec, seq) {
+            return true;
+        }
+        *baq_reads += 1;
         let _ = unsafe {
             htslib::sam_prob_realn(rec.inner_mut(), seq.as_ptr() as *const c_char, seq.len() as i64, BAQ_FLAGS)
         };
@@ -537,7 +601,7 @@ pub fn process_window(
             Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
             Some(Ok(())) => {
                 timing.records += 1;
-                let keep = accept_record(&mut rec, params, baq_ref, whitelist);
+                let keep = accept_record(&mut rec, params, baq_ref, whitelist, &mut timing.baq_reads);
                 timing.baq_s += lap(sample) * scale;
                 if !keep {
                     continue;
@@ -592,7 +656,7 @@ impl BaqRef {
                 let s: Arc<[u8]> = seq.into();
                 Self { ot: Arc::clone(&s), ob: s }
             }
-            BaqMode::Taps => {
+            BaqMode::Taps | BaqMode::TapsFull | BaqMode::TapsPartial => {
                 // FastFaiReader::fetch returns uppercase.
                 let mask = |from: u8| -> Arc<[u8]> {
                     seq.iter().map(|&b| if b == from { b'N' } else { b }).collect()
@@ -842,5 +906,30 @@ mod tests {
         let h = BaqRef::new(b"ACGT".to_vec(), BaqMode::Htslib);
         assert_eq!(&*h.ot, b"ACGT");
         assert!(Arc::ptr_eq(&h.ot, &h.ob));
+    }
+
+    fn record(cigar: &str, seq: &[u8], pos: i64) -> Record {
+        let mut r = Record::new();
+        let c = rust_htslib::bam::record::CigarString::try_from(cigar).unwrap();
+        r.set(b"q", Some(&c), seq, &vec![30u8; seq.len()]);
+        r.set_pos(pos);
+        r
+    }
+
+    #[test]
+    fn taps_baq_skips_only_perfect_all_match_reads() {
+        // Masked OT reference: C -> N.
+        let masked = BaqRef::new(b"AACGTTCGAA".to_vec(), BaqMode::Taps).ot;
+        let perfect = record("4M", b"ATGT", 1); // ref ANGT: T vs masked C is fine
+        let mismatch = record("4M", b"AAGA", 1);
+        let read_n = record("4M", b"ATNT", 1); // N against reference G
+        let clipped = record("1S3M", b"ATGT", 2);
+        for (rec, taps, partial) in [(&perfect, false, false), (&mismatch, true, false), (&read_n, true, false), (&clipped, true, true)] {
+            assert_eq!(BaqMode::Taps.wants(rec, &masked), taps, "{:?}", rec.seq().as_bytes());
+            assert_eq!(BaqMode::TapsPartial.wants(rec, &masked), partial, "{:?}", rec.seq().as_bytes());
+            assert!(BaqMode::TapsFull.wants(rec, &masked));
+        }
+        // Running off the reference end: run BAQ.
+        assert!(BaqMode::Taps.wants(&record("4M", b"AAAA", 8), &masked));
     }
 }
