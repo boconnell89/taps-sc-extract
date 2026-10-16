@@ -3,8 +3,13 @@ fn main() {
     let include = std::env::var("DEP_HTS_INCLUDE").expect("hts-sys exports its include dir");
     println!("cargo:rerun-if-changed=csrc/baq_simd.c");
     println!("cargo:rerun-if-changed=csrc/baq_kernel.h");
-    cc::Build::new()
-        .file("csrc/baq_simd.c")
+    println!("cargo:rerun-if-env-changed=TAPS_BAQ_NO_SIMD");
+    let mut b = cc::Build::new();
+    // TAPS_BAQ_NO_SIMD=1 builds the scalar-only path (what non-x86 hosts get).
+    if std::env::var_os("TAPS_BAQ_NO_SIMD").is_some() {
+        b.define("TAPS_BAQ_NO_SIMD", None);
+    }
+    b.file("csrc/baq_simd.c")
         .include(include)
         .opt_level(3)
         // Same IEEE operations as htslib's probaln.c (also built without contraction).

@@ -137,7 +137,32 @@ fn compare(recs: &[Record], refs: &[&[u8]], width: Width, ws: &mut Workspace) ->
         .map(|(r, s)| BaqJob { b: r.inner_mut(), reference: s.as_ptr() as *const c_char, ref_len: s.len() as i64 })
         .collect();
     let simd_reads = ws.run(&jobs, width);
-    let mismatched = a.iter().zip(&b).filter(|(x, y)| x.qual() != y.qual()).count();
+    let mut mismatched = 0;
+    for ((x, y), orig) in a.iter().zip(&b).zip(recs) {
+        if x.qual() == y.qual() {
+            continue;
+        }
+        mismatched += 1;
+        if mismatched <= 5 {
+            let diff: Vec<String> = x
+                .qual()
+                .iter()
+                .zip(y.qual())
+                .enumerate()
+                .filter(|(_, (p, q))| p != q)
+                .map(|(i, (p, q))| format!("{i}:{p}/{q}"))
+                .collect();
+            eprintln!(
+                "    differs: {} flag {} pos {} cigar {} len {} (htslib/simd at index: {})",
+                String::from_utf8_lossy(orig.qname()),
+                orig.flags(),
+                orig.pos(),
+                orig.cigar(),
+                orig.seq_len(),
+                diff.join(" ")
+            );
+        }
+    }
     SelftestResult { reads: recs.len(), simd_reads, mismatched }
 }
 

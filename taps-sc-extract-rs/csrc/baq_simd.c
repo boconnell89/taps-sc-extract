@@ -47,7 +47,10 @@ __attribute__((constructor)) static void taps_qual2prob_init(void)
     for (int i = 0; i < 256; ++i) taps_qual2prob[i] = pow(10, -i/10.);
 }
 
-/* ---- kernels ---- */
+/* ---- kernels (x86 only; elsewhere every read goes to sam_prob_realn) ---- */
+
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(TAPS_BAQ_NO_SIMD)
+#define TAPS_BAQ_SIMD 1
 
 #pragma GCC push_options
 #pragma GCC target("avx2")
@@ -72,6 +75,7 @@ __attribute__((constructor)) static void taps_qual2prob_init(void)
 #undef KFN
 #undef VW
 #pragma GCC pop_options
+#endif
 
 /* ---- widths ---- */
 
@@ -85,6 +89,9 @@ enum {
 /* Widest kernel this CPU runs: 8, 4, or 0. */
 int taps_baq_cpu_width(void)
 {
+#ifndef TAPS_BAQ_SIMD
+    return TAPS_BAQ_HTSLIB;
+#endif
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx512f")) return TAPS_BAQ_AVX512;
     if (__builtin_cpu_supports("avx2")) return TAPS_BAQ_AVX2;
@@ -93,6 +100,9 @@ int taps_baq_cpu_width(void)
 
 int taps_baq_width_ok(int width)
 {
+#ifndef TAPS_BAQ_SIMD
+    return width == TAPS_BAQ_HTSLIB;
+#endif
     __builtin_cpu_init();
     switch (width) {
     case TAPS_BAQ_HTSLIB: return 1;
@@ -322,8 +332,11 @@ static int run_group(taps_baq_ws *ws, const taps_baq_job *jobs, const int *idx, 
         st[l] = (int *)(ws->arena + p->state);
         qq[l] = ws->arena + p->q;
     }
-    /* Illumina parameters (sam_prob_realn, l_qseq <= 1000). */
-    const double cd = 0.001, ce = 0.1;
+    /* Illumina parameters (sam_prob_realn, l_qseq <= 1000). probaln_par_t
+     * holds them as float, and htslib evaluates e.g. (1 - c->d) / l_ref in
+     * float; doubles here shift HMM values in about the 7th digit. */
+    const float cd = 0.001f, ce = 0.1f;
+#ifdef TAPS_BAQ_SIMD
     switch (width) {
     case TAPS_BAQ_AVX2:
         taps_probaln_x4_avx2(in, lr, lq, bwk, cd, ce, f, bb, s, R, Q, QL, st, qq); break;
@@ -332,6 +345,10 @@ static int run_group(taps_baq_ws *ws, const taps_baq_job *jobs, const int *idx, 
     default:
         taps_probaln_x8_avx512(in, lr, lq, bwk, cd, ce, f, bb, s, R, Q, QL, st, qq); break;
     }
+#else
+    (void)cd; (void)ce; (void)f; (void)bb; (void)s; (void)R; (void)Q; (void)QL; (void)in; (void)st; (void)qq;
+    return -1;
+#endif
     if (grow((void **)&ws->fin, &ws->fin_cap, 3 * al16((size_t)lq + 1), 0) < 0) return -1;
     for (int l = 0; l < n_real; ++l) {
         const prep_t *p = &ws->prep[idx[l]];

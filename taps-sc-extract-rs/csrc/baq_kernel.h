@@ -34,7 +34,9 @@ static inline __attribute__((always_inline)) vi visel(vi m, vi a, vi b) { return
  * R holds l_ref vi; Q holds l_query vi; QL holds l_query vd.
  * Output: state[l][0..l_query), q[l][0..l_query).
  */
-static void KFN(const taps_lane_in *in, int l_ref, int l_query, int bw_in, double cd, double ce,
+/* cd, ce are float like probaln_par_t's d and e, so expressions such as
+ * (1 - cd) / l_ref are evaluated in float exactly as htslib does. */
+static void KFN(const taps_lane_in *in, int l_ref, int l_query, int bw_in, float cd, float ce,
                 vd *f, vd *b, vd *s, vi *R, vi *Q, vd *QL, int **state, uint8_t **q)
 {
     double m[9], sI, sM, bI, bM;
