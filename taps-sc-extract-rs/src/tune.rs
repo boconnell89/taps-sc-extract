@@ -23,7 +23,7 @@
 
 use crate::autotune;
 use crate::extract::{ExtractParams, WindowResult};
-use crate::h5_out::{assemble_hdf5_from_memory, H5Compression, WriterMode};
+use crate::h5_out::{assemble_hdf5_from_memory, assemble_hdf5_from_temp, written_output_bytes, H5Compression, WriterMode};
 use crate::parallel::{extract_memory_parallel, new_cancel_flag, QUIET_PROGRESS};
 use crate::shard_io::{ChunkCell, ChunkFile};
 use crate::window::{plan_windows, Window};
@@ -448,6 +448,11 @@ pub struct H5Run {
     pub secs: f64,
     pub sites_per_s: f64,
     pub datasets_per_s: f64,
+    /// Compressed output bytes per site.
+    pub bytes_per_site: f64,
+    /// Stream mode only: seconds to write the temp chunk files (during a real
+    /// run this overlaps extraction).
+    pub temp_write_s: f64,
 }
 
 /// Synthetic shard payloads: `n_cells` cells, sites per cell drawn around
@@ -481,22 +486,63 @@ fn synthetic_payload(n_cells: usize, mean_sites: u32, shards: usize) -> (Vec<Vec
     (payload, total)
 }
 
-fn h5_run(dir: &Path, mode: WriterMode, writers: usize, n_cells: usize, mean_sites: u32) -> Result<H5Run> {
+/// Write a synthetic payload with `writers` writers. `stream_temp` = Some(dir):
+/// stream mode (chunk files written to `dir` first, then read back by the
+/// writers); None: memory mode (payload piped to the writers).
+fn h5_run(
+    dir: &Path,
+    mode: WriterMode,
+    writers: usize,
+    n_cells: usize,
+    mean_sites: u32,
+    stream_temp: Option<&Path>,
+) -> Result<H5Run> {
     let shards = writers.max(2);
     let (payload, sites) = synthetic_payload(n_cells, mean_sites, shards);
-    let out = dir.join(format!("h5_{}_{writers}", mode.label()));
+    let label = format!("{}{}", mode.label(), if stream_temp.is_some() { "-stream" } else { "" });
+    let out = dir.join(format!("h5_{label}_{writers}_{n_cells}"));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
-    let t = Instant::now();
-    assemble_hdf5_from_memory(payload, &out, H5Compression::Lzf, "lzf", writers, mode)?;
+    let mut temp_write_s = 0.0;
+    let t;
+    let res = match stream_temp {
+        Some(tmp) => {
+            let t0 = Instant::now();
+            let tmp = tmp.join(format!("h5_stream_{}", std::process::id()));
+            crate::shard_io::prepare_shard_dirs(&tmp, shards)?;
+            for (s, chunks) in payload.iter().enumerate() {
+                for c in chunks {
+                    let p = crate::shard_io::chunk_path(&tmp, s, c.chunk_id);
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&p)?);
+                    crate::shard_io::write_chunk_to(&mut w, c)?;
+                    w.flush()?;
+                    w.get_ref().sync_all()?;
+                }
+            }
+            temp_write_s = t0.elapsed().as_secs_f64();
+            drop(payload);
+            let groups: Vec<Vec<usize>> = (0..shards).map(|s| vec![s]).collect();
+            t = Instant::now();
+            let r = assemble_hdf5_from_temp(&tmp, &out, &groups, H5Compression::Lzf, "lzf", writers, mode);
+            let _ = std::fs::remove_dir_all(&tmp);
+            r?
+        }
+        None => {
+            t = Instant::now();
+            assemble_hdf5_from_memory(payload, &out, H5Compression::Lzf, "lzf", writers, mode)?
+        }
+    };
     let secs = t.elapsed().as_secs_f64();
+    let bytes = written_output_bytes(&res.path);
     let _ = std::fs::remove_dir_all(&out);
     Ok(H5Run {
-        mode: mode.label().to_string(),
+        mode: label,
         writers,
         secs,
         sites_per_s: sites as f64 / secs,
         datasets_per_s: (2 * n_cells) as f64 / secs,
+        bytes_per_site: bytes as f64 / sites.max(1) as f64,
+        temp_write_s,
     })
 }
 
@@ -560,6 +606,8 @@ pub struct DatasetSample {
     pub sites_per_read: f64,
     pub calls_per_read: f64,
     pub cells: usize,
+    /// Largest cell's share of the sample's sites.
+    pub max_cell_share: f64,
     pub baq_share: f64,
     /// Worker-thread seconds per read with all workers busy.
     pub thread_s_per_read: f64,
@@ -567,7 +615,7 @@ pub struct DatasetSample {
 
 /// Mapped reads per contig from the BAM index.
 fn mapped_per_contig(bam_path: &Path, contigs: &[&str]) -> Result<Vec<(String, u64, u64)>> {
-    let mut bam = bam::IndexedReader::from_path(bam_path)
+    let mut bam = crate::input::open_indexed(bam_path)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", bam_path.display()))?;
     let names: Vec<String> = bam
         .header()
@@ -627,8 +675,14 @@ fn sample_dataset(bam_path: &Path, fasta: &Path, workers: usize, target_reads: u
         .flat_map(|c| c.cells.iter())
         .map(|c| (c.cg.len() + c.ch.len()) as u64)
         .sum();
+    let mut per_cell: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for c in mem.iter().flatten().flat_map(|c| c.cells.iter()) {
+        *per_cell.entry(c.barcode.as_str()).or_default() += (c.cg.len() + c.ch.len()) as u64;
+    }
+    let max_cell = per_cell.values().copied().max().unwrap_or(0);
     let t = &r.timing;
     Ok(DatasetSample {
+        max_cell_share: max_cell as f64 / site_count.max(1) as f64,
         mapped_reads: mapped,
         sampled_reads: reads,
         sample_secs: secs,
@@ -735,6 +789,16 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         }
     };
     let inflate_share = t.read_s / t.total_s.max(1e-9);
+    // BAQ off at the knee: how much of the scaled-up throughput BAQ costs.
+    let knee_nobaq = {
+        let wins = if knee < 8 {
+            synthetic_windows(&fai, small_names, small_bp, knee)
+        } else {
+            synthetic_windows(&fai, &names, total_bp, knee)
+        };
+        let (r, _, secs) = run_extract(&syn.bam, &syn.fasta, &wins, &tune_params(false, false), knee, 1)?;
+        r.timing.records.max(1) as f64 / secs
+    };
 
     // --- Memory bandwidth.
     eprintln!("[3/5] Memory bandwidth ...");
@@ -775,11 +839,10 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         v.dedup();
         v
     };
-    h5.push(h5_run(&h5_dir, WriterMode::Thread, 4, n_cells, mean_sites)?);
+    h5.push(h5_run(&h5_dir, WriterMode::Thread, 4, n_cells, mean_sites, None)?);
     for &w in &proc_ladder {
-        h5.push(h5_run(&h5_dir, WriterMode::Process, w, n_cells, mean_sites)?);
+        h5.push(h5_run(&h5_dir, WriterMode::Process, w, n_cells, mean_sites, None)?);
     }
-    let _ = std::fs::remove_dir_all(&h5_dir);
     let best_h5 = h5
         .iter()
         .filter(|r| r.mode == "process")
@@ -790,6 +853,14 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         })
         .cloned()
         .unwrap_or_default();
+    // Same payload at the best writer count through stream mode (temp files on
+    // the temp filesystem), and a few very large cells (low cell count, deep
+    // coverage: each cell is one writer's serial work).
+    let bw = best_h5.writers.max(1);
+    let h5_stream = h5_run(&h5_dir, WriterMode::Process, bw, n_cells, mean_sites, Some(&a.temp_dir))?;
+    let (dense_cells, dense_sites) = if a.quick { (2 * bw, 300_000u32) } else { (2 * bw, 1_000_000u32) };
+    let h5_dense = h5_run(&h5_dir, WriterMode::Process, bw, dense_cells, dense_sites, None)?;
+    let _ = std::fs::remove_dir_all(&h5_dir);
 
     // --- Recommendations.
     let rec_workers = knee;
@@ -827,6 +898,12 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     if let Some(g) = smt_gain {
         let _ = writeln!(rpt, "  SMT: {} logical vs {} physical gives {:.2}x", host.nproc, host.physical_cores, g);
     }
+    let knee_baq = scaling.iter().find(|r| r.workers == knee).map(|r| r.reads_per_s).unwrap_or(best);
+    let _ = writeln!(
+        rpt,
+        "  W={knee} BAQ off: {knee_nobaq:.0} reads/s ({:.1}x BAQ on)",
+        knee_nobaq / knee_baq.max(1.0)
+    );
     let _ = writeln!(rpt, "Memory copy bandwidth: {bw1:.1} GB/s (1 thread), {bwn:.1} GB/s ({} threads)", host.nproc);
     let _ = writeln!(rpt, "Storage ({} MB probe):", size_mb);
     for f in &fs {
@@ -848,10 +925,29 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     for r in &h5 {
         let _ = writeln!(
             rpt,
-            "  {:<7} x{:<3} {:6.2} s  {:>6.1} M sites/s  {:>7.0} datasets/s",
-            r.mode, r.writers, r.secs, r.sites_per_s / 1e6, r.datasets_per_s
+            "  {:<7} x{:<3} {:6.2} s  {:>6.1} M sites/s  {:>7.0} datasets/s  {:>5.1} B/site",
+            r.mode, r.writers, r.secs, r.sites_per_s / 1e6, r.datasets_per_s, r.bytes_per_site
         );
     }
+    let _ = writeln!(
+        rpt,
+        "  stream x{:<3} {:6.2} s  {:>6.1} M sites/s  (+{:.2} s writing temp chunk files; memory mode {:.2} s)",
+        h5_stream.writers,
+        h5_stream.secs,
+        h5_stream.sites_per_s / 1e6,
+        h5_stream.temp_write_s,
+        best_h5.secs
+    );
+    let _ = writeln!(
+        rpt,
+        "  {} large cells x ~{} sites, x{}: {:6.2} s  {:>6.1} M sites/s  ({:.1} M sites/s per writer on one cell)",
+        dense_cells,
+        dense_sites,
+        h5_dense.writers,
+        h5_dense.secs,
+        h5_dense.sites_per_s / 1e6,
+        h5_dense.sites_per_s / h5_dense.writers.max(1) as f64 / 1e6
+    );
 
     let _ = writeln!(rpt, "\nLimiting factors on this machine:");
     let _ = writeln!(
@@ -938,6 +1034,33 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
             "  ({:.1} worker-us per read under full load; overhead factors fitted to one run of one dataset and not yet checked on another)",
             d.thread_s_per_read * 1e6
         );
+        // One cell is written by one writer, so the largest cell sets a floor
+        // on write time that more shards cannot lower.
+        let per_writer = h5_dense.sites_per_s / h5_dense.writers.max(1) as f64;
+        let biggest = d.max_cell_share * sites;
+        let _ = writeln!(
+            rpt,
+            "Cells: largest holds {:.1}% of sampled sites (~{:.0}M sites) -> one writer needs ~{:.1} s for it alone; {}",
+            100.0 * d.max_cell_share,
+            biggest / 1e6,
+            biggest / per_writer.max(1.0),
+            if d.cells < 2 * rec_writers {
+                format!("only {} cells: use --shards <= {} (more shards cannot help)", d.cells, (d.cells / 2).max(1))
+            } else {
+                format!("--shards {} (writers are balanced by site count)", rec_writers.max(16))
+            }
+        );
+        if let Some(o) = fs.iter().find(|f| f.role.starts_with("output")) {
+            let out_mb_s = sites * best_h5.bytes_per_site / write_s.max(1e-9) / 1e6;
+            let _ = writeln!(
+                rpt,
+                "Output: ~{:.1} GB of HDF5 (LZF) at ~{out_mb_s:.0} MB/s; output storage writes {:.0} MB/s sequential ({:.0}% of it){}",
+                sites * best_h5.bytes_per_site / 1e9,
+                o.seq_write_mb_s,
+                100.0 * out_mb_s / o.seq_write_mb_s.max(1.0),
+                if out_mb_s > 0.7 * o.seq_write_mb_s { " -> storage limits the write" } else { " -> CPU-bound, not storage" }
+            );
+        }
     }
 
     let _ = writeln!(rpt, "\nRecommended: -t {rec_workers} --decomp-threads {rec_decomp} --writer-mode process --max-writer-threads {rec_writers} (shards >= {rec_writers}); --chunk-size-mb auto");
@@ -973,6 +1096,11 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     for r in &h5 {
         let _ = writeln!(toml, "h5_{}_{}_sites_per_s = {:.0}", r.mode, r.writers, r.sites_per_s);
     }
+    let _ = writeln!(toml, "h5_stream_{}_sites_per_s = {:.0}", h5_stream.writers, h5_stream.sites_per_s);
+    let _ = writeln!(toml, "h5_stream_temp_write_s = {:.2}", h5_stream.temp_write_s);
+    let _ = writeln!(toml, "h5_large_cells_{}_sites_per_s = {:.0}", h5_dense.writers, h5_dense.sites_per_s);
+    let _ = writeln!(toml, "h5_bytes_per_site_lzf = {:.2}", best_h5.bytes_per_site);
+    let _ = writeln!(toml, "reads_per_s_w{knee}_nobaq = {knee_nobaq:.0}");
     let _ = writeln!(toml, "recommended_workers = {rec_workers}");
     let _ = writeln!(toml, "recommended_decomp_threads = {rec_decomp}");
     let _ = writeln!(toml, "recommended_writers = {rec_writers}");

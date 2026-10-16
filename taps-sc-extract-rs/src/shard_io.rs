@@ -24,7 +24,7 @@ use crate::barcode::barcode_to_shard;
 use crate::window::Window;
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const MAGIC: &[u8; 8] = b"TAPSCK01";
@@ -47,13 +47,16 @@ fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
 }
 
 
+/// `n` then `n` × (pos, t, c) little-endian u32s, read in one piece.
 fn read_sites<R: Read>(r: &mut R) -> std::io::Result<Vec<(u32, u32, u32)>> {
     let n = read_u32(r)? as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        out.push((read_u32(r)?, read_u32(r)?, read_u32(r)?));
-    }
-    Ok(out)
+    let mut raw = vec![0u8; n * 12];
+    r.read_exact(&mut raw)?;
+    let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    Ok(raw
+        .chunks_exact(12)
+        .map(|s| (le(&s[0..4]), le(&s[4..8]), le(&s[8..12])))
+        .collect())
 }
 
 pub fn shard_dir(temp_dir: &Path, shard: usize) -> PathBuf {
@@ -155,7 +158,8 @@ pub fn write_window_shards(
         let dir = shard_dir(temp_dir, s);
         fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         let path = chunk_path(temp_dir, s, window.chunk_id);
-        let mut w = BufWriter::new(
+        let mut w = BufWriter::with_capacity(
+            1 << 20,
             File::create(&path).with_context(|| format!("create {}", path.display()))?,
         );
         w.write_all(MAGIC)?;
@@ -201,8 +205,9 @@ pub struct ChunkFile {
 }
 
 pub fn read_chunk_file(path: &Path) -> Result<ChunkFile> {
-    let mut r = BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
-    read_chunk_from(&mut r)
+    // One read of the whole file; chunk files are a few MB.
+    let bytes = fs::read(path).with_context(|| format!("open {}", path.display()))?;
+    read_chunk_from(&mut bytes.as_slice())
         .with_context(|| format!("read {}", path.display()))?
         .ok_or_else(|| anyhow::anyhow!("empty chunk file {}", path.display()))
 }
@@ -258,12 +263,13 @@ pub fn read_all_chunks_from<R: Read>(r: &mut R) -> Result<Vec<ChunkFile>> {
 
 fn write_sorted_sites<W: Write>(w: &mut W, sites: &[(u32, u32, u32)]) -> std::io::Result<()> {
     write_u32(w, sites.len() as u32)?;
+    let mut raw = Vec::with_capacity(sites.len() * 12);
     for &(p, t, c) in sites {
-        write_u32(w, p)?;
-        write_u32(w, t)?;
-        write_u32(w, c)?;
+        raw.extend_from_slice(&p.to_le_bytes());
+        raw.extend_from_slice(&t.to_le_bytes());
+        raw.extend_from_slice(&c.to_le_bytes());
     }
-    Ok(())
+    w.write_all(&raw)
 }
 
 /// Serialize an in-memory chunk in the same `TAPSCK01` layout as the temp files.

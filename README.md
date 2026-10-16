@@ -75,7 +75,7 @@ taps-sc-extract --help
 taps-sc-extract --test --save-profile                     # machine only, a few minutes
 taps-sc-extract --test -b sample.srt.bam -f ref.fa -o out/   # also predict time and memory for this BAM
 ```
-The report names the limiting factor for each phase (CPU, BAM read, HDF5 write, storage) and recommends flags. `--test-quick` takes about 40 seconds.
+The report names the limiting factor for each phase (CPU, BAM read, HDF5 write, storage) and recommends flags. It probes the input, temp and output filesystems separately, measures BAQ on and off at the recommended worker count, compares memory-mode and stream-mode writing, and times a few very large cells. With `-b`, it also reports the largest cell's share of sites (one writer writes a whole cell, so that cell sets a floor on write time) and the predicted HDF5 MB/s as a share of the output disk's sequential write speed. `--test-quick` takes about 40 seconds.
 
 ### 1. Standard Parallel Run (Auto Engine: Uses Compiled Rust Core)
 ```bash
@@ -137,7 +137,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-b, --bam` | `str` | *Required* | Path to coordinate-sorted, indexed BAM (`.bam` + `.bai`). |
+| `-b, --bam` | `str` | *Required* | Coordinate-sorted alignments: BAM, CRAM (decoded against `-f`) or SAM (copied to a temporary BAM first). A missing index (`.bai`, `.csi` for contigs over 512 Mb, `.crai`) is built next to the file, or in the temp directory if that directory is read-only; the time is logged separately. CRAM decoding costs extra CPU per read. |
 | `-f, --fasta` | `str` | *Required* | Path to reference FASTA (`.fa` + `.fai`). |
 | `-o, --out` | `str` | *Required* | Output `.h5` file path or output directory (when `--shards > 1`). |
 | `-c, --chroms` | `str` | `None` | Comma-separated contigs (e.g. `chr1,chr2` or `chr19`). Default: canonical autosomes + `chrX`, `chrY`. |
@@ -152,11 +152,11 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `-t, --threads, --workers`| `int` | `24` | Number of parallel chunk worker processes (or Rayon threads in Rust). `0` = auto. |
 | `--decomp-threads` | `int` | Rust: 4 / 2 / 0 by worker count; Python: 1 | BAM BGZF decompression threads per worker (`0` = inflate on the worker thread). |
 | `--chunk-size-mb` | `int` | `10` Python / auto Rust | Genomic window size in megabases. Rust auto: about 6 windows per worker, 2–100 Mb. |
-| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). An `.h5` file name with multiple shards is written to a directory named after the file stem. |
+| `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). An `.h5` file name with multiple shards is written to a directory named after the file stem. Rust balances shards by site count (barcodes are hashed into 4 buckets per shard, and buckets are packed by size), so which `shard_XXX.h5` holds a cell differs from the Python engine; `master.h5` links every cell either way. A single cell is never split, so the largest cell sets a floor on write time. |
 | `--compression` | `str` | `gzip` Python / `lzf` Rust | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc`, `blosc-zstd`, `none`. |
 | `--max-writer-threads` | `int` | `0` | Maximum concurrent shard writers after extraction (`0` = auto: up to shard count, cores and memory; in-process writers capped at 6). |
 | `--writer-mode` | `str` | `auto` | Rust shard writers: `process` (one child per shard, default when shards > 1) or `thread` (in-process, one shared HDF5 lock). |
-| `--profile-json` | `str` | `None` | Rust: write per-phase CPU use, per-stage and per-window timings and writer memory to JSON. Adds ~5–10% to processing time. |
+| `--profile-json` | `str` | `None` | Rust: write per-phase CPU use, per-stage and per-window timings (1 in 16 reads and pileup columns are timed and scaled up) and per-shard writer reports (read, create, fill, HDF5 write seconds, bytes, peak memory) to JSON. Adds ~2% to processing time. |
 | `--test` | `flag` | `False` | Run the tuning probes instead of extracting (see Quickstart 0). `-b/-f` optional. |
 | `--test-quick` / `--save-profile` / `--test-report` | | | Shorter probes; save the machine profile for later runs on this host; also write the report to a file. |
 | `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk (equivalent to `--memory-mode memory`). |
@@ -204,8 +204,9 @@ Measured on chr1–3 before `026c52e` with the older in-process writers. Ratios 
 - The Python engine defaults to `10` Mb.
 
 ### 5. `--shards`
-- **Mechanism**: Partitions barcodes across $N$ shard files by `hash(bc) % N` and writes `master.h5` with relative `ExternalLink`s.
-- **Recommendation**: Depends on the filesystem. On local NVMe, 16 shards wrote 4.2 GB in 11–17 s against 62 s for one shard. On a server filesystem with fewer cells, more shards were much slower, so measure there (`--test` probes the output filesystem). The default stays 1 shard below 10,000 cells.
+- **Mechanism**: Writes $N$ shard files and `master.h5` with relative `ExternalLink`s. Rust hashes barcodes into 4N buckets and packs buckets into shards by site count, so a few deep cells do not land in one shard (the slowest shard sets the write time). Python assigns `md5(bc) % N`.
+- **Recommendation**: Depends on the filesystem and the cell count. On local NVMe, 16 shards wrote 4.2 GB in 11–17 s against 62 s for one shard. On a server filesystem with fewer cells, more shards were much slower, so measure there (`--test` probes the output filesystem). The default stays 1 shard below 10,000 cells.
+- **Few, deep cells** (hundreds of cells, ~1M sites each): one cell is one writer's serial work, so beyond about cells/2 shards, more shards add nothing. The run summary's `Shard writers:` line shows the sites per shard (median, max), the slowest shard, and where writer time went (read, create, fill, HDF5 write).
 
 ### 6. `--max-writer-threads` and `--writer-mode`
 - **`--writer-mode process`** (default with more than one shard): one `taps-sc-extract-rs write-shard` child per shard, up to `--max-writer-threads` at a time. Each child streams its shard one cell at a time in bounded slices, so a writer needs roughly 15–60 bytes per site of its shard.

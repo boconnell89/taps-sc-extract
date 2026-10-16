@@ -31,6 +31,12 @@ pub struct MethRec {
 
 impl MethRec {
     pub fn new(contig: &str, pos: u32, t: u32, c: u32) -> Self {
+        Self::with_chr(contig_s10(contig), pos, t, c)
+    }
+
+    /// Same as `new` with the contig name already converted (once per window).
+    #[inline]
+    pub fn with_chr(chr: FixedAscii<10>, pos: u32, t: u32, c: u32) -> Self {
         let tot = t + c;
         let pct = if tot == 0 {
             0.0
@@ -38,7 +44,7 @@ impl MethRec {
             100.0 * f64::from(c) / f64::from(tot)
         };
         Self {
-            chr: contig_s10(contig),
+            chr,
             pos: i64::from(pos),
             pct,
             t: i64::from(t),
@@ -116,6 +122,18 @@ const H5_CHUNK: usize = 65536;
 /// type-conversion and filter buffers to about 12 MB, whatever the cell size.
 const WRITE_SLICE: usize = 4 * H5_CHUNK;
 
+/// Where one shard's write time went (seconds, summed over its cells).
+#[derive(Clone, Debug, Default)]
+pub struct ShardWriteStats {
+    pub cells: usize,
+    /// Group and dataset creation (HDF5 metadata).
+    pub create_s: f64,
+    /// Expanding 12-byte sites into 48-byte `MethRec`s.
+    pub fill_s: f64,
+    /// `write_slice`: filter (compression) plus file I/O, under the HDF5 lock.
+    pub h5_write_s: f64,
+}
+
 /// Write one cell's sites from window chunks (`(contig, sites)` in chunk_id
 /// order) in `WRITE_SLICE`-record pieces. Same dataset as `write_cell_dataset`
 /// over the concatenated records.
@@ -125,25 +143,33 @@ fn write_cell_dataset_sliced(
     barcode: &str,
     parts: &[(&str, &[(u32, u32, u32)])],
     compression: H5Compression,
+    st: &mut ShardWriteStats,
 ) -> Result<()> {
     let n: usize = parts.iter().map(|(_, s)| s.len()).sum();
     if n == 0 {
         return Ok(());
     }
+    let t_create = std::time::Instant::now();
     let ds = create_cell_dataset(file, context, barcode, n, compression)?;
+    st.create_s += t_create.elapsed().as_secs_f64();
+    let t_cell = std::time::Instant::now();
+    let mut write_s = 0.0f64;
     let mut buf: Vec<MethRec> = Vec::with_capacity(n.min(WRITE_SLICE));
     let mut start = 0usize;
-    let flush = |buf: &mut Vec<MethRec>, start: &mut usize| -> Result<()> {
+    let mut flush = |buf: &mut Vec<MethRec>, start: &mut usize| -> Result<()> {
+        let t = std::time::Instant::now();
         let end = *start + buf.len();
         ds.write_slice(buf.as_slice(), *start..end)
             .map_err(|e| anyhow::anyhow!("write {context}/{barcode}/1 [{}..{end}]: {e}", *start))?;
         *start = end;
         buf.clear();
+        write_s += t.elapsed().as_secs_f64();
         Ok(())
     };
     for &(contig, sites) in parts {
+        let chr = contig_s10(contig);
         for &(pos, t, c) in sites {
-            buf.push(MethRec::new(contig, pos, t, c));
+            buf.push(MethRec::with_chr(chr, pos, t, c));
             if buf.len() == WRITE_SLICE {
                 flush(&mut buf, &mut start)?;
             }
@@ -152,6 +178,8 @@ fn write_cell_dataset_sliced(
     if !buf.is_empty() {
         flush(&mut buf, &mut start)?;
     }
+    st.h5_write_s += write_s;
+    st.fill_s += (t_cell.elapsed().as_secs_f64() - write_s).max(0.0);
     Ok(())
 }
 
@@ -252,7 +280,7 @@ pub fn write_shard_from_chunks(
     path: &Path,
     mut chunks: Vec<ChunkFile>,
     compression: H5Compression,
-) -> Result<usize> {
+) -> Result<ShardWriteStats> {
     chunks.sort_by_key(|c| c.chunk_id);
     let mut by_bc: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
     for (ci, ch) in chunks.iter().enumerate() {
@@ -268,6 +296,7 @@ pub fn write_shard_from_chunks(
     }
     let file = File::create(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
     write_version(&file)?;
+    let mut st = ShardWriteStats::default();
     let mut bcs: Vec<&str> = by_bc.keys().copied().collect();
     bcs.sort_unstable();
     for bc in &bcs {
@@ -282,11 +311,12 @@ pub fn write_shard_from_chunks(
                 })
                 .collect()
         };
-        write_cell_dataset_sliced(&file, "CG", bc, &parts(true), compression)?;
-        write_cell_dataset_sliced(&file, "CH", bc, &parts(false), compression)?;
+        write_cell_dataset_sliced(&file, "CG", bc, &parts(true), compression, &mut st)?;
+        write_cell_dataset_sliced(&file, "CH", bc, &parts(false), compression, &mut st)?;
     }
     file.flush().ok();
-    Ok(bcs.len())
+    st.cells = bcs.len();
+    Ok(st)
 }
 
 /// How shard files are written when there is more than one shard.
@@ -317,8 +347,8 @@ impl WriterMode {
 
 /// Where a `write-shard` child gets its chunks.
 enum ShardInput {
-    /// Stream-mode temp directory `temp_dir/shard_XXX/`.
-    Dir(PathBuf),
+    /// Stream-mode temp bucket directories `temp_dir/shard_XXX/` for this shard.
+    Dirs(Vec<PathBuf>),
     /// Memory-mode payloads, sent on the child's stdin.
     Chunks(Vec<ChunkFile>),
 }
@@ -327,14 +357,120 @@ enum ShardInput {
 #[derive(Clone, Debug, Default)]
 pub struct WriterReport {
     pub shard: usize,
+    /// Written by a `write-shard` child process (else in the extract process).
+    pub child: bool,
+    pub cells: usize,
     pub sites: u64,
+    /// Reading the shard's chunks (temp files or stdin).
+    pub read_s: f64,
+    /// Writing the shard file: create + fill + h5_write.
+    pub write_s: f64,
+    pub create_s: f64,
+    pub fill_s: f64,
+    pub h5_write_s: f64,
+    /// Size of the finished shard file.
+    pub bytes: u64,
     pub peak_rss_mb: f64,
+}
+
+impl WriterReport {
+    /// Report for a shard written in this process.
+    fn local(shard: usize, path: &Path, sites: u64, read_s: f64, write_s: f64, st: &ShardWriteStats) -> Self {
+        Self {
+            shard,
+            child: false,
+            cells: st.cells,
+            sites,
+            read_s,
+            write_s,
+            create_s: st.create_s,
+            fill_s: st.fill_s,
+            h5_write_s: st.h5_write_s,
+            bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            peak_rss_mb: 0.0,
+        }
+    }
+
+    /// The `write-shard` child's summary line (parsed back by the parent).
+    pub fn child_line(&self, path: &Path) -> String {
+        format!(
+            "HDF5 shard {:03} cells={} sites={} read={:.3}s write={:.3}s create={:.3}s fill={:.3}s h5write={:.3}s bytes={} peak_rss={:.0}MB -> {}",
+            self.shard,
+            self.cells,
+            self.sites,
+            self.read_s,
+            self.write_s,
+            self.create_s,
+            self.fill_s,
+            self.h5_write_s,
+            self.bytes,
+            self.peak_rss_mb,
+            path.display()
+        )
+    }
+}
+
+fn chunk_sites(chunks: &[ChunkFile]) -> u64 {
+    chunks
+        .iter()
+        .flat_map(|c| c.cells.iter())
+        .map(|cell| (cell.cg.len() + cell.ch.len()) as u64)
+        .sum()
+}
+
+/// Read and write one shard in this process, timed.
+pub fn write_shard_timed(shard: usize, path: &Path, input: impl FnOnce() -> Result<Vec<ChunkFile>>, compression: H5Compression) -> Result<WriterReport> {
+    let t0 = std::time::Instant::now();
+    let chunks = input()?;
+    let read_s = t0.elapsed().as_secs_f64();
+    let sites = chunk_sites(&chunks);
+    let t1 = std::time::Instant::now();
+    let st = write_shard_from_chunks(path, chunks, compression)?;
+    Ok(WriterReport::local(shard, path, sites, read_s, t1.elapsed().as_secs_f64(), &st))
+}
+
+/// One line on the writers: per-shard spread (the slowest shard sets the
+/// write wall time), where write time went, `master.h5` time.
+pub fn writer_summary_line(reports: &[WriterReport], master_s: f64) -> Option<String> {
+    if reports.is_empty() {
+        return None;
+    }
+    let med = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    let slow = reports
+        .iter()
+        .max_by(|a, b| (a.read_s + a.write_s).partial_cmp(&(b.read_s + b.write_s)).unwrap_or(std::cmp::Ordering::Equal))?;
+    let sites: Vec<f64> = reports.iter().map(|r| r.sites as f64).collect();
+    let max_sites = sites.iter().cloned().fold(0.0, f64::max);
+    let sum = |f: fn(&WriterReport) -> f64| reports.iter().map(f).sum::<f64>();
+    let bytes: u64 = reports.iter().map(|r| r.bytes).sum();
+    let busy = sum(|r| r.read_s + r.write_s);
+    Some(format!(
+        "Shard writers:         {} shards | sites/shard median {:.0}, max {:.0} ({:.2}x) | shard time median {:.2}s, max {:.2}s (shard {:03}, {} cells) | \
+         time in read {:.0}%, create {:.0}%, fill {:.0}%, h5write {:.0}% | {:.1} MB/s per shard | master.h5 {:.2}s",
+        reports.len(),
+        med(sites.clone()),
+        max_sites,
+        if med(sites.clone()) > 0.0 { max_sites / med(sites) } else { 0.0 },
+        med(reports.iter().map(|r| r.read_s + r.write_s).collect()),
+        slow.read_s + slow.write_s,
+        slow.shard,
+        slow.cells,
+        100.0 * sum(|r| r.read_s) / busy.max(1e-9),
+        100.0 * sum(|r| r.create_s) / busy.max(1e-9),
+        100.0 * sum(|r| r.fill_s) / busy.max(1e-9),
+        100.0 * sum(|r| r.h5_write_s) / busy.max(1e-9),
+        bytes as f64 / 1e6 / sum(|r| r.write_s).max(1e-9),
+        master_s
+    ))
 }
 
 /// Peak RSS of `n_writers` concurrent children, bounded above by the sum of the
 /// `n_writers` largest child peaks.
 pub fn concurrent_writer_peak_mb(reports: &[WriterReport], n_writers: usize) -> f64 {
-    let mut peaks: Vec<f64> = reports.iter().map(|r| r.peak_rss_mb).collect();
+    let mut peaks: Vec<f64> = reports.iter().filter(|r| r.child).map(|r| r.peak_rss_mb).collect();
     peaks.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     peaks.iter().take(n_writers.max(1)).sum()
 }
@@ -342,13 +478,24 @@ pub fn concurrent_writer_peak_mb(reports: &[WriterReport], n_writers: usize) -> 
 fn parse_writer_line(shard: usize, stderr: &str) -> WriterReport {
     let mut rep = WriterReport {
         shard,
+        child: true,
         ..Default::default()
     };
+    let secs = |v: &str| v.strip_suffix('s').and_then(|x| x.parse().ok()).unwrap_or(0.0);
     for tok in stderr.split_whitespace() {
-        if let Some(v) = tok.strip_prefix("sites=") {
-            rep.sites = v.parse().unwrap_or(0);
-        } else if let Some(v) = tok.strip_prefix("peak_rss=").and_then(|v| v.strip_suffix("MB")) {
-            rep.peak_rss_mb = v.parse().unwrap_or(0.0);
+        if let Some((k, v)) = tok.split_once('=') {
+            match k {
+                "cells" => rep.cells = v.parse().unwrap_or(0),
+                "sites" => rep.sites = v.parse().unwrap_or(0),
+                "read" => rep.read_s = secs(v),
+                "write" => rep.write_s = secs(v),
+                "create" => rep.create_s = secs(v),
+                "fill" => rep.fill_s = secs(v),
+                "h5write" => rep.h5_write_s = secs(v),
+                "bytes" => rep.bytes = v.parse().unwrap_or(0),
+                "peak_rss" => rep.peak_rss_mb = v.strip_suffix("MB").and_then(|x| x.parse().ok()).unwrap_or(0.0),
+                _ => {}
+            }
         }
     }
     rep
@@ -378,8 +525,11 @@ fn run_shard_writer_process(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let chunks = match input {
-        ShardInput::Dir(d) => {
-            cmd.arg("--chunk-dir").arg(d).stdin(Stdio::null());
+        ShardInput::Dirs(dirs) => {
+            for d in dirs {
+                cmd.arg("--chunk-dir").arg(d);
+            }
+            cmd.stdin(Stdio::null());
             None
         }
         ShardInput::Chunks(c) => {
@@ -471,26 +621,100 @@ pub fn write_master_h5(out_dir: &Path, n_shards: usize) -> Result<std::path::Pat
     Ok(master_path)
 }
 
-/// Read every chunk file of one stream-mode shard, then delete the directory.
-pub fn read_shard_temp_chunks(dir: &Path) -> Result<Vec<ChunkFile>> {
+/// Read every chunk file of a shard's stream-mode bucket directories, then
+/// delete them.
+pub fn read_shard_temp_chunks(dirs: &[PathBuf]) -> Result<Vec<ChunkFile>> {
     let mut chunks = Vec::new();
-    if dir.is_dir() {
-        for p in list_chunk_files(dir)? {
-            chunks.push(read_chunk_file(&p)?);
+    for dir in dirs {
+        if dir.is_dir() {
+            for p in list_chunk_files(dir)? {
+                chunks.push(read_chunk_file(&p)?);
+            }
+            let _ = std::fs::remove_dir_all(dir);
         }
-        let _ = std::fs::remove_dir_all(dir);
     }
     Ok(chunks)
 }
 
+/// Hash buckets per output shard. Barcodes are hashed into
+/// `n_shards * BUCKETS_PER_SHARD` buckets during extraction; `pack_buckets`
+/// then deals whole buckets to shards by size, so a few large cells do not
+/// pile into one shard (the slowest shard sets the write time).
+pub const BUCKETS_PER_SHARD: usize = 4;
+
+pub fn bucket_count(n_shards: usize) -> usize {
+    if n_shards <= 1 {
+        1
+    } else {
+        n_shards * BUCKETS_PER_SHARD
+    }
+}
+
+/// Assign buckets to `n_shards` shards, largest first to the lightest shard
+/// (LPT). Each shard's bucket list is ascending. Deterministic for equal input.
+pub fn pack_buckets(weights: &[u64], n_shards: usize) -> Vec<Vec<usize>> {
+    let n_shards = n_shards.max(1);
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
+    let mut load = vec![0u64; n_shards];
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_shards];
+    for b in order {
+        let s = (0..n_shards).min_by_key(|&s| (load[s], s)).expect("n_shards > 0");
+        load[s] += weights[b];
+        groups[s].push(b);
+    }
+    for g in &mut groups {
+        g.sort_unstable();
+    }
+    groups
+}
+
+/// Sites per in-memory bucket.
+pub fn bucket_sites(per_bucket: &[Vec<ChunkFile>]) -> Vec<u64> {
+    per_bucket.iter().map(|v| chunk_sites(v)).collect()
+}
+
+/// Bytes of chunk files per stream-mode bucket directory.
+pub fn bucket_bytes(temp_dir: &Path, n_buckets: usize) -> Vec<u64> {
+    (0..n_buckets)
+        .map(|b| {
+            std::fs::read_dir(shard_dir(temp_dir, b))
+                .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Concatenate in-memory buckets into shards.
+pub fn group_buckets(per_bucket: Vec<Vec<ChunkFile>>, groups: &[Vec<usize>]) -> Vec<Vec<ChunkFile>> {
+    let mut slots: Vec<Option<Vec<ChunkFile>>> = per_bucket.into_iter().map(Some).collect();
+    groups
+        .iter()
+        .map(|g| g.iter().flat_map(|&b| slots[b].take().unwrap_or_default()).collect())
+        .collect()
+}
+
 fn assemble_one_shard_from_temp(
-    temp_dir: &Path,
+    dirs: Vec<PathBuf>,
     shard: usize,
     shard_h5: &Path,
     compression: H5Compression,
-) -> Result<usize> {
-    let chunks = read_shard_temp_chunks(&shard_dir(temp_dir, shard))?;
-    write_shard_from_chunks(shard_h5, chunks, compression)
+) -> Result<WriterReport> {
+    write_shard_timed(shard, shard_h5, || read_shard_temp_chunks(&dirs), compression)
+}
+
+/// `master.h5` and the seconds it took.
+fn timed_master(dir: &Path, n_shards: usize) -> Result<(PathBuf, f64)> {
+    let t = std::time::Instant::now();
+    let p = write_master_h5(dir, n_shards)?;
+    Ok((p, t.elapsed().as_secs_f64()))
+}
+
+/// Shard files written, per-shard reports, and seconds spent on `master.h5`.
+pub struct HdfOutput {
+    pub path: PathBuf,
+    pub reports: Vec<WriterReport>,
+    pub master_s: f64,
 }
 
 fn is_h5_filename(path: &Path) -> bool {
@@ -590,29 +814,33 @@ pub fn written_output_bytes(h5_path: &Path) -> u64 {
     total
 }
 
-/// Write `shard_XXX.h5` (+ `master.h5` if `n_shards > 1`) from stream temp chunks.
+/// Write `shard_XXX.h5` (+ `master.h5` if more than one shard) from stream
+/// temp chunks. `groups[s]` lists the bucket directories shard `s` reads.
 pub fn assemble_hdf5_from_temp(
     temp_dir: &Path,
     out: &Path,
-    n_shards: usize,
+    groups: &[Vec<usize>],
     compression: H5Compression,
     compression_name: &str,
     max_writers: usize,
     mode: WriterMode,
-) -> Result<(PathBuf, Vec<WriterReport>)> {
+) -> Result<HdfOutput> {
     std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
-    let n_shards = n_shards.max(1);
+    let n_shards = groups.len().max(1);
     let n_writers = n_shards.min(max_writers.max(1));
+    let dirs = |s: usize| -> Vec<PathBuf> {
+        groups.get(s).map(|g| g.iter().map(|&b| shard_dir(temp_dir, b)).collect()).unwrap_or_default()
+    };
     match resolve_output_target(out, n_shards)? {
         OutputTarget::File(path) => {
-            assemble_one_shard_from_temp(temp_dir, 0, &path, compression)?;
-            Ok((path, Vec::new()))
+            let rep = assemble_one_shard_from_temp(dirs(0), 0, &path, compression)?;
+            Ok(HdfOutput { path, reports: vec![rep], master_s: 0.0 })
         }
         OutputTarget::ShardDir(dir) => {
             let reports = match mode {
                 WriterMode::Process => {
                     let inputs = (0..n_shards)
-                        .map(|s| (s, ShardInput::Dir(shard_dir(temp_dir, s))))
+                        .map(|s| (s, ShardInput::Dirs(dirs(s))))
                         .collect();
                     write_shards_with_processes(&dir, inputs, compression_name, n_writers)?
                 }
@@ -622,19 +850,21 @@ pub fn assemble_hdf5_from_temp(
                         .thread_name(|i| format!("taps-h5-{i}"))
                         .build()
                         .context("HDF5 writer pool")?;
-                    let temp_dir = temp_dir.to_path_buf();
                     pool.install(|| {
-                        (0..n_shards).into_par_iter().try_for_each(|s| {
-                            let p = dir.join(format!("shard_{s:03}.h5"));
-                            let n = assemble_one_shard_from_temp(&temp_dir, s, &p, compression)?;
-                            eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
-                            Ok::<(), anyhow::Error>(())
-                        })
-                    })?;
-                    Vec::new()
+                        (0..n_shards)
+                            .into_par_iter()
+                            .map(|s| {
+                                let p = dir.join(format!("shard_{s:03}.h5"));
+                                let rep = assemble_one_shard_from_temp(dirs(s), s, &p, compression)?;
+                                eprintln!("{}", rep.child_line(&p));
+                                Ok(rep)
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })?
                 }
             };
-            Ok((write_master_h5(&dir, n_shards)?, reports))
+            let (path, master_s) = timed_master(&dir, n_shards)?;
+            Ok(HdfOutput { path, reports, master_s })
         }
     }
 }
@@ -646,15 +876,15 @@ pub fn assemble_hdf5_from_memory(
     compression_name: &str,
     max_writers: usize,
     mode: WriterMode,
-) -> Result<(PathBuf, Vec<WriterReport>)> {
+) -> Result<HdfOutput> {
     std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE");
     let n_shards = per_shard.len().max(1);
     let n_writers = n_shards.min(max_writers.max(1));
     match resolve_output_target(out, n_shards)? {
         OutputTarget::File(path) => {
             let chunks = per_shard.into_iter().next().unwrap_or_default();
-            write_shard_from_chunks(&path, chunks, compression)?;
-            Ok((path, Vec::new()))
+            let rep = write_shard_timed(0, &path, || Ok(chunks), compression)?;
+            Ok(HdfOutput { path, reports: vec![rep], master_s: 0.0 })
         }
         OutputTarget::ShardDir(dir) => {
             let reports = match mode {
@@ -673,17 +903,21 @@ pub fn assemble_hdf5_from_memory(
                         .build()
                         .context("HDF5 writer pool")?;
                     pool.install(|| {
-                        per_shard.into_par_iter().enumerate().try_for_each(|(s, v)| {
-                            let p = dir.join(format!("shard_{s:03}.h5"));
-                            let n = write_shard_from_chunks(&p, v, compression)?;
-                            eprintln!("HDF5 shard {s:03} cells={n} -> {}", p.display());
-                            Ok::<(), anyhow::Error>(())
-                        })
-                    })?;
-                    Vec::new()
+                        per_shard
+                            .into_par_iter()
+                            .enumerate()
+                            .map(|(s, v)| {
+                                let p = dir.join(format!("shard_{s:03}.h5"));
+                                let rep = write_shard_timed(s, &p, || Ok(v), compression)?;
+                                eprintln!("{}", rep.child_line(&p));
+                                Ok(rep)
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })?
                 }
             };
-            Ok((write_master_h5(&dir, n_shards)?, reports))
+            let (path, master_s) = timed_master(&dir, n_shards)?;
+            Ok(HdfOutput { path, reports, master_s })
         }
     }
 }
@@ -692,6 +926,23 @@ pub fn assemble_hdf5_from_memory(
 mod tests {
     use super::*;
     use crate::shard_io::ChunkCell;
+
+    #[test]
+    fn pack_buckets_balances_and_covers_all() {
+        assert_eq!(bucket_count(1), 1);
+        assert_eq!(bucket_count(8), 8 * BUCKETS_PER_SHARD);
+        let w = [90u64, 10, 50, 40, 30, 30, 20, 0];
+        let g = pack_buckets(&w, 3);
+        let mut all: Vec<usize> = g.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..w.len()).collect::<Vec<_>>());
+        let loads: Vec<u64> = g.iter().map(|b| b.iter().map(|&i| w[i]).sum()).collect();
+        assert_eq!(loads.iter().sum::<u64>(), 270);
+        assert!(*loads.iter().max().unwrap() <= 90, "{loads:?}");
+        assert!(g.iter().all(|b| b.windows(2).all(|p| p[0] < p[1])));
+        assert_eq!(pack_buckets(&w, 3), g);
+        assert_eq!(pack_buckets(&[5], 1), vec![vec![0]]);
+    }
 
     #[test]
     fn h5_filename_with_multiple_shards_uses_stem_directory() {
@@ -761,7 +1012,7 @@ mod tests {
         let whole = dir.join("whole.h5");
         write_shard_file(&whole, &records_from_chunks(&ordered), H5Compression::Lzf).unwrap();
         let sliced = dir.join("sliced.h5");
-        assert_eq!(write_shard_from_chunks(&sliced, chunks, H5Compression::Lzf).unwrap(), 2);
+        assert_eq!(write_shard_from_chunks(&sliced, chunks, H5Compression::Lzf).unwrap().cells, 2);
         let (fw, fs) = (File::open(&whole).unwrap(), File::open(&sliced).unwrap());
         for name in ["CG/big/1", "CH/big/1", "CG/small/1"] {
             let a: Vec<MethRec> = fw.dataset(name).unwrap().read_raw().unwrap();

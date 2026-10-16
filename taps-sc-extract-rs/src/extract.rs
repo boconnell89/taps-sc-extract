@@ -250,6 +250,9 @@ extern "C" {
     fn bam_plp_init_overlaps(iter: htslib::bam_plp_t) -> std::os::raw::c_int;
 }
 
+/// `--profile-json` times one record (and one pileup column) in this many.
+const PROFILE_STRIDE: u64 = 16;
+
 fn accept_record(
     rec: &mut Record,
     params: &ExtractParams,
@@ -432,13 +435,16 @@ pub fn process_window(
         }
     };
 
-    // Calling time, accumulated per column only when profiling.
+    // Calling time when profiling: every PROFILE_STRIDE-th column is timed and
+    // scaled up, so the clock is not read twice per column (that alone cost
+    // ~70% extra wall time on a 64-core server).
     let call_ns = Cell::new(0u64);
+    let n_col = Cell::new(0u64);
     let mut consume_column = |pos: u32, n_plp: i32, col: *const htslib::bam_pileup1_t| {
-        if profile {
+        if profile && n_col.replace(n_col.get() + 1) % PROFILE_STRIDE == 0 {
             let t = Instant::now();
             consume_column(pos, n_plp, col);
-            call_ns.set(call_ns.get() + t.elapsed().as_nanos() as u64);
+            call_ns.set(call_ns.get() + t.elapsed().as_nanos() as u64 * PROFILE_STRIDE);
         } else {
             consume_column(pos, n_plp, col);
         }
@@ -476,16 +482,24 @@ pub fn process_window(
         d
     };
     let mut plp_s = 0.0f64;
+    // Per-record stage times: every PROFILE_STRIDE-th record, scaled up.
+    let scale = PROFILE_STRIDE as f64;
+    let mut n_rec = 0u64;
     loop {
+        let sample = profile && n_rec % PROFILE_STRIDE == 0;
+        n_rec += 1;
+        if sample {
+            lap(true);
+        }
         let got = bam.read(&mut rec);
-        timing.read_s += lap(profile);
+        timing.read_s += lap(sample) * scale;
         match got {
             None => break,
             Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
             Some(Ok(())) => {
                 timing.records += 1;
                 let keep = accept_record(&mut rec, params, baq_ptr, baq_len, whitelist);
-                timing.baq_s += lap(profile);
+                timing.baq_s += lap(sample) * scale;
                 if !keep {
                     continue;
                 }
@@ -494,9 +508,12 @@ pub fn process_window(
                     anyhow::bail!("bam_plp_push failed");
                 }
                 drain_ready(plp, &mut consume_column)?;
-                plp_s += lap(profile);
+                plp_s += lap(sample) * scale;
             }
         }
+    }
+    if profile {
+        lap(true);
     }
     if unsafe { htslib::bam_plp_push(plp, std::ptr::null()) } < 0 {
         anyhow::bail!("bam_plp_push(EOF) failed");
@@ -610,7 +627,7 @@ pub struct BamTraffic {
 }
 
 pub fn estimate_bam_traffic(bam_path: &Path, contigs: &[&str]) -> Result<BamTraffic> {
-    let mut bam = IndexedReader::from_path(bam_path)
+    let mut bam = crate::input::open_indexed(bam_path)
         .map_err(|e| anyhow::anyhow!("open BAM for idxstats {}: {e}", bam_path.display()))?;
     let stats = bam
         .index_stats()
@@ -650,7 +667,7 @@ pub fn estimate_bam_traffic(bam_path: &Path, contigs: &[&str]) -> Result<BamTraf
 }
 
 pub fn open_bam(path: &Path, decomp_threads: usize) -> Result<IndexedReader> {
-    let mut bam = IndexedReader::from_path(path)
+    let mut bam = crate::input::open_indexed(path)
         .map_err(|e| anyhow::anyhow!("open BAM {}: {e}", path.display()))?;
     if decomp_threads > 0 {
         bam.set_threads(decomp_threads)

@@ -305,3 +305,45 @@ Full numbers: [`nvme-profiling-2026-10-15.md`](nvme-profiling-2026-10-15.md). Wo
 - Both engines read a complexity file (`rank barcode total_reads unique_reads percent`, whitespace-separated, optional header, `.gz` accepted) and keep barcodes whose unique-read count (column 4) is within the inclusive bounds. With `--whitelist` too, a cell must pass both. A warning is printed when no read matches the filter (for example a barcode format that differs from the QNAME prefix).
 - The filter acts at call time, the same place as the whitelist, so kept cells' calls equal an unfiltered run. Rust also skips BAQ for reads of filtered cells. They are still pushed into the pileup, so depth caps and overlap pairing are unchanged.
 - Tests: Rust and Python unit tests (bounds, header, short rows, `.gz`, intersection); chr19 BAQ-on filtered run equals the frozen reference on kept cells; chr19 `--no-baq` filtered Rust equals Python on kept cells.
+
+## 2026-10-15 — Write path for few, deep cells; input handling; `--test` additions
+
+Prompted by a 64-core run (454 cells, 56.5M reads, 422M sites): 2.9 s HDF5 write with LZF, about 9 cores busy while writing, and 64 writers no faster than 32. Plan reviewed by Grok 4.6 and Gemini 3.8 Flash; claims below were checked against the source and by measurement.
+
+**Test data.** `bigcell_450.bam`: the workstation BAM with its 7,351 barcodes merged round-robin into 450 cells, about 1.9M sites per cell on average. The largest merged cell has 37.8M sites. Mates share a QNAME, so pairs stay together. Calls differ from the original by 240 CG positions because overlap clipping picks the mate by QNAME hash. Rebuild it with:
+  ```bash
+  samtools view -h -@4 5base_ucbTn5_sp2.srt.bam | mawk 'BEGIN{OFS="\t"} /^@/{print;next} {i=index($1,":"); bc=substr($1,1,i-1); if(!(bc in m)){m[bc]=sprintf("CELL%03d", n%450); n++} $1=m[bc] substr($1,i); print}' | samtools view -b -@8 -o bigcell_450.bam - && samtools index bigcell_450.bam
+  ```
+
+Balanced and hash-sharded outputs are identical per cell (701.7M sites over 900 datasets), and Amethyst loads the balanced `master.h5`.
+
+**Writer instrumentation.** Each shard reports cells, sites, read / create / fill / HDF5-write seconds, bytes and peak RSS. The run prints a `Shard writers:` line (sites per shard median and max, slowest shard, time split, `master.h5` time), and `--profile-json` has the per-shard fields and `master_h5_s`.
+
+**Measured on the 450-cell BAM** (T=32, memory mode, LZF, 16-core workstation):
+
+| | 32 shards | 16 shards |
+|---|---:|---:|
+| Before: write s, max/median sites per shard | 11.9 s, 2.60× | 13.9 s, 2.14× |
+| Writer time: read / fill / HDF5 write | 37% / 11% / 51% | 30% / 15% / 55% |
+| After balancing + bulk chunk I/O: write s, max/median | 12.5 s, 2.27× (one 37.8M-site cell) | 14.1 s, 1.08× |
+
+- **Hash skew was real.** With hundreds of cells, `md5 % N` left the busiest shard at 2–2.6× the median, and the slowest shard sets the write time. Shards are now balanced: barcodes hash into 4 buckets per shard during extraction, and buckets are packed into shards by site count (memory mode) or temp-file bytes (stream mode). A cell is never split, so the largest cell is a floor; at 32 shards here that floor (one 37.8M-site cell) is what remains.
+- **On this 16-core box the write is CPU-bound in total.** With every writer busy, wall time did not move. On the 64-core server, where writers were idle most of the write, balancing should shorten the write; that needs a rerun there.
+- **Chunk-site encoding** now reads and writes each cell's sites in one block instead of three 4-byte calls per site. Stream temp files are read whole and written with 1 MB buffers. Writer read share fell from 37% to 22–25%.
+- **Contig name** is converted once per window instead of once per site.
+- **Larger HDF5 chunks: rejected.** 262,144-record chunks (same slice memory) wrote in 14.7 s LZF / 17.3 s Blosc against 13.4 / 15.4 s at 65,536, with the same sizes. Amethyst's `getGeneM` reads gene-sized slices (`h5read(start=, count=)`), and every slice decompresses whole chunks, so bigger chunks would also slow Amethyst. `H5_CHUNK` stays 65,536.
+- **`--min-mapq 0` skip: not done.** The check is one `u8` compare per read.
+- **Integer `pct`: rejected.** The Amethyst dtype has `pct` as `<f8`.
+
+**`--profile-json` overhead.** It read the clock around every record stage and every pileup column; the 64-core run took 12 s with it against 7.2 s without. Now 1 in 16 records and columns are timed and scaled up: 41.5 s → 42.2 s on the workstation BAM, and stage sums still add up to window totals (1,250 of 1,251 worker-seconds). Check `/sys/devices/system/clocksource/clocksource0/current_clocksource` on servers; anything other than `tsc` makes each clock read a system call.
+
+**Inputs (both engines).** A missing `.bai` (`.csi` if a contig is ≥ 2^29 bp) or `.crai` is built next to the file, or in a temp directory when that directory is read-only. CRAM decodes against `-f`. Plain SAM is copied to a temporary BAM and must be coordinate-sorted. Rust: `src/input.rs`, through which every reader opens. Python: `taps_sc_extract/inputs.py`. On a chr19 slice, unindexed BAM, read-only BAM, SAM and CRAM gave identical calls to the indexed BAM in both engines; an unsorted SAM fails with a `samtools sort` hint.
+
+**`--test` additions.**
+- BAQ on vs off at the recommended worker count (workstation: 6.3× more reads/s with BAQ off at W=32).
+- Stream-mode write through the temp filesystem vs memory mode.
+- A few very large cells at the best writer count (per-writer sites/s on one cell).
+- Output bytes per site, and with `-b`: the largest cell's share of sites and its write-time floor, the shard advice that follows from the cell count, and the predicted HDF5 MB/s as a share of the output disk's sequential write speed. On `bigcell_450.bam` it predicted the largest cell at ~40M sites (actual 37.8M).
+
+**BAQ.** Python never runs BAQ; Rust runs htslib's by default, like asTair. On chr19 htslib BAQ lowers methylated CpG calls by 3.0% and unmethylated by 0.4% (CpG 67.07% → 66.48%; full genome 71.54% → 70.86%). In TAPS a methylated C reads as T, a mismatch BAQ treats as possible misalignment. Two TAPS-aware variants were tried on chr19 at the same cost as htslib BAQ: masking the convertible base to N (C on OT reads, G on OB reads) gave 67.24%; a 3-letter version (ref and read C→T on OT, G→A on OB) gave 67.24%. Both remove the methylation-specific loss; t calls still drop ~0.8%. Not shipped: choosing the default is a user decision. The experiment is kept as `scratch/baq-taps-aware-experiment.diff` (not in git). BAQ output is the same with and without FMA contraction (`-ffp-contract=off`, chr19 identical, 16 vs 0 FMA instructions in `probaln.o`).
+- Faster bit-exact BAQ: no faster drop-in exists (newest htslib still uses scalar double `probaln_glocal`). The realistic options are reusing the HMM's per-read buffers (it zeroes ~120 KB per read; a few percent to ~15% of BAQ) or running several reads in SIMD lanes with the operation order unchanged (larger gain, much more work). Neither is started.

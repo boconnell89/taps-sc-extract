@@ -33,6 +33,7 @@ import numpy as np
 import pysam
 
 from .barcode import load_cell_filter
+from .inputs import AlignmentSource, prepare_alignment
 from .calling import (
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
@@ -146,7 +147,7 @@ _worker_params: Optional[Dict[str, Any]] = None
 
 
 def _init_worker(
-    bam_path: str,
+    source: AlignmentSource,
     fasta_path: str,
     whitelist: Optional[Set[str]],
     temp_dir: Optional[str],
@@ -155,7 +156,7 @@ def _init_worker(
     """Initialize worker process with clean private file handles."""
     global _worker_bam, _worker_fai, _worker_whitelist, _worker_temp_dir, _worker_params
     decomp_threads = params.get("decomp_threads", 1)
-    _worker_bam = pysam.AlignmentFile(bam_path, "rb", threads=decomp_threads)
+    _worker_bam = source.open(threads=decomp_threads)
     _worker_fai = FastFaiReader(fasta_path)
     _worker_whitelist = whitelist
     _worker_temp_dir = temp_dir
@@ -582,7 +583,9 @@ def extract_methylation_parallel(
         whitelist_path, complexity_path, min_complexity, max_complexity
     )
 
-    bam = pysam.AlignmentFile(bam_path, "rb")
+    # Builds a missing index / converts SAM; keep input_tmp alive for the run.
+    source, input_tmp = prepare_alignment(bam_path, fasta_path)
+    bam = source.open()
     bam_contigs = set(bam.references)
     if chroms is None:
         target_contigs = [c for c in CANONICAL_CONTIGS if c in bam_contigs]
@@ -672,7 +675,7 @@ def extract_methylation_parallel(
         with ctx.Pool(
             processes=n_workers,
             initializer=_init_worker,
-            initargs=(bam_path, fasta_path, whitelist, actual_temp_dir, worker_params),
+            initargs=(source, fasta_path, whitelist, actual_temp_dir, worker_params),
         ) as pool:
             for result in pool.imap_unordered(_process_chunk, chunks, chunksize=1):
                 chunk_id, contig, start, end, shard_payload, chunk_stats = result

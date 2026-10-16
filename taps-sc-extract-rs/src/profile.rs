@@ -53,6 +53,7 @@ pub struct RunProfile<'a> {
     pub result: &'a WindowResult,
     pub windows: &'a [Window],
     pub writer_reports: &'a [WriterReport],
+    pub master_s: f64,
     pub peak_rss_mb: f64,
     pub writer_peak_mb: f64,
 }
@@ -127,12 +128,12 @@ pub fn write_profile_json(path: &Path, p: &RunProfile) -> Result<()> {
         );
         o.push_str(if i + 1 < wt.len() { ",\n" } else { "\n" });
     }
-    o.push_str("  ],\n  \"writers\": [\n");
+    let _ = write!(o, "  ],\n  \"master_h5_s\": {:.4},\n  \"writers\": [\n", p.master_s);
     for (i, r) in p.writer_reports.iter().enumerate() {
         let _ = write!(
             o,
-            "    {{\"shard\": {}, \"sites\": {}, \"peak_rss_mb\": {:.1}}}",
-            r.shard, r.sites, r.peak_rss_mb
+            "    {{\"shard\": {}, \"child\": {}, \"cells\": {}, \"sites\": {}, \"read_s\": {:.4}, \"write_s\": {:.4}, \"create_s\": {:.4}, \"fill_s\": {:.4}, \"h5_write_s\": {:.4}, \"bytes\": {}, \"peak_rss_mb\": {:.1}}}",
+            r.shard, r.child, r.cells, r.sites, r.read_s, r.write_s, r.create_s, r.fill_s, r.h5_write_s, r.bytes, r.peak_rss_mb
         );
         o.push_str(if i + 1 < p.writer_reports.len() { ",\n" } else { "\n" });
     }

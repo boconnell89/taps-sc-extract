@@ -17,6 +17,7 @@ import numpy as np
 import pysam
 
 from .barcode import extract_barcode, load_cell_filter
+from .inputs import prepare_alignment
 from .calling import (
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
@@ -85,7 +86,9 @@ def extract_methylation(
     )
 
     # Open BAM and FASTA
-    bam = pysam.AlignmentFile(bam_path, "rb")
+    # Builds a missing index / converts SAM; keep input_tmp alive for the run.
+    source, input_tmp = prepare_alignment(bam_path, fasta_path)
+    bam = source.open()
     fasta = pysam.FastaFile(fasta_path)
 
     # Determine contigs to process

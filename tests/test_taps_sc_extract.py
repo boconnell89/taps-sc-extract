@@ -468,6 +468,88 @@ def test_chr19_rust_matches_python_per_cell(chr19_python_run, tmp_path):
         assert not diff, f"{ctx}: {len(diff)} (cell, pos) differ from Python, e.g. {sorted(diff)[:3]}"
 
 
+@pytest.fixture(scope="module")
+def chr19_slice_inputs(tmp_path_factory):
+    """chr19:5.0-6.0 Mb of the test BAM as an unindexed BAM, a read-only copy,
+    plain SAM, unindexed CRAM, an unsorted SAM, and an indexed reference BAM."""
+    _require(CHR19_BAM, CHR19_FASTA)
+    d = tmp_path_factory.mktemp("inputs")
+    with pysam.AlignmentFile(CHR19_BAM, "rb") as src:
+        recs = list(src.fetch("chr19", 5_000_000, 6_000_000))
+        header = src.header
+    paths = {"bam": d / "noidx.bam", "sam": d / "plain.sam", "cram": d / "x.cram",
+             "unsorted": d / "unsorted.sam", "ref": d / "ref.bam"}
+    for key, mode in (("bam", "wb"), ("ref", "wb"), ("sam", "w")):
+        with pysam.AlignmentFile(str(paths[key]), mode, header=header) as out:
+            for r in recs:
+                out.write(r)
+    with pysam.AlignmentFile(str(paths["cram"]), "wc", header=header, reference_filename=CHR19_FASTA) as out:
+        for r in recs:
+            out.write(r)
+    with pysam.AlignmentFile(str(paths["unsorted"]), "w", header=header) as out:
+        for r in recs[::-1][:500]:
+            out.write(r)
+    pysam.index(str(paths["ref"]))
+    ro = d / "ro"
+    ro.mkdir()
+    paths["ro"] = ro / "ro.bam"
+    paths["ro"].write_bytes(paths["bam"].read_bytes())
+    ro.chmod(0o555)
+    yield paths, len(recs)
+    ro.chmod(0o755)
+
+
+def test_inputs_index_sam_cram_python(chr19_slice_inputs):
+    """prepare_alignment builds missing indexes, converts SAM, reads CRAM."""
+    from taps_sc_extract.inputs import prepare_alignment
+
+    paths, n = chr19_slice_inputs
+    for key in ("bam", "ro", "sam", "cram"):
+        src, tmp = prepare_alignment(str(paths[key]), CHR19_FASTA)
+        with src.open() as f:
+            assert f.has_index()
+            assert sum(1 for _ in f.fetch("chr19", 5_000_000, 6_000_000)) == n, key
+        if key == "ro":
+            assert src.index is not None and tmp is not None  # index went to the temp dir
+    with pytest.raises(ValueError, match="not coordinate-sorted"):
+        prepare_alignment(str(paths["unsorted"]), CHR19_FASTA)
+
+
+def test_inputs_index_sam_cram_rust(chr19_slice_inputs, tmp_path):
+    """The Rust engine gives the same calls from every input form."""
+    import subprocess
+    from taps_sc_extract.cli import find_rust_binary
+
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        pytest.skip("Rust binary not built.")
+    paths, _ = chr19_slice_inputs
+    paths = dict(paths)
+    for key in ("bam", "cram"):  # fresh unindexed copies (the Python test may have indexed them)
+        fresh = tmp_path / f"fresh_{paths[key].name}"
+        fresh.write_bytes(paths[key].read_bytes())
+        paths[key] = fresh
+
+    def run(key):
+        p = subprocess.run(
+            [rust_bin, "extract", "-b", str(paths[key]), "-f", CHR19_FASTA, "-o", str(tmp_path / f"{key}.h5"),
+             "-c", "chr19", "--start", "5000000", "--end", "6000000", "-t", "2", "--shards", "1"],
+            capture_output=True, text=True,
+        )
+        return p.returncode, p.stdout + p.stderr
+
+    rc, ref = run("ref")
+    assert rc == 0, ref
+    want = [l for l in ref.splitlines() if l.startswith("cells=")][0].split(" elapsed_s")[0]
+    for key in ("bam", "ro", "sam", "cram"):
+        rc, out = run(key)
+        assert rc == 0, out
+        got = [l for l in out.splitlines() if l.startswith("cells=")][0].split(" elapsed_s")[0]
+        assert got == want, key
+    rc, out = run("unsorted")
+    assert rc != 0 and "not coordinate-sorted" in out
+
+
 def _complexity_from_reference(path, out_txt):
     """Complexity file over the frozen chr19 reference's cells (unique = CG sites).
     Returns the cutoff that keeps roughly the upper half of cells."""

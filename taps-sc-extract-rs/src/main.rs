@@ -14,6 +14,7 @@ mod extract;
 mod extract_noodles;
 mod fasta;
 mod h5_out;
+mod input;
 mod parallel;
 mod profile;
 mod shard_io;
@@ -30,7 +31,7 @@ use crate::extract_noodles::extract_regions_stats_noodles;
 use crate::fasta::FastFaiReader;
 use crate::h5_out::{
     assemble_hdf5_from_memory, assemble_hdf5_from_temp, read_shard_temp_chunks,
-    write_shard_from_chunks, written_output_bytes, H5Compression, WriterMode,
+    written_output_bytes, H5Compression, WriterMode,
 };
 use crate::shard_io::ChunkFile;
 use crate::parallel::{
@@ -245,9 +246,10 @@ enum Commands {
         /// Blosc internal threads (0 = Blosc default).
         #[arg(long, default_value_t = 0)]
         compression_threads: usize,
-        /// Stream-mode temp directory holding this shard's chunk_*.bin files.
+        /// Stream-mode temp bucket directory with chunk_*.bin files (repeatable:
+        /// one per bucket this shard writes).
         #[arg(long, conflicts_with = "stdin")]
-        chunk_dir: Option<PathBuf>,
+        chunk_dir: Vec<PathBuf>,
         /// Read TAPSCK01 chunk records from stdin until EOF.
         #[arg(long, default_value_t = false)]
         stdin: bool,
@@ -273,6 +275,14 @@ fn main() -> Result<()> {
                 .or_else(|| bam.as_ref().and_then(|b| b.parent().map(|p| p.to_path_buf())))
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| PathBuf::from("."));
+            let prepared = match (&bam, &fasta) {
+                (Some(b), Some(f)) => {
+                    let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+                    Some(input::prepare(b, f, nproc)?)
+                }
+                _ => None,
+            };
+            let bam = prepared.as_ref().map(|p| p.path.clone()).or(bam);
             tune::run_tune(&tune::TuneArgs {
                 temp_dir,
                 out_dir,
@@ -297,29 +307,19 @@ fn main() -> Result<()> {
             if codec.is_blosc() {
                 crate::h5_out::apply_blosc_threads(compression_threads);
             }
-            let t0 = Instant::now();
-            let chunks = match (chunk_dir, stdin) {
-                (Some(d), false) => read_shard_temp_chunks(&d)?,
-                (None, true) => {
-                    let mut r = std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock());
-                    shard_io::read_all_chunks_from(&mut r)?
+            let input = || -> Result<Vec<shard_io::ChunkFile>> {
+                match (chunk_dir.is_empty(), stdin) {
+                    (false, false) => read_shard_temp_chunks(&chunk_dir),
+                    (true, true) => {
+                        let mut r = std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock());
+                        shard_io::read_all_chunks_from(&mut r)
+                    }
+                    _ => anyhow::bail!("write-shard needs exactly one of --chunk-dir or --stdin"),
                 }
-                _ => anyhow::bail!("write-shard needs exactly one of --chunk-dir or --stdin"),
             };
-            let read_s = t0.elapsed().as_secs_f64();
-            let sites: u64 = chunks
-                .iter()
-                .flat_map(|c| c.cells.iter())
-                .map(|cell| (cell.cg.len() + cell.ch.len()) as u64)
-                .sum();
-            let t1 = Instant::now();
-            let n = write_shard_from_chunks(&out, chunks, codec)?;
-            eprintln!(
-                "HDF5 shard {shard:03} cells={n} sites={sites} read={read_s:.1}s write={:.1}s peak_rss={:.0}MB -> {}",
-                t1.elapsed().as_secs_f64(),
-                autotune::process_peak_rss_mb(),
-                out.display()
-            );
+            let mut rep = crate::h5_out::write_shard_timed(shard, &out, input, codec)?;
+            rep.peak_rss_mb = autotune::process_peak_rss_mb();
+            eprintln!("{}", rep.child_line(&out));
         }
         Commands::Stats {
             bam,
@@ -346,6 +346,9 @@ fn main() -> Result<()> {
             dump_sites,
         } => {
             let fai = FastFaiReader::open(&fasta)?;
+            let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let prepared = input::prepare(&bam, &fasta, nproc)?;
+            let bam = prepared.path.clone();
             let contig_list: Vec<&str> = match &chroms {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
                 None => CANONICAL_CONTIGS.to_vec(),
@@ -470,6 +473,9 @@ fn main() -> Result<()> {
             profile_json,
         } => {
             let fai = FastFaiReader::open(&fasta)?;
+            let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let prepared = input::prepare(&bam, &fasta, nproc)?;
+            let bam = prepared.path.clone();
             let contig_list: Vec<&str> = match &chroms {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
                 None => CANONICAL_CONTIGS.to_vec(),
@@ -609,6 +615,7 @@ fn main() -> Result<()> {
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
             eprintln!("======================================================================");
+            let n_buckets = crate::h5_out::bucket_count(n_shards);
             let cpu_start = profile::cpu_times();
             let t_process = Instant::now();
             let (r, pending) = match resolved_memory_mode.as_str() {
@@ -619,7 +626,7 @@ fn main() -> Result<()> {
                         &windows,
                         wl.as_ref(),
                         &params,
-                        n_shards,
+                        n_buckets,
                         n_workers,
                         &cancel,
                     )?;
@@ -637,7 +644,7 @@ fn main() -> Result<()> {
                         wl.as_ref(),
                         &params,
                         tmp.path(),
-                        n_shards,
+                        n_buckets,
                         n_workers,
                         &cancel,
                     )?;
@@ -652,10 +659,11 @@ fn main() -> Result<()> {
                 writer_mode.label()
             );
             let t_write = Instant::now();
-            let (h5_path, writer_reports) = match pending {
+            let crate::h5_out::HdfOutput { path: h5_path, reports: writer_reports, master_s } = match pending {
                 PendingOutput::Memory(mem) => {
+                    let groups = crate::h5_out::pack_buckets(&crate::h5_out::bucket_sites(&mem), n_shards);
                     assemble_hdf5_from_memory(
-                        mem,
+                        crate::h5_out::group_buckets(mem, &groups),
                         &out,
                         compression,
                         &compression_name,
@@ -664,10 +672,14 @@ fn main() -> Result<()> {
                     )?
                 }
                 PendingOutput::Stream(tmp) => {
+                    let groups = crate::h5_out::pack_buckets(
+                        &crate::h5_out::bucket_bytes(tmp.path(), n_buckets),
+                        n_shards,
+                    );
                     let res = assemble_hdf5_from_temp(
                         tmp.path(),
                         &out,
-                        n_shards,
+                        &groups,
                         compression,
                         &compression_name,
                         writer_threads,
@@ -695,8 +707,11 @@ fn main() -> Result<()> {
                 resolved_memory_mode == "stream",
                 crate::autotune::process_peak_rss_mb(),
                 crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
-                writer_reports.len(),
+                writer_reports.iter().filter(|w| w.child).count(),
             );
+            if let Some(line) = crate::h5_out::writer_summary_line(&writer_reports, master_s) {
+                eprintln!("{line}");
+            }
             if wl.is_some() && r.n_cells() == 0 {
                 eprintln!(
                     "WARNING: no reads matched the barcode filter (--whitelist / --complexity). \
@@ -730,6 +745,7 @@ fn main() -> Result<()> {
                     result: &r,
                     windows: &windows,
                     writer_reports: &writer_reports,
+                    master_s,
                     peak_rss_mb: crate::autotune::process_peak_rss_mb(),
                     writer_peak_mb: crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
                 };

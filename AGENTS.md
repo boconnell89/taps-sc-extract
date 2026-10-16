@@ -36,7 +36,8 @@ taps-sc-extract/
 │   ├── fasta.py                # FastFaiReader: process-safe .fai indexed FASTA reader
 │   ├── calling.py              # TAPS mC-to-T lookup tables & SAM flag classification
 │   ├── context.py              # Sequence context classifier (CpG, CHG, CHH, CG, CH)
-│   └── barcode.py              # Barcode extraction from QNAME/tags & whitelist parsing
+│   ├── barcode.py              # Barcode extraction from QNAME/tags, whitelist & complexity-file parsing
+│   └── inputs.py               # BAM/CRAM/SAM input: builds a missing index, converts SAM, CRAM reference
 ├── taps-sc-extract-rs/         # Rust acceleration core
 │   ├── Cargo.toml              # Rust crate manifest (mimalloc, rust-htslib+libdeflate, hdf5-metno, rayon, libc)
 │   ├── .cargo/config.toml.in   # Template install.sh fills (conda prefix, target CPU, forced CFLAGS)
@@ -47,7 +48,8 @@ taps-sc-extract/
 │       ├── parallel.rs         # Rayon window pool, thread-local readers, cancellation
 │       ├── window.rs           # Genomic window planner
 │       ├── accumulate.rs       # Barcode intern & per-cell sorted (pos, t, c) site vectors
-│       ├── h5_out.rs           # Amethyst HDF5 writer: sliced cell datasets, process-per-shard writers, master.h5
+│       ├── h5_out.rs           # Amethyst HDF5 writer: sliced cell datasets, process-per-shard writers, shard balancing, writer reports, master.h5
+│       ├── input.rs            # BAM/CRAM/SAM input: builds a missing index, converts SAM, CRAM reference; all readers open through it
 │       ├── shard_io.rs         # TAPSCK01 chunk format (temp files and writer stdin)
 │       ├── autotune.rs         # Worker / window / writer / memory-mode defaults
 │       ├── profile.rs          # --profile-json output
@@ -78,6 +80,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Process-tree accounting**: The summary reports the extraction process's peak RSS and the writer children's combined peak (each `write-shard` child reports its own peak). Count both when sizing memory.
 - **Disk-Streaming vs. Memory Mode**: In `stream` mode, intermediate chunks are partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin` and purged on write. In `memory` mode, per-window payloads stay in RAM and are piped to the writers.
 - **HDF5 global lock**: hdf5-metno wraps every HDF5 call in one process-wide `ReentrantMutex` (`hdf5-metno-sys` `LOCK`), compression included. Threads in one process never write HDF5 in parallel. Parallel writing means one `write-shard` child process per shard (`--writer-mode process`, the default with >1 shard). In-process (`thread`) writers are auto-capped at 6.
+- **Shard balancing**: Rust extraction hashes barcodes into `bucket_count(n_shards)` = 4 × shards buckets (`h5_out::BUCKETS_PER_SHARD`); after extraction `pack_buckets` deals whole buckets to shards by sites (memory) or temp bytes (stream). A cell stays in one bucket, so its records keep chunk_id order. Shard placement therefore differs from Python's `md5 % N`; compare outputs per cell, never per shard file.
 - **Bounded writer memory**: `write_shard_from_chunks` writes one cell at a time in `WRITE_SLICE` (4 × 65,536-record) slices. Never build a whole shard's or a whole cell's `MethRec` vector.
 
 ### E. Per-Read State in the Pileup Callback

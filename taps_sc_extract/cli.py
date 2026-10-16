@@ -52,7 +52,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "-b", "--bam",
         default=None,
         help=(
-            "Path to coordinate-sorted, indexed TAPS BAM file (.bam with .bai). "
+            "Coordinate-sorted TAPS alignments: BAM, CRAM (decoded with -f) or SAM (converted "
+            "to a temporary BAM). A missing .bai/.csi/.crai is built automatically. "
             "Required unless --test runs without a dataset."
         ),
     )
