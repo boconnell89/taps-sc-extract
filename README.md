@@ -125,7 +125,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--no-temp-file] [--temp-dir TEMP_DIR]
                        [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
-                       [--no-baq] [--no-overlap-clip]
+                       [--no-baq] [--baq {taps,htslib}] [--no-overlap-clip]
                        [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
                        [--writer-mode {auto,process,thread}] [--profile-json PROFILE_JSON]
                        [--test] [--test-quick] [--save-profile] [--test-report TEST_REPORT]
@@ -166,6 +166,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--min-mapq` | `int` | `0` | Minimum mapping quality for alignment filtering. |
 | `--max-depth` | `int` | `250` | Maximum pileup depth. |
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
+| `--baq` | `taps`\|`htslib` | `taps` | BAQ reference (Rust engine). `taps` realigns OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `htslib` is samtools/asTair BAQ on the plain reference; it treats each methylated C (read as T) as a mismatch and under-calls methylation (chr19 CpG 66.48% vs 67.24% `taps`, 67.07% no BAQ). Same speed. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
 | `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
 | `--trim-r1` | `int` | `0` | Drop this many 5′ sequenced bases of read 1 before calling. |
@@ -244,6 +245,22 @@ $$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
 | **OB** (Original Bottom, Strand `-`) | `G` | `G` | Unmodified ($\text{C}$) | **Unmethylated** (`t += 1`) |
 
 *Note: In the Amethyst HDF5 output schema, `t` stores unmethylated counts and `c` stores methylated counts.*
+
+### BAQ for TAPS
+
+BAQ (htslib `sam_prob_realn`) realigns each read to the reference with a profile HMM and lowers base qualities where the alignment is uncertain; bases that fall below `--min-baseq` are not called. On the plain reference, a methylated C read as T (A on OB) is a mismatch, so BAQ lowers quality at and around methylated sites and drops methylated calls preferentially.
+
+The default `--baq taps` gives the HMM a reference with the convertible base masked to `N`: every `C` for OT reads and every `G` for OB reads, in all contexts (CpG and CH). `N` scores as neither match nor mismatch in the HMM, so a converted or unconverted base costs nothing, while indels and other mismatches still lower quality. Only BAQ sees the masked reference; calling uses the real one.
+
+chr19, change in calls against `--no-baq`:
+
+| BAQ | CG methylated | CG unmethylated | CG % | CH methylated | CH unmethylated | CH % |
+|---|---:|---:|---:|---:|---:|---:|
+| off (`--no-baq`) | 574,228 | 281,919 | 67.07 | 59,592 | 19,984,017 | 0.297 |
+| `--baq htslib` | −3.00% | −0.37% | 66.48 | −4.93% | −0.42% | 0.284 |
+| `--baq taps` (default) | −0.07% | −0.84% | 67.24 | −0.60% | −0.38% | 0.297 |
+
+BAQ is most of the processing time (full test BAM: 46 s with BAQ, 8.4 s without, at `-t 32`); both BAQ modes cost the same.
 
 ---
 
@@ -334,7 +351,7 @@ pytest tests/ -v                        # includes chr19 BAM tests when the data
 (cd taps-sc-extract-rs && cargo test --release)
 ```
 
-The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_overlapfix_2026-10-15/`), and require Rust `--no-baq` to equal the Python engine at every cell and position.
+The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_tapsbaq_2026-10-16/`, TAPS-aware BAQ; `--baq htslib` against `test_chr19_rust_overlapfix_2026-10-15/`), and require Rust `--no-baq` to equal the Python engine at every cell and position.
 
 ---
 

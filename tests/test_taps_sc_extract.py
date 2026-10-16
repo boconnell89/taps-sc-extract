@@ -340,13 +340,25 @@ def test_cli_forwards_complexity_flags():
     assert cmd[cmd.index("--max-complexity") + 1] == "50000.5"
 
 
+def test_cli_forwards_baq_mode():
+    from taps_sc_extract.cli import build_rust_command
+
+    base = ["-b", "x.bam", "-f", "x.fa", "-o", "out"]
+    assert "--baq" not in build_rust_command("taps-sc-extract-rs", parse_args(base), base)
+    argv = base + ["--baq", "htslib"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    assert cmd[cmd.index("--baq") + 1] == "htslib"
+
+
 # 10. Real BAM smoke test (chr19)
 CHR19_BAM = "/mnt/e/sciMET_TAPS/260731/taps_ucbTn5_sp2.srt.bam"
 CHR19_FASTA = "/mnt/e/refs/mm10/mm10.fa"
-# Rust chr19 output frozen after the barcode-cache fix and the htslib 1.21
-# overlap-clipping patch (see the README in that directory). Older references
-# (test_chr19_rust_026c52e/, test_chr19_rust_cellfix_2026-10-15/) are records.
-CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_overlapfix_2026-10-15/chr19.h5"
+# Rust chr19 output with TAPS-aware BAQ, the default (see the README in that
+# directory). The htslib-BAQ reference is what `--baq htslib` must still give.
+# Older references (test_chr19_rust_026c52e/, test_chr19_rust_cellfix_2026-10-15/)
+# are records.
+CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_tapsbaq_2026-10-16/chr19.h5"
+CHR19_RUST_REFERENCE_HTSLIB = "/mnt/e/sciMET_TAPS/test_chr19_rust_overlapfix_2026-10-15/chr19.h5"
 
 
 def _require(*paths):
@@ -430,20 +442,31 @@ def test_chr19_real_bam_smoke(chr19_python_run):
     assert 0.0 <= ch_pct <= 3.0
 
 
-def test_chr19_real_bam_smoke_rust(tmp_path):
-    """Rust engine on chr19 must reproduce the frozen reference sites exactly."""
-    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
-    out_h5 = tmp_path / "chr19_rust.h5"
-    _run_rust_chr19(out_h5)
-
+def _assert_same_sites(ref_path, new_path):
     cols = ["chr", "pos", "t", "c"]
-    with h5py.File(CHR19_RUST_REFERENCE, "r") as ref, h5py.File(str(out_h5), "r") as new:
+    with h5py.File(ref_path, "r") as ref, h5py.File(str(new_path), "r") as new:
         for ctx in ("CG", "CH"):
             assert sorted(ref[ctx].keys()) == sorted(new[ctx].keys())
             for bc in ref[ctx]:
                 a = ref[ctx][bc]["1"][()][cols]
                 b = new[ctx][bc]["1"][()][cols]
                 assert np.array_equal(a, b), f"{ctx}/{bc} differs"
+
+
+def test_chr19_real_bam_smoke_rust(tmp_path):
+    """Rust engine (TAPS-aware BAQ) on chr19 must reproduce the frozen reference exactly."""
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
+    out_h5 = tmp_path / "chr19_rust.h5"
+    _run_rust_chr19(out_h5)
+    _assert_same_sites(CHR19_RUST_REFERENCE, out_h5)
+
+
+def test_chr19_rust_htslib_baq_unchanged(tmp_path):
+    """--baq htslib still gives the pre-2026-10-16 (plain-reference BAQ) calls."""
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE_HTSLIB)
+    out_h5 = tmp_path / "chr19_rust_htslib.h5"
+    _run_rust_chr19(out_h5, "--baq", "htslib")
+    _assert_same_sites(CHR19_RUST_REFERENCE_HTSLIB, out_h5)
 
 
 def test_chr19_rust_matches_python_per_cell(chr19_python_run, tmp_path):

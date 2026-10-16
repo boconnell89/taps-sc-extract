@@ -26,7 +26,16 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::extract::{estimate_bam_traffic, BamTraffic, ExtractParams};
+use crate::extract::{estimate_bam_traffic, BamTraffic, BaqMode, ExtractParams};
+
+/// "taps", "htslib" or "off".
+fn baq_label(p: &ExtractParams) -> &'static str {
+    if p.compute_baq {
+        p.baq_mode.label()
+    } else {
+        "off"
+    }
+}
 use crate::extract_noodles::extract_regions_stats_noodles;
 use crate::fasta::FastFaiReader;
 use crate::h5_out::{
@@ -89,6 +98,11 @@ enum Commands {
         /// flag is currently a no-op; we do not copy that).
         #[arg(long, default_value_t = false)]
         no_baq: bool,
+        /// BAQ reference: `taps` masks the methylation-convertible base (C on
+        /// OT reads, G on OB reads) so conversions are not penalised; `htslib`
+        /// uses the plain reference (samtools/asTair; under-calls methylation).
+        #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
+        baq: BaqMode,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -186,6 +200,9 @@ enum Commands {
         /// Disable BAQ. Default is on (do not copy Python's current no-op).
         #[arg(long, default_value_t = false)]
         no_baq: bool,
+        /// BAQ reference: `taps` (masked convertible base) or `htslib` (plain).
+        #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
+        baq: BaqMode,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -336,6 +353,7 @@ fn main() -> Result<()> {
             no_overlap_clip,
             no_ignore_orphans,
             no_baq,
+            baq,
             trim_r1,
             trim_r2,
             whitelist,
@@ -384,6 +402,7 @@ fn main() -> Result<()> {
                 ignore_overlaps,
                 ignore_orphans,
                 compute_baq,
+                baq_mode: baq,
                 decomp_threads: decomp,
                 accumulate: dump_sites.is_some(),
                 trim_r1,
@@ -391,7 +410,8 @@ fn main() -> Result<()> {
                 profile: false,
             };
             eprintln!(
-                "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={compute_baq} overlaps={ignore_overlaps} orphans={ignore_orphans} trim_r1={trim_r1} trim_r2={trim_r2} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
+                "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={} overlaps={ignore_overlaps} orphans={ignore_orphans} trim_r1={trim_r1} trim_r2={trim_r2} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
+                baq_label(&params),
                 windows.len(),
                 contig_list
             );
@@ -464,6 +484,7 @@ fn main() -> Result<()> {
             no_overlap_clip,
             no_ignore_orphans,
             no_baq,
+            baq,
             trim_r1,
             trim_r2,
             whitelist,
@@ -573,6 +594,7 @@ fn main() -> Result<()> {
                 ignore_overlaps: !no_overlap_clip,
                 ignore_orphans: !no_ignore_orphans,
                 compute_baq: !no_baq,
+                baq_mode: baq,
                 decomp_threads: decomp,
                 accumulate: true,
                 trim_r1,
@@ -610,7 +632,7 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("  Compression:     {compression_name}");
             }
-            eprintln!("  BAQ:             {}", params.compute_baq);
+            eprintln!("  BAQ:             {}", baq_label(&params));
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
@@ -731,7 +753,7 @@ fn main() -> Result<()> {
                         ("writers", writer_threads.to_string()),
                         ("memory_mode", resolved_memory_mode.clone()),
                         ("compression", compression_name.clone()),
-                        ("baq", params.compute_baq.to_string()),
+                        ("baq", baq_label(&params).to_string()),
                         ("bam", bam.display().to_string()),
                         ("nproc", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).to_string()),
                     ],

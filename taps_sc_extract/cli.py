@@ -227,6 +227,15 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Disable BAQ (Base Alignment Quality) computation.",
     )
     parser.add_argument(
+        "--baq",
+        choices=["taps", "htslib"],
+        default=None,
+        help="BAQ reference (Rust engine). 'taps' (default) masks the methylation-"
+        "convertible base (C on OT reads, G on OB reads) so C-to-T conversions are not "
+        "treated as mismatches; 'htslib' uses the plain reference like samtools/asTair, "
+        "which lowers methylated calls.",
+    )
+    parser.add_argument(
         "--no-overlap-clip",
         action="store_true",
         help="Do not ignore overlapping mate read bases.",
@@ -379,6 +388,8 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.extend(["--decomp-threads", str(parsed.decomp_threads)])
     if parsed.no_baq:
         cmd.append("--no-baq")
+    if parsed.baq:
+        cmd.extend(["--baq", parsed.baq])
     if parsed.no_overlap_clip:
         cmd.append("--no-overlap-clip")
     if parsed.profile_json:
@@ -479,6 +490,11 @@ def main(args: Optional[List[str]] = None) -> int:
             return 1
 
     logger.info("Running Python reference multiprocessing extraction engine.")
+    if not parsed.no_baq:
+        logger.info(
+            "Note: the Python engine does not apply BAQ (same calls as --no-baq); "
+            "TAPS-aware BAQ needs the Rust engine."
+        )
     chroms_list = None
     if parsed.chroms:
         chroms_list = [c.strip() for c in parsed.chroms.split(",") if c.strip()]

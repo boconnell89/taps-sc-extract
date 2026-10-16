@@ -8,7 +8,9 @@
 //! - flag filter: UNMAP | SECONDARY | QCFAIL | DUP
 //! - `ignore_orphans`: skip paired-but-not-proper
 //! - `compute_baq`: `sam_prob_realn(b, full_contig, len, BAQ_APPLY|BAQ_EXTEND)`
-//!   (flag 3). The reference must start at contig coordinate 0.
+//!   (flag 3). The reference must start at contig coordinate 0. With
+//!   `BaqMode::Taps` (the default) the reference has the strand's convertible
+//!   base masked to N; see `BaqMode`.
 //! - `ignore_overlaps`: `bam_plp_init_overlaps` (zeros the lower-quality
 //!   overlapping mate base; pysam then drops it via `min_base_quality`)
 //!
@@ -196,6 +198,8 @@ pub struct ExtractParams {
     pub ignore_overlaps: bool,
     pub ignore_orphans: bool,
     pub compute_baq: bool,
+    /// Reference BAQ realigns against (when `compute_baq`).
+    pub baq_mode: BaqMode,
     pub decomp_threads: usize,
     /// Fill per-barcode (pos, t, c) maps. Off for stats-only (saves RAM).
     pub accumulate: bool,
@@ -216,6 +220,7 @@ impl Default for ExtractParams {
             ignore_overlaps: true,
             ignore_orphans: true,
             compute_baq: true,
+            baq_mode: BaqMode::Taps,
             decomp_threads: 1,
             accumulate: false,
             trim_r1: DEFAULT_TRIM_R1,
@@ -223,6 +228,43 @@ impl Default for ExtractParams {
             profile: false,
         }
     }
+}
+
+/// Reference that BAQ (`sam_prob_realn`) realigns each read against.
+///
+/// In TAPS a methylated C is read as T (A on the bottom strand), so against the
+/// plain reference every methylated C is a mismatch. htslib's HMM reads that as
+/// possible misalignment and lowers base qualities at and around methylated
+/// sites, which drops methylated calls more often than unmethylated ones
+/// (chr19: -3.0% methylated vs -0.4% unmethylated CpG calls).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BaqMode {
+    /// Mask the convertible base: OT reads see every reference C as N, OB reads
+    /// every G (all contexts, CpG and CH). N scores as neither match nor
+    /// mismatch in the HMM (`probaln.c`), so methylation state does not affect
+    /// BAQ, while indels and real mismatches still do.
+    Taps,
+    /// htslib's plain reference (samtools/asTair behaviour; biased for TAPS).
+    Htslib,
+}
+
+impl BaqMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            BaqMode::Taps => "taps",
+            BaqMode::Htslib => "htslib",
+        }
+    }
+}
+
+/// Bottom-strand (OB) read for TAPS-aware BAQ: read 1 reverse or read 2
+/// forward (flags 83/163; unpaired reverse reads too). Everything else,
+/// including 99/147, is OT.
+#[inline]
+fn baq_is_ob(flags: u16) -> bool {
+    let reverse = flags & htslib::BAM_FREVERSE as u16 != 0;
+    let read2 = flags & htslib::BAM_FPAIRED as u16 != 0 && flags & htslib::BAM_FREAD2 as u16 != 0;
+    reverse != read2
 }
 
 /// pysam / samtools default: skip unmapped, secondary, QC fail, duplicate.
@@ -256,8 +298,7 @@ const PROFILE_STRIDE: u64 = 16;
 fn accept_record(
     rec: &mut Record,
     params: &ExtractParams,
-    baq_ptr: *const c_char,
-    baq_len: i64,
+    baq_ref: Option<&BaqRef>,
     whitelist: Option<&HashSet<String>>,
 ) -> bool {
     let flags = rec.flags();
@@ -282,8 +323,11 @@ fn accept_record(
     let excluded = whitelist.is_some_and(|wl| {
         !wl.contains(std::str::from_utf8(barcode_from_qname_bytes(rec.qname())).unwrap_or(""))
     });
-    if params.compute_baq && !baq_ptr.is_null() && !excluded {
-        let _ = unsafe { htslib::sam_prob_realn(rec.inner_mut(), baq_ptr, baq_len, BAQ_FLAGS) };
+    if let Some(r) = baq_ref.filter(|_| params.compute_baq && !excluded) {
+        let seq = if baq_is_ob(flags) { &r.ob } else { &r.ot };
+        let _ = unsafe {
+            htslib::sam_prob_realn(rec.inner_mut(), seq.as_ptr() as *const c_char, seq.len() as i64, BAQ_FLAGS)
+        };
     }
     true
 }
@@ -298,7 +342,7 @@ pub fn process_window(
     window: &Window,
     whitelist: Option<&HashSet<String>>,
     params: &ExtractParams,
-    baq_ref: Option<&[u8]>,
+    baq_ref: Option<&BaqRef>,
 ) -> Result<WindowResult> {
     let profile = params.profile;
     let t_window = Instant::now();
@@ -319,11 +363,6 @@ pub fn process_window(
     if profile {
         timing.setup_s = t_window.elapsed().as_secs_f64();
     }
-
-    let (baq_ptr, baq_len) = match baq_ref {
-        Some(s) if params.compute_baq => (s.as_ptr() as *const c_char, s.len() as i64),
-        _ => (std::ptr::null(), 0),
-    };
 
     // func=NULL: we push records ourselves so overlap_push sees the same
     // bam1_t that rust-htslib just filled (no extra bam_copy1 into iter->b).
@@ -498,7 +537,7 @@ pub fn process_window(
             Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
             Some(Ok(())) => {
                 timing.records += 1;
-                let keep = accept_record(&mut rec, params, baq_ptr, baq_len, whitelist);
+                let keep = accept_record(&mut rec, params, baq_ref, whitelist);
                 timing.baq_s += lap(sample) * scale;
                 if !keep {
                     continue;
@@ -538,16 +577,42 @@ pub fn process_window(
     })
 }
 
-/// Full-contig sequences for `sam_prob_realn` (each must start at coordinate 0),
-/// shared by all workers. A contig is fetched once, by the first window that
-/// needs it, and dropped when its last window releases it.
+/// Full-contig BAQ references for one contig (each starts at coordinate 0):
+/// `ot` for top-strand reads, `ob` for bottom-strand reads. With
+/// `BaqMode::Htslib` both are the same plain sequence.
+pub struct BaqRef {
+    pub ot: Arc<[u8]>,
+    pub ob: Arc<[u8]>,
+}
+
+impl BaqRef {
+    fn new(seq: Vec<u8>, mode: BaqMode) -> Self {
+        match mode {
+            BaqMode::Htslib => {
+                let s: Arc<[u8]> = seq.into();
+                Self { ot: Arc::clone(&s), ob: s }
+            }
+            BaqMode::Taps => {
+                // FastFaiReader::fetch returns uppercase.
+                let mask = |from: u8| -> Arc<[u8]> {
+                    seq.iter().map(|&b| if b == from { b'N' } else { b }).collect()
+                };
+                Self { ot: mask(b'C'), ob: mask(b'G') }
+            }
+        }
+    }
+}
+
+/// Full-contig BAQ references (`BaqRef`), shared by all workers. A contig is
+/// fetched once, by the first window that needs it, and dropped when its last
+/// window releases it.
 pub struct BaqRefs<'a> {
     fasta: &'a FastFaiReader,
     slots: FxHashMap<String, BaqSlot>,
 }
 
 struct BaqSlot {
-    seq: Mutex<Option<Arc<[u8]>>>,
+    seq: Mutex<Option<Arc<BaqRef>>>,
     remaining: AtomicUsize,
 }
 
@@ -568,7 +633,7 @@ impl<'a> BaqRefs<'a> {
     }
 
     /// Sequence for `contig`. Pair every call with `release`.
-    pub fn acquire(&self, contig: &str) -> Result<Arc<[u8]>> {
+    pub fn acquire(&self, contig: &str, mode: BaqMode) -> Result<Arc<BaqRef>> {
         let slot = self
             .slots
             .get(contig)
@@ -581,11 +646,12 @@ impl<'a> BaqRefs<'a> {
             .fasta
             .reference_length(contig)
             .ok_or_else(|| anyhow::anyhow!("contig {contig} missing in FASTA"))?;
-        let seq: Arc<[u8]> = self
-            .fasta
-            .fetch(contig, 0, len)
-            .with_context(|| format!("FASTA BAQ fetch {contig}"))?
-            .into();
+        let seq = Arc::new(BaqRef::new(
+            self.fasta
+                .fetch(contig, 0, len)
+                .with_context(|| format!("FASTA BAQ fetch {contig}"))?,
+            mode,
+        ));
         *guard = Some(Arc::clone(&seq));
         Ok(seq)
     }
@@ -610,7 +676,7 @@ pub fn process_window_with_baq(
     params: &ExtractParams,
 ) -> Result<WindowResult> {
     let baq_ref = if params.compute_baq {
-        Some(baq_refs.acquire(&window.contig)?)
+        Some(baq_refs.acquire(&window.contig, params.baq_mode)?)
     } else {
         None
     };
@@ -748,4 +814,33 @@ pub fn extract_windows_to_temp(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baq_strand_matches_calling_strand() {
+        use crate::calling::Strand;
+        for flag in [99u16, 147, 83, 163] {
+            let ob = matches!(classify_strand(flag), Some(Strand::Ob));
+            assert_eq!(baq_is_ob(flag), ob, "flag {flag}");
+        }
+        // Supplementary copies follow their primary's strand; unpaired reads use orientation.
+        assert!(!baq_is_ob(99 | 2048));
+        assert!(baq_is_ob(83 | 2048));
+        assert!(!baq_is_ob(0));
+        assert!(baq_is_ob(16));
+    }
+
+    #[test]
+    fn taps_baq_ref_masks_convertible_base_per_strand() {
+        let r = BaqRef::new(b"ACGTNCCGG".to_vec(), BaqMode::Taps);
+        assert_eq!(&*r.ot, b"ANGTNNNGG");
+        assert_eq!(&*r.ob, b"ACNTNCCNN");
+        let h = BaqRef::new(b"ACGT".to_vec(), BaqMode::Htslib);
+        assert_eq!(&*h.ot, b"ACGT");
+        assert!(Arc::ptr_eq(&h.ot, &h.ob));
+    }
 }
