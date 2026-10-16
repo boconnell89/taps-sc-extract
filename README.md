@@ -34,6 +34,8 @@ conda install -c conda-forge hdf5 clang libclang pkg-config   # build dependenci
 ```
 `install.sh` downloads hts-sys 2.2.1 and patches in htslib 1.21's read-pair overlap clipping, so Rust calls match the Python engine. It writes `taps-sc-extract-rs/.cargo/config.toml` for your conda prefix and builds with `-C target-cpu=native` (Rust) and `-O3 -march=native` (the vendored htslib, including BAQ). A native binary can fail with SIGILL on a different CPU, so **rerun `install.sh` on each host**, or use `./install.sh --portable` for an x86-64-v3 build. `./install.sh --smoke-bam BAM --smoke-fasta FA` also extracts chr19:5.0–5.1 Mb as a check.
 
+BAQ runs on SIMD kernels that process 8 reads per vector (AVX-512F) or 4 (AVX2). Both are always compiled, including in `--portable` builds, and the binary picks the widest the CPU runs. After building, `install.sh` runs `taps-sc-extract-rs baq-selftest`, which runs every supported kernel and htslib's scalar BAQ on the same reads and requires identical base qualities for every read; the install stops on any difference. Override with `--baq-simd avx512|avx2|off`. `taps-sc-extract --test --save-profile` times each kernel under full load and saves the fastest, since some Intel CPUs lower their clock for AVX-512.
+
 ### Upgrading an existing install
 ```bash
 cd taps-sc-extract
@@ -270,6 +272,15 @@ BAQ is most of the processing time. About 72% of reads have an all-M CIGAR and m
 | `--no-baq` | 7.5–8.8 s | 20–23 s | 71.543 | 64,056 (0.25%) |
 
 `htslib` costs the same as `taps-full`.
+
+The HMM runs on SIMD kernels (`--baq-simd`, default `auto`), with identical results to htslib's scalar code. Full test BAM, AVX2 kernel vs htslib (`--baq-simd off`), two runs each:
+
+| BAQ | Kernel | Processing | BAQ thread-seconds |
+|---|---|---:|---:|
+| `taps-full` | htslib | 42.6 / 47.6 s | 1,046 / 1,138 |
+| `taps-full` | AVX2 | 28.9 / 28.9 s | 576 / 569 |
+| `taps` (default) | htslib | 20.2 / 22.2 s | 322 / 333 |
+| `taps` (default) | AVX2 | 15.9 / 17.5 s | 170 / 184 |
 
 ---
 

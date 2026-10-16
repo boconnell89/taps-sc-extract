@@ -40,10 +40,14 @@ taps-sc-extract/
 │   └── inputs.py               # BAM/CRAM/SAM input: builds a missing index, converts SAM, CRAM reference
 ├── taps-sc-extract-rs/         # Rust acceleration core
 │   ├── Cargo.toml              # Rust crate manifest (mimalloc, rust-htslib+libdeflate, hdf5-metno, rayon, libc)
-│   ├── .cargo/config.toml.in   # Template install.sh fills (conda prefix, target CPU, forced CFLAGS)
+│   ├── .cargo/config.toml.in   # Template install.sh fills (conda prefix, target CPU, forced CFLAGS incl. -ffp-contract=off)
+│   ├── build.rs                # Compiles csrc/ against the vendored htslib headers (cc)
+│   ├── csrc/baq_simd.c         # Batched BAQ: realn.c wrapper + grouping by HMM shape; AVX2/AVX-512 dispatch
+│   ├── csrc/baq_kernel.h       # Lane-parallel probaln_glocal (included once per vector width)
 │   └── src/
-│       ├── main.rs             # Rust CLI: extract, stats, tune, write-shard (hidden, spawned by extract)
-│       ├── extract.rs          # bam_plp pileup, BAQ, calling callback, shared BAQ contig refs, stage timing
+│       ├── main.rs             # Rust CLI: extract, stats, tune, baq-selftest, write-shard (hidden, spawned by extract)
+│       ├── baq_simd.rs         # FFI to csrc/baq_simd.c, --baq-simd widths, per-read self-tests
+│       ├── extract.rs          # bam_plp pileup, batched read/BAQ/push loop, calling callback, BAQ refs and modes, stage timing
 │       ├── extract_noodles.rs  # Slower pure-Rust reference pileup (noodles)
 │       ├── parallel.rs         # Rayon window pool, thread-local readers, cancellation
 │       ├── window.rs           # Genomic window planner
@@ -89,6 +93,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Per-cell sites arrive in position order** (columns ascend within a window), so `CellMaps::add` appends or adds to the last entry. Keep that invariant; `normalize()` repairs any out-of-order input.
 - **Parity checks must be per cell**, not totals: `test_chr19_rust_matches_python_per_cell` requires Rust `--no-baq` to equal Python exactly on chr19.
 - **BAQ is TAPS-aware by default** (`extract::BaqMode`): `sam_prob_realn` gets a reference with C masked to N for OT reads and G masked to N for OB reads (`BaqRef`, strand from `baq_is_ob`), so methylation conversions are not treated as mismatches. The default `--baq taps` skips the HMM for reads that are all-M and match the masked reference exactly (`BaqMode::wants`; ~72% of reads, 0.0007% of CG calls differ from `--baq taps-full`). `--baq taps-partial` runs it only for reads with an indel or clip. Any change to the skip rule needs a new frozen chr19 reference. `--baq htslib` is the plain reference (biased against methylated calls). Calling always uses the unmasked reference. The Python engine never applies BAQ, so parity with Python is only defined for `--no-baq`.
+- **SIMD BAQ must equal htslib read by read.** `csrc/baq_kernel.h` is htslib 1.19.1 `probaln_glocal` with `double` replaced by a vector of 4 or 8 reads; every lane does the same IEEE operations in the same order. Keep `-ffp-contract=off` (no FMA) on both it and htslib (`.cargo/config.toml.in`, `build.rs`), never use `-ffast-math` or a vector `log`, and zero `f`/`b` per group (the forward pass reads zeroed cells outside the band). Reads the kernel does not cover (BQ/ZQ tag, >1000 bp, empty span) go to `sam_prob_realn`. After any change run `taps-sc-extract-rs baq-selftest -b BAM -f FA` (QUAL memcmp per read; `install.sh` runs it and fails the install on a mismatch). Reads are BAQ'd per 8,192-record batch, then pushed and drained one at a time in file order; never push a batch before draining, or `--max-depth` drops different reads.
 - **htslib version matters for calls.** Rust builds hts-sys 2.2.1 (htslib 1.19.1) patched with htslib 1.21's overlap clipping (`taps-sc-extract-rs/patches/`, applied by `install.sh` into `vendor/`, re-applied whenever the patch file's checksum changes) to match pysam 0.23 (htslib 1.21). Re-check parity whenever pysam or rust-htslib changes.
 
 ### F. TAPS Chemistry & Amethyst Schema

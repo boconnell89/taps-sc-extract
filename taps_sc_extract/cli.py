@@ -239,6 +239,14 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "methylated calls.",
     )
     parser.add_argument(
+        "--baq-simd",
+        choices=["auto", "avx512", "avx2", "off"],
+        default=None,
+        help="BAQ kernel (Rust engine): auto (default; widest the CPU runs, or the "
+        "fastest measured by --test --save-profile), avx512 (8 reads per vector), avx2 "
+        "(4), or off (htslib, one read at a time). All give identical results.",
+    )
+    parser.add_argument(
         "--no-overlap-clip",
         action="store_true",
         help="Do not ignore overlapping mate read bases.",
@@ -393,6 +401,8 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.append("--no-baq")
     if parsed.baq:
         cmd.extend(["--baq", parsed.baq])
+    if parsed.baq_simd:
+        cmd.extend(["--baq-simd", parsed.baq_simd])
     if parsed.no_overlap_clip:
         cmd.append("--no-overlap-clip")
     if parsed.profile_json:

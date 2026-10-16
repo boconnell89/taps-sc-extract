@@ -565,6 +565,16 @@ pub struct SavedProfile {
     pub workers: Option<usize>,
     pub writers: Option<usize>,
     pub decomp_threads: Option<usize>,
+    /// Fastest BAQ kernel measured on this host ("avx512", "avx2", "off").
+    pub baq_simd: Option<String>,
+}
+
+fn simd_name(w: crate::baq_simd::Width) -> &'static str {
+    match w.0 {
+        8 => "avx512",
+        4 => "avx2",
+        _ => "off",
+    }
 }
 
 /// Load the saved machine profile if it was made on this host.
@@ -594,6 +604,7 @@ pub fn load_profile_for_host() -> Option<(SavedProfile, PathBuf)> {
             workers: num("recommended_workers"),
             writers: num("recommended_writers"),
             decomp_threads: num("recommended_decomp_threads"),
+            baq_simd: kv.get("recommended_baq_simd").cloned(),
         },
         path,
     ))
@@ -807,6 +818,35 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         let (r, _, secs) = run_extract(&syn.bam, &syn.fasta, &wins, &tune_params(false, false), knee, 1)?;
         r.timing.records.max(1) as f64 / secs
     };
+    // BAQ kernels at the knee: wider vectors can lower the clock (AVX-512 on
+    // some Intel parts), so time each one this CPU runs and keep the fastest.
+    let mut kernels: Vec<(crate::baq_simd::Width, f64)> = Vec::new();
+    {
+        use crate::baq_simd::Width;
+        let wins = if knee < 8 {
+            synthetic_windows(&fai, small_names, small_bp, knee)
+        } else {
+            synthetic_windows(&fai, &names, total_bp, knee)
+        };
+        for w in [Width::HTSLIB, Width::AVX2, Width::AVX512] {
+            if !w.supported() {
+                continue;
+            }
+            let p = ExtractParams { baq_width: w, ..tune_params(true, true) };
+            let (r, _, _) = run_extract(&syn.bam, &syn.fasta, &wins, &p, knee, 1)?;
+            // BAQ thread-seconds per read: the kernel's own cost under full load.
+            kernels.push((w, r.timing.records.max(1) as f64 / r.timing.baq_s.max(1e-9)));
+        }
+    }
+    let best_kernel = kernels
+        .iter()
+        .copied()
+        .fold(None::<(crate::baq_simd::Width, f64)>, |b, k| match b {
+            Some(x) if x.1 >= k.1 => Some(x),
+            _ => Some(k),
+        })
+        .map(|k| k.0)
+        .unwrap_or(crate::baq_simd::Width::HTSLIB);
 
     // --- Memory bandwidth.
     eprintln!("[3/5] Memory bandwidth ...");
@@ -912,6 +952,20 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         "  W={knee} BAQ off: {knee_nobaq:.0} reads/s ({:.1}x BAQ on)",
         knee_nobaq / knee_baq.max(1.0)
     );
+    if !kernels.is_empty() {
+        let base_k = kernels[0].1.max(1e-9);
+        let _ = writeln!(rpt, "BAQ kernels at W={knee} (BAQ reads per thread-second, HMM on every read):");
+        for (w, rate) in &kernels {
+            let _ = writeln!(
+                rpt,
+                "  {:32} {:>9.0}  {:.2}x{}",
+                w.label(),
+                rate,
+                rate / base_k,
+                if *w == best_kernel { "  <- fastest (--baq-simd auto uses it with --save-profile)" } else { "" }
+            );
+        }
+    }
     let _ = writeln!(rpt, "Memory copy bandwidth: {bw1:.1} GB/s (1 thread), {bwn:.1} GB/s ({} threads)", host.nproc);
     let _ = writeln!(rpt, "Storage ({} MB probe):", size_mb);
     for f in &fs {
@@ -1113,6 +1167,10 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     let _ = writeln!(toml, "recommended_workers = {rec_workers}");
     let _ = writeln!(toml, "recommended_decomp_threads = {rec_decomp}");
     let _ = writeln!(toml, "recommended_writers = {rec_writers}");
+    for (w, rate) in &kernels {
+        let _ = writeln!(toml, "baq_kernel_{}_reads_per_thread_s = {rate:.0}", w.0);
+    }
+    let _ = writeln!(toml, "recommended_baq_simd = \"{}\"", simd_name(best_kernel));
 
     if let Some(j) = &a.json {
         std::fs::write(j, toml.clone() + "\n# report\n" + &rpt.lines().map(|l| format!("# {l}\n")).collect::<String>())

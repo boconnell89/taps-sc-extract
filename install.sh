@@ -7,6 +7,12 @@
 #   ./install.sh --no-pip        # build the Rust core only
 #   ./install.sh --smoke-bam BAM --smoke-fasta FA   # also extract chr19:5.0-5.1 Mb
 #
+# BAQ runs on SIMD kernels: AVX-512 (8 reads per vector) and AVX2 (4). Both are
+# always built; the binary picks the widest the CPU runs (--baq-simd to override,
+# `taps-sc-extract --test --save-profile` to keep the fastest measured). After
+# building, `baq-selftest` checks every kernel this CPU supports against htslib
+# read by read and the install stops on any difference.
+#
 # A native build uses instructions of the CPU it was built on. Rerun this script
 # on each host; copying the binary to a different CPU can fail with SIGILL.
 #
@@ -29,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --prefix) PREFIX="$2"; shift ;;
         --smoke-bam) SMOKE_BAM="$2"; shift ;;
         --smoke-fasta) SMOKE_FASTA="$2"; shift ;;
-        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -127,10 +133,23 @@ nproc=$(nproc)
 target_cpu=$TARGET_CPU
 march=$MARCH
 prefix=$PREFIX
+baq_simd_cpu=$(grep -qw avx512f /proc/cpuinfo && echo avx512 || (grep -qw avx2 /proc/cpuinfo && echo avx2 || echo off))
 git=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 INFO
 
 "$BIN" --version
+
+# SIMD BAQ must equal htslib's on every read (synthetic reads, plus real ones
+# from --smoke-bam when given).
+selftest=("$BIN" baq-selftest --synthetic-reads 200000)
+if [[ -n "$SMOKE_BAM" && -n "$SMOKE_FASTA" ]]; then
+    selftest+=(-b "$SMOKE_BAM" -f "$SMOKE_FASTA" -c chr19 --max-reads 300000)
+fi
+if ! "${selftest[@]}"; then
+    echo "install.sh: SIMD BAQ self-test failed; extraction would differ from htslib." >&2
+    echo "Report this, and run with --baq-simd off until it is fixed." >&2
+    exit 1
+fi
 
 if [[ $PIP -eq 1 ]]; then
     python3 -m pip install -e "$ROOT"

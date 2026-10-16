@@ -371,3 +371,14 @@ Balanced and hash-sharded outputs are identical per cell (701.7M sites over 900 
 ## 2026-10-16 — Vendored C built with `-ffp-contract=off`
 
 `install.sh`'s CFLAGS now include `-ffp-contract=off`. GCC's default for GNU C contracts `a*b+c` into FMA under `-march=native`; `probaln.o` had 16 `vfmadd`, now 0. BAQ results therefore no longer depend on whether the build host has FMA, and the scalar HMM and the planned SIMD kernel do the same IEEE operations. All three frozen chr19 references (`taps`, `taps-full`, `htslib`) are unchanged. Existing installs pick it up on the next `./install.sh`.
+
+## 2026-10-16 — SIMD BAQ kernels (AVX2 / AVX-512), `--baq-simd`, `baq-selftest`
+
+- `csrc/baq_kernel.h`: htslib 1.19.1 `probaln_glocal` (default non-`PROBALN_ORIG` path) with each `double` a GCC vector of 4 or 8 reads. Every lane performs the scalar code's IEEE operations in the same order, so each read's `state[]`/`q[]` equal htslib's. Skips the unused likelihood and `b[0]`. Compiled three times: 4 lanes on AVX2, 8 lanes on AVX-512F, and 8 lanes on AVX2 (testing the 8-lane logic on AVX2-only hosts). Runtime dispatch via `__builtin_cpu_supports`, so `--portable` builds carry both.
+- `csrc/baq_simd.c`: `sam_prob_realn`'s code before and after the HMM (span, band, translated sequences; `BAQ_EXTEND` running min/max and QUAL cap), copied from realn.c, minus the unused `ZQ` tag. Reads are grouped by (l_query, l_ref, band); short groups are padded with copies. Reads with BQ/ZQ tags, >1000 bp, or an empty span go to `sam_prob_realn`.
+- `extract.rs`: reads are read and filtered in batches of 8,192, BAQ'd together, then pushed and drained one at a time in file order (same pileup as before). 4-lane slot fill on chr19 at the default skip: ~0.92 at 8,192 records (0.79 at 1,024).
+- `baq-selftest`: every supported kernel vs htslib on copies of each read, QUAL memcmp. All 1,431,323 chr19 reads and 200,000 synthetic reads (indels, clips, N, low quality, reads off the reference end) identical for 4-lane AVX2 and 8-lane-on-AVX2. `install.sh` runs it (plus 300k real reads with `--smoke-bam`) and fails the install on a mismatch. AVX-512 instructions are not testable on this Zen 3 host (Intel SDE needs a licence click-through); the first AVX-512 host's install self-test covers them.
+- All frozen chr19 references reproduce with the SIMD kernel and with `--baq-simd off`.
+- Full test BAM, `-t 32 --shards 16`, two runs each: `taps-full` processing 42.6/47.6 s → 28.9/28.9 s, BAQ thread-s 1,046/1,138 → 576/569 (1.9×); default `taps` 20.2/22.2 s → 15.9/17.5 s, BAQ thread-s 322/333 → 170/184. Totals identical.
+- `--test` times each kernel at the knee and saves `recommended_baq_simd`; `--baq-simd auto` uses it when the profile matches the host.
+- Default-run worker time now: BAQ 38%, calling callback 36%, read/inflate 14%, pileup 13%.

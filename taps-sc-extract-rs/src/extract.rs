@@ -20,6 +20,7 @@
 //! actually applies BAQ when `compute_baq` is true because we always have FASTA.
 
 use crate::accumulate::{ensure_cell, merge_window_cells, BarcodeIntern, CellMaps};
+use crate::baq_simd::{self, BaqJob};
 use crate::barcode::barcode_from_qname_bytes;
 use crate::calling::{
     call_mctot, classify_strand, keep_after_5prime_trim, DEFAULT_TRIM_R1, DEFAULT_TRIM_R2,
@@ -138,9 +139,9 @@ pub struct WindowTiming {
     pub total_s: f64,
     /// FASTA window fetch plus BAM index seek.
     pub setup_s: f64,
-    /// `bam.read`: BGZF inflate and record decode.
+    /// `bam.read` (BGZF inflate, record decode) and the flag/MAPQ/orphan filters.
     pub read_s: f64,
-    /// Flag/MAPQ/orphan filters and `sam_prob_realn` (BAQ).
+    /// BAQ (`baq_simd::Workspace::run`: SIMD kernel or `sam_prob_realn`).
     pub baq_s: f64,
     /// `bam_plp_push` / `bam_plp_next` and overlap clipping, excluding calling.
     pub pileup_s: f64,
@@ -204,6 +205,8 @@ pub struct ExtractParams {
     pub compute_baq: bool,
     /// Reference BAQ realigns against (when `compute_baq`).
     pub baq_mode: BaqMode,
+    /// BAQ kernel: SIMD width or htslib.
+    pub baq_width: baq_simd::Width,
     pub decomp_threads: usize,
     /// Fill per-barcode (pos, t, c) maps. Off for stats-only (saves RAM).
     pub accumulate: bool,
@@ -225,6 +228,7 @@ impl Default for ExtractParams {
             ignore_orphans: true,
             compute_baq: true,
             baq_mode: BaqMode::Taps,
+            baq_width: baq_simd::Width::cpu_best(),
             decomp_threads: 1,
             accumulate: false,
             trim_r1: DEFAULT_TRIM_R1,
@@ -320,7 +324,7 @@ fn matches_masked_ref(rec: &Record, refseq: &[u8]) -> bool {
 /// forward (flags 83/163; unpaired reverse reads too). Everything else,
 /// including 99/147, is OT.
 #[inline]
-fn baq_is_ob(flags: u16) -> bool {
+pub(crate) fn baq_is_ob(flags: u16) -> bool {
     let reverse = flags & htslib::BAM_FREVERSE as u16 != 0;
     let read2 = flags & htslib::BAM_FPAIRED as u16 != 0 && flags & htslib::BAM_FREAD2 as u16 != 0;
     reverse != read2
@@ -332,8 +336,10 @@ const FLAG_FILTER: u16 = (htslib::BAM_FUNMAP
     | htslib::BAM_FQCFAIL
     | htslib::BAM_FDUP) as u16;
 
-/// BAQ_APPLY | BAQ_EXTEND (pysam `compute_baq=True`, `redo_baq=False`).
-const BAQ_FLAGS: i32 = 3;
+/// Records read, filtered and BAQ'd together before they are pushed in order.
+/// Large enough that most reads find same-shape partners for the SIMD lanes
+/// (chr19 at the default skip: ~92% of 4-lane slots filled at 8,192).
+const READ_BATCH: usize = 8192;
 
 struct PlpGuard(htslib::bam_plp_t);
 
@@ -354,27 +360,28 @@ extern "C" {
 /// `--profile-json` times one record (and one pileup column) in this many.
 const PROFILE_STRIDE: u64 = 16;
 
-fn accept_record(
-    rec: &mut Record,
+/// Filters, and the reference to run BAQ against (`None`: no BAQ for this
+/// read). Returns `None` when the read is not pushed at all.
+fn accept_record<'r>(
+    rec: &Record,
     params: &ExtractParams,
-    baq_ref: Option<&BaqRef>,
+    baq_ref: Option<&'r BaqRef>,
     whitelist: Option<&HashSet<String>>,
-    baq_reads: &mut u64,
-) -> bool {
+) -> Option<Option<&'r [u8]>> {
     let flags = rec.flags();
     if flags & FLAG_FILTER != 0 {
-        return false;
+        return None;
     }
     // MAPQ and orphan tests only reject. A rejected read is never pushed, so
     // testing before BAQ leaves calls unchanged and skips the HMM for it.
     if rec.mapq() < params.min_mapq {
-        return false;
+        return None;
     }
     if params.ignore_orphans
         && (flags & htslib::BAM_FPAIRED as u16) != 0
         && (flags & htslib::BAM_FPROPER_PAIR as u16) == 0
     {
-        return false;
+        return None;
     }
     // A read from a filtered-out cell is still pushed (depth caps and overlap
     // pairing stay the same), but its BAQ is skipped: BAQ only changes this
@@ -383,17 +390,11 @@ fn accept_record(
     let excluded = whitelist.is_some_and(|wl| {
         !wl.contains(std::str::from_utf8(barcode_from_qname_bytes(rec.qname())).unwrap_or(""))
     });
-    if let Some(r) = baq_ref.filter(|_| params.compute_baq && !excluded) {
-        let seq = if baq_is_ob(flags) { &r.ob } else { &r.ot };
-        if !params.baq_mode.wants(rec, seq) {
-            return true;
-        }
-        *baq_reads += 1;
-        let _ = unsafe {
-            htslib::sam_prob_realn(rec.inner_mut(), seq.as_ptr() as *const c_char, seq.len() as i64, BAQ_FLAGS)
-        };
-    }
-    true
+    let Some(r) = baq_ref.filter(|_| params.compute_baq && !excluded) else {
+        return Some(None);
+    };
+    let seq: &[u8] = if baq_is_ob(flags) { &r.ob } else { &r.ot };
+    Some(params.baq_mode.wants(rec, seq).then_some(seq))
 }
 
 /// Process one genomic window `[start, end)` with column-wise `bam_plp` pileup.
@@ -572,7 +573,14 @@ pub fn process_window(
         Ok(())
     };
 
-    let mut rec = Record::new();
+    // Records are read in batches: filter, BAQ the whole batch (SIMD kernel
+    // across reads), then push and drain each record in file order exactly as
+    // one-at-a-time processing would. BAQ changes only the read's own
+    // qualities, so running it ahead of the pushes leaves the pileup unchanged.
+    let mut pool: Vec<Record> = (0..READ_BATCH).map(|_| Record::new()).collect();
+    let mut keep = vec![false; READ_BATCH];
+    let mut jobs: Vec<BaqJob> = Vec::with_capacity(READ_BATCH);
+    let mut ws = baq_simd::Workspace::new();
     // Stage clock: `lap` returns seconds since the previous lap when profiling.
     let mut mark = Instant::now();
     let mut lap = |on: bool| -> f64 {
@@ -585,35 +593,45 @@ pub fn process_window(
         d
     };
     let mut plp_s = 0.0f64;
-    // Per-record stage times: every PROFILE_STRIDE-th record, scaled up.
-    let scale = PROFILE_STRIDE as f64;
-    let mut n_rec = 0u64;
-    loop {
-        let sample = profile && n_rec % PROFILE_STRIDE == 0;
-        n_rec += 1;
-        if sample {
-            lap(true);
-        }
-        let got = bam.read(&mut rec);
-        timing.read_s += lap(sample) * scale;
-        match got {
-            None => break,
-            Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
-            Some(Ok(())) => {
-                timing.records += 1;
-                let keep = accept_record(&mut rec, params, baq_ref, whitelist, &mut timing.baq_reads);
-                timing.baq_s += lap(sample) * scale;
-                if !keep {
-                    continue;
+    let mut eof = false;
+    while !eof {
+        lap(profile);
+        jobs.clear();
+        let mut n = 0;
+        while n < READ_BATCH {
+            match bam.read(&mut pool[n]) {
+                None => {
+                    eof = true;
+                    break;
                 }
-                timing.pushed += 1;
-                if unsafe { htslib::bam_plp_push(plp, rec.inner()) } < 0 {
-                    anyhow::bail!("bam_plp_push failed");
+                Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
+                Some(Ok(())) => {
+                    timing.records += 1;
+                    let acc = accept_record(&pool[n], params, baq_ref, whitelist);
+                    keep[n] = acc.is_some();
+                    if let Some(Some(seq)) = acc {
+                        jobs.push(BaqJob {
+                            b: pool[n].inner_mut(),
+                            reference: seq.as_ptr() as *const c_char,
+                            ref_len: seq.len() as i64,
+                        });
+                    }
+                    n += 1;
                 }
-                drain_ready(plp, &mut consume_column)?;
-                plp_s += lap(sample) * scale;
             }
         }
+        timing.read_s += lap(profile);
+        timing.baq_reads += jobs.len() as u64;
+        ws.run(&jobs, params.baq_width);
+        timing.baq_s += lap(profile);
+        for (rec, _) in pool[..n].iter().zip(&keep[..n]).filter(|(_, k)| **k) {
+            timing.pushed += 1;
+            if unsafe { htslib::bam_plp_push(plp, rec.inner()) } < 0 {
+                anyhow::bail!("bam_plp_push failed");
+            }
+            drain_ready(plp, &mut consume_column)?;
+        }
+        plp_s += lap(profile);
     }
     if profile {
         lap(true);
@@ -650,7 +668,7 @@ pub struct BaqRef {
 }
 
 impl BaqRef {
-    fn new(seq: Vec<u8>, mode: BaqMode) -> Self {
+    pub(crate) fn new(seq: Vec<u8>, mode: BaqMode) -> Self {
         match mode {
             BaqMode::Htslib => {
                 let s: Arc<[u8]> = seq.into();

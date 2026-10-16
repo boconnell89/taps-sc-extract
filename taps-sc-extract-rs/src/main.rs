@@ -7,6 +7,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod accumulate;
 mod autotune;
+mod baq_simd;
 mod barcode;
 mod calling;
 mod context;
@@ -34,6 +35,33 @@ fn baq_label(p: &ExtractParams) -> &'static str {
         p.baq_mode.label()
     } else {
         "off"
+    }
+}
+
+/// `--baq-simd auto` takes the kernel `--test --save-profile` measured fastest
+/// on this host, when it is still supported; otherwise the widest one.
+fn resolve_baq_width(choice: baq_simd::BaqSimd, saved: Option<&tune::SavedProfile>) -> Result<baq_simd::Width> {
+    use baq_simd::{BaqSimd, Width};
+    if choice == BaqSimd::Auto {
+        let from_profile = match saved.and_then(|p| p.baq_simd.as_deref()) {
+            Some("avx512") => Some(Width::AVX512),
+            Some("avx2") => Some(Width::AVX2),
+            Some("off") => Some(Width::HTSLIB),
+            _ => None,
+        };
+        if let Some(w) = from_profile.filter(|w| w.supported()) {
+            return Ok(w);
+        }
+    }
+    Width::resolve(choice)
+}
+
+/// Kernel label, or "-" when BAQ is off.
+fn baq_kernel_label(p: &ExtractParams) -> &'static str {
+    if p.compute_baq {
+        p.baq_width.label()
+    } else {
+        "-"
     }
 }
 use crate::extract_noodles::extract_regions_stats_noodles;
@@ -105,6 +133,11 @@ enum Commands {
         /// or clip. `htslib` uses the plain reference (under-calls methylation).
         #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
         baq: BaqMode,
+        /// BAQ kernel: auto (widest this CPU runs), avx512 (8 reads per
+        /// vector), avx2 (4), or off (htslib, one read at a time). All give
+        /// identical results (`baq-selftest`).
+        #[arg(long, value_enum, default_value_t = baq_simd::BaqSimd::Auto)]
+        baq_simd: baq_simd::BaqSimd,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -205,6 +238,11 @@ enum Commands {
         /// BAQ mode: taps (default), taps-full, taps-partial or htslib.
         #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
         baq: BaqMode,
+        /// BAQ kernel: auto (widest this CPU runs), avx512 (8 reads per
+        /// vector), avx2 (4), or off (htslib, one read at a time). All give
+        /// identical results (`baq-selftest`).
+        #[arg(long, value_enum, default_value_t = baq_simd::BaqSimd::Auto)]
+        baq_simd: baq_simd::BaqSimd,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -252,6 +290,21 @@ enum Commands {
         /// Also write the profile and report to this file.
         #[arg(long)]
         report: Option<PathBuf>,
+    },
+    /// Check the SIMD BAQ kernels against htslib, read by read (QUAL must be
+    /// byte-identical). Synthetic reads always; add -b/-f for real reads.
+    BaqSelftest {
+        #[arg(short = 'b', long)]
+        bam: Option<PathBuf>,
+        #[arg(short = 'f', long, requires = "bam")]
+        fasta: Option<PathBuf>,
+        /// Contig to read from the BAM.
+        #[arg(short = 'c', long, default_value = "chr19")]
+        contig: String,
+        #[arg(long, default_value_t = 2_000_000)]
+        max_reads: usize,
+        #[arg(long, default_value_t = 200_000)]
+        synthetic_reads: usize,
     },
     /// Internal: write one shard file from window chunks (spawned by `extract`).
     #[command(hide = true)]
@@ -313,6 +366,31 @@ fn main() -> Result<()> {
                 json: report,
             })?;
         }
+        Commands::BaqSelftest { bam, fasta, contig, max_reads, synthetic_reads } => {
+            use baq_simd::Width;
+            let mut widths = vec![Width::AVX2, Width::AVX2_X8, Width::AVX512];
+            widths.retain(|w| w.supported());
+            eprintln!(
+                "BAQ self-test: CPU kernel {}; testing {}",
+                Width::cpu_best().label(),
+                if widths.is_empty() { "none (no AVX2)".to_string() } else { widths.iter().map(|w| w.label()).collect::<Vec<_>>().join(", ") }
+            );
+            let mut bad = 0usize;
+            for w in &widths {
+                let t = Instant::now();
+                let r = baq_simd::selftest_synthetic(*w, synthetic_reads, 0x5eed)?;
+                eprintln!("  synthetic  {:32} {:>9} reads, {:>9} via SIMD, {} differ ({:.1} s)", w.label(), r.reads, r.simd_reads, r.mismatched, t.elapsed().as_secs_f64());
+                bad += r.mismatched;
+                if let (Some(b), Some(f)) = (&bam, &fasta) {
+                    let t = Instant::now();
+                    let r = baq_simd::selftest_bam(b, f, &contig, max_reads, *w)?;
+                    eprintln!("  {contig:<10} {:32} {:>9} reads, {:>9} via SIMD, {} differ ({:.1} s)", w.label(), r.reads, r.simd_reads, r.mismatched, t.elapsed().as_secs_f64());
+                    bad += r.mismatched;
+                }
+            }
+            anyhow::ensure!(bad == 0, "SIMD BAQ differs from htslib on {bad} read(s); use --baq-simd off");
+            eprintln!("BAQ self-test passed");
+        }
         Commands::WriteShard {
             shard,
             out,
@@ -356,6 +434,7 @@ fn main() -> Result<()> {
             no_ignore_orphans,
             no_baq,
             baq,
+            baq_simd,
             trim_r1,
             trim_r2,
             whitelist,
@@ -405,6 +484,7 @@ fn main() -> Result<()> {
                 ignore_orphans,
                 compute_baq,
                 baq_mode: baq,
+                baq_width: baq_simd::Width::resolve(baq_simd)?,
                 decomp_threads: decomp,
                 accumulate: dump_sites.is_some(),
                 trim_r1,
@@ -487,6 +567,7 @@ fn main() -> Result<()> {
             no_ignore_orphans,
             no_baq,
             baq,
+            baq_simd,
             trim_r1,
             trim_r2,
             whitelist,
@@ -597,6 +678,7 @@ fn main() -> Result<()> {
                 ignore_orphans: !no_ignore_orphans,
                 compute_baq: !no_baq,
                 baq_mode: baq,
+                baq_width: resolve_baq_width(baq_simd, saved.as_ref().map(|(p, _)| p))?,
                 decomp_threads: decomp,
                 accumulate: true,
                 trim_r1,
@@ -634,7 +716,7 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("  Compression:     {compression_name}");
             }
-            eprintln!("  BAQ:             {}", baq_label(&params));
+            eprintln!("  BAQ:             {} (kernel: {})", baq_label(&params), baq_kernel_label(&params));
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
@@ -756,6 +838,7 @@ fn main() -> Result<()> {
                         ("memory_mode", resolved_memory_mode.clone()),
                         ("compression", compression_name.clone()),
                         ("baq", baq_label(&params).to_string()),
+                        ("baq_kernel", baq_kernel_label(&params).to_string()),
                         ("bam", bam.display().to_string()),
                         ("nproc", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).to_string()),
                     ],

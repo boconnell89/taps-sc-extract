@@ -349,6 +349,9 @@ def test_cli_forwards_baq_mode():
         argv = base + ["--baq", mode]
         cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
         assert cmd[cmd.index("--baq") + 1] == mode
+    argv = base + ["--baq-simd", "off"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    assert cmd[cmd.index("--baq-simd") + 1] == "off"
 
 
 # 10. Real BAM smoke test (chr19)
@@ -469,6 +472,25 @@ def test_chr19_rust_taps_full_baq_unchanged(tmp_path):
     out_h5 = tmp_path / "chr19_rust_taps_full.h5"
     _run_rust_chr19(out_h5, "--baq", "taps-full")
     _assert_same_sites(CHR19_RUST_REFERENCE_TAPS_FULL, out_h5)
+
+
+def test_chr19_rust_simd_baq_matches_htslib_kernel(tmp_path):
+    """Default BAQ with the htslib kernel (--baq-simd off) equals the SIMD default."""
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
+    out_h5 = tmp_path / "chr19_rust_simd_off.h5"
+    _run_rust_chr19(out_h5, "--baq-simd", "off")
+    _assert_same_sites(CHR19_RUST_REFERENCE, out_h5)
+
+
+def test_rust_baq_selftest_synthetic():
+    """SIMD BAQ kernels equal htslib read by read on synthetic reads."""
+    import subprocess
+    from taps_sc_extract.cli import find_rust_binary
+
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        pytest.skip("Rust binary not built.")
+    subprocess.run([rust_bin, "baq-selftest", "--synthetic-reads", "50000"], check=True, capture_output=True)
 
 
 def test_chr19_rust_htslib_baq_unchanged(tmp_path):
