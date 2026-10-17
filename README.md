@@ -311,17 +311,7 @@ Best case on this machine, three runs:
 
 Fastest options on the same machine: `--baq taps-partial` 23.6 s, `--no-baq` 21.8 s, `--compression blosc` 28.8 s with 2.7× smaller output.
 
-### Improvement history (same machine and dataset)
-
-| Change | Processing | HDF5 write | Total wall | Peak memory |
-|---|---:|---:|---:|---:|
-| Baseline, 2026-10-14 (`026c52e`; htslib BAQ, 100 Mb windows, in-process writers) | 1.0× | 1.0× | 1.0× | 29.7 GB |
-| Balanced windows, libdeflate, shared BAQ references, one writer process per shard, native build, per-cell sorted vectors (2026-10-15) | 1.5× | 2.2× | 1.7× | 11.5 + 10.2 GB |
-| TAPS-aware BAQ (correctness; same cost) | 1.6× | 2.5× | 1.8× | 12.5 + 10.7 GB |
-| Skip BAQ for reads that already match (new default) | 3.0× | 2.4× | 2.8× | 12.5 + 10.7 GB |
-| SIMD BAQ, AVX2 (current) | **3.8×** | **2.4×** | **3.2×** | 13.3 + 10.7 GB |
-
-Baseline output used htslib BAQ (CpG 70.86%); current output uses TAPS-aware BAQ (CpG 71.62%). Running the HMM on every read (`--baq taps-full`) is 2.2× faster than the baseline's processing. Detailed snapshots: [`code/nvme-profiling-2026-10-14.md`](code/nvme-profiling-2026-10-14.md), [`code/nvme-profiling-2026-10-15.md`](code/nvme-profiling-2026-10-15.md), [`code/rust-implementation-log.md`](code/rust-implementation-log.md).
+How speed changed across releases: [Performance History](#performance-history).
 
 ### Servers
 
@@ -417,6 +407,24 @@ pytest tests/ -v                        # includes chr19 BAM tests when the data
 ```
 
 The chr19 tests check the Rust engine bit for bit against a frozen reference (`test_chr19_rust_tapsskip_2026-10-16/`, default BAQ; `--baq taps-full` against `test_chr19_rust_tapsbaq_2026-10-16/`, `--baq htslib` against `test_chr19_rust_overlapfix_2026-10-15/`), and require Rust `--no-baq` to equal the Python engine at every cell and position.
+
+---
+
+## Performance History
+
+Reduction in time and memory relative to the first measured build (2026-10-14, `026c52e`), on the reference workstation and test dataset under [Performance](#performance), `-t 32 --shards 16`, LZF. Negative is better.
+
+| Release | Processing time | HDF5 write time | Total wall time | Peak memory |
+|---|---:|---:|---:|---:|
+| First measured build (2026-10-14): htslib BAQ, 100 Mb windows, in-process writers | 0% | 0% | 0% | 0% |
+| 2026-10-15: balanced windows, libdeflate, shared BAQ references, one writer process per shard, native build, per-cell sorted vectors | −35% | −55% | −42% | −27% |
+| 2026-10-16: TAPS-aware BAQ (correctness fix; same cost) | −36% | −59% | −44% | −22% |
+| 2026-10-16: skip BAQ for reads that already match the masked reference (new default) | −67% | −59% | −65% | −22% |
+| 2026-10-16: SIMD BAQ, AVX2 (current) | **−74%** | **−59%** | **−69%** | −19% (−39% in stream mode) |
+
+- Peak memory counts the extraction process plus the writer processes.
+- The first build used htslib BAQ (CpG 70.86%); later builds use TAPS-aware BAQ (CpG 71.62%). Running BAQ on every read (`--baq taps-full`) the current build still needs 55% less processing time than the first.
+- Detailed snapshots: [`code/nvme-profiling-2026-10-14.md`](code/nvme-profiling-2026-10-14.md), [`2026-10-15`](code/nvme-profiling-2026-10-15.md), [`2026-10-16`](code/nvme-profiling-2026-10-16.md); change log: [`code/rust-implementation-log.md`](code/rust-implementation-log.md).
 
 ---
 
