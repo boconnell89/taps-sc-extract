@@ -31,3 +31,20 @@ comp_blosc-zstd        proc   17.0 write   24.8 total   41.9 out   1.06 GB extra
 - Whole-dataset `baq-selftest`: 53,675,651 reads on 60 contigs identical to htslib for the 4-lane and 8-lane (on AVX2) kernels.
 - Worker time split at the default: BAQ 38%, calling 36%, read/inflate 14%, pileup 13%. Calling is the next target.
 - Extraction peak is ~0.8 GB above the pre-SIMD build (12.5 → 13.3 GB); not yet investigated.
+
+## --context and blosc default (same day, after `a733a66`)
+
+Defaults now `--compression blosc`. `-t 32 --shards 16 --memory-mode memory`.
+
+```
+both_r1      proc  16.0 write  11.3 total  27.3 extractMB  13208 writersMB  10698
+both_r2      proc  15.4 write  12.2 total  27.6 extractMB  13138 writersMB  10687
+CG_r1        proc  13.3 write   0.6 total  13.9 extractMB   6829 writersMB   1342
+CG_r2        proc  13.2 write   0.6 total  13.8 extractMB   7084 writersMB   1338
+CH_r1        proc  15.6 write  11.4 total  27.0 extractMB  12515 writersMB  10262
+CH_r2        proc  16.2 write  11.7 total  28.0 extractMB  13144 writersMB  10254
+both_nobaq   proc   8.2 write  12.3 total  20.4 extractMB  10923 writersMB  10678
+CG_nobaq     proc   5.5 write   0.6 total   6.1 extractMB   2026 writersMB   1341
+```
+
+Output: both 1.49 GB, CG 0.15 GB, CH 1.34 GB.

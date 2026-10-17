@@ -11,7 +11,7 @@ import logging
 import resource
 import time
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pysam
@@ -56,6 +56,7 @@ def extract_methylation(
     ignore_overlaps: bool = True,
     trim_r1: int = DEFAULT_TRIM_R1,
     trim_r2: int = DEFAULT_TRIM_R2,
+    contexts: Tuple[str, ...] = ("CG", "CH"),
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -77,6 +78,9 @@ def extract_methylation(
         ignore_overlaps: Whether to skip overlapping mate bases (default True).
         trim_r1: Drop this many 5' sequenced bases of read 1 (default 0).
         trim_r2: Drop this many 5' sequenced bases of read 2 (default 10).
+        contexts: Methylation contexts to extract, any of "CG", "CH" (default
+            both). Columns of the other context are skipped and its HDF5 group
+            is not written.
 
     Returns:
         Summary dictionary with counts, methylation percentages, and performance metrics.
@@ -183,6 +187,8 @@ def extract_methylation(
                             ctx_tri = "CHH"
                         ctx = "CH"
                 else:
+                    continue
+                if ctx not in contexts:
                     continue
 
                 target_accum = accum_cg if ctx == "CG" else accum_ch

@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::extract::{estimate_bam_traffic, BamTraffic, BaqMode, ExtractParams};
+use crate::extract::{estimate_bam_traffic, BamTraffic, BaqMode, ContextSel, ExtractParams};
 
 /// "taps", "htslib" or "off".
 fn baq_label(p: &ExtractParams) -> &'static str {
@@ -138,6 +138,11 @@ enum Commands {
         /// identical results (`baq-selftest`).
         #[arg(long, value_enum, default_value_t = baq_simd::BaqSimd::Auto)]
         baq_simd: baq_simd::BaqSimd,
+        /// Methylation contexts to extract: both (default), CG or CH. With one
+        /// context the other's pileup columns are skipped and its HDF5 group
+        /// (/CG or /CH) is not written.
+        #[arg(long, value_enum, default_value_t = ContextSel::Both, ignore_case = true)]
+        context: ContextSel,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -206,8 +211,9 @@ enum Commands {
         /// Optional expected cell count (auto-detected from whitelist if omitted).
         #[arg(long)]
         expected_cells: Option<usize>,
-        /// HDF5 compression (Rust default: lzf).
-        #[arg(long, default_value = "lzf")]
+        /// HDF5 compression (default: blosc, LZ4 level 9: as fast as lzf on the
+        /// test data with 2.7x smaller files; R needs rhdf5filters for blosc and lzf).
+        #[arg(long, default_value = "blosc")]
         compression: String,
         /// Blosc internal threads per shard writer (blosc / blosc-zstd only).
         /// Default 1: more threads measured no gain (2026-10-15), because most
@@ -243,6 +249,11 @@ enum Commands {
         /// identical results (`baq-selftest`).
         #[arg(long, value_enum, default_value_t = baq_simd::BaqSimd::Auto)]
         baq_simd: baq_simd::BaqSimd,
+        /// Methylation contexts to extract: both (default), CG or CH. With one
+        /// context the other's pileup columns are skipped and its HDF5 group
+        /// (/CG or /CH) is not written.
+        #[arg(long, value_enum, default_value_t = ContextSel::Both, ignore_case = true)]
+        context: ContextSel,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -435,6 +446,7 @@ fn main() -> Result<()> {
             no_baq,
             baq,
             baq_simd,
+            context,
             trim_r1,
             trim_r2,
             whitelist,
@@ -485,6 +497,7 @@ fn main() -> Result<()> {
                 compute_baq,
                 baq_mode: baq,
                 baq_width: baq_simd::Width::resolve(baq_simd)?,
+                context,
                 decomp_threads: decomp,
                 accumulate: dump_sites.is_some(),
                 trim_r1,
@@ -568,6 +581,7 @@ fn main() -> Result<()> {
             no_baq,
             baq,
             baq_simd,
+            context,
             trim_r1,
             trim_r2,
             whitelist,
@@ -645,6 +659,7 @@ fn main() -> Result<()> {
                 mode: &memory_mode,
                 budget_gb,
                 mapped_reads: traffic.mapped_reads,
+                site_share: context.site_share(),
                 cell_count: cell_source.count(),
                 genome_mb: selected_bp / 1_000_000,
                 n_shards,
@@ -679,6 +694,7 @@ fn main() -> Result<()> {
                 compute_baq: !no_baq,
                 baq_mode: baq,
                 baq_width: resolve_baq_width(baq_simd, saved.as_ref().map(|(p, _)| p))?,
+                context,
                 decomp_threads: decomp,
                 accumulate: true,
                 trim_r1,
@@ -717,6 +733,7 @@ fn main() -> Result<()> {
                 eprintln!("  Compression:     {compression_name}");
             }
             eprintln!("  BAQ:             {} (kernel: {})", baq_label(&params), baq_kernel_label(&params));
+            eprintln!("  Contexts:        {}", params.context.label());
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
@@ -814,6 +831,7 @@ fn main() -> Result<()> {
                 crate::autotune::process_peak_rss_mb(),
                 crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
                 writer_reports.iter().filter(|w| w.child).count(),
+                params.context,
             );
             if let Some(line) = crate::h5_out::writer_summary_line(&writer_reports, master_s) {
                 eprintln!("{line}");
@@ -839,6 +857,7 @@ fn main() -> Result<()> {
                         ("compression", compression_name.clone()),
                         ("baq", baq_label(&params).to_string()),
                         ("baq_kernel", baq_kernel_label(&params).to_string()),
+                        ("context", params.context.label().to_string()),
                         ("bam", bam.display().to_string()),
                         ("nproc", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).to_string()),
                     ],
@@ -939,6 +958,7 @@ fn print_extraction_summary(
     peak_rss_mb: f64,
     writer_peak_mb: f64,
     n_writer_procs: usize,
+    context: ContextSel,
 ) {
     let cg_c = r.stats.cg_c;
     let cg_t = r.stats.cg_t;
@@ -1003,36 +1023,20 @@ fn print_extraction_summary(
     eprintln!("Shards Written:        {n_shards}");
     eprintln!("Streaming Mode:        {mode}");
     eprintln!("----------------------------------------------------------------------");
-    eprintln!(
-        "CpG Methylation:       {:.3}% ({c} / {tot})",
-        pct(cg_c, cg_all),
-        c = fmt_u64(cg_c),
-        tot = fmt_u64(cg_all)
-    );
-    eprintln!(
-        "CHG Methylation:       {:.3}% ({c} / {tot})",
-        pct(chg_c, chg_all),
-        c = fmt_u64(chg_c),
-        tot = fmt_u64(chg_all)
-    );
-    eprintln!(
-        "CHH Methylation:       {:.3}% ({c} / {tot})",
-        pct(chh_c, chh_all),
-        c = fmt_u64(chh_c),
-        tot = fmt_u64(chh_all)
-    );
-    eprintln!(
-        "CH (Combined):         {:.3}% ({c} / {tot})",
-        pct(ch_c, ch_all),
-        c = fmt_u64(ch_c),
-        tot = fmt_u64(ch_all)
-    );
-    eprintln!(
-        "Pooled (All C/G sites):{:.3}% ({c} / {tot})",
-        pct(total_mod, total_calls),
-        c = fmt_u64(total_mod),
-        tot = fmt_u64(total_calls)
-    );
+    let line = |label: &str, want: bool, c: u64, tot: u64| {
+        if want {
+            eprintln!("{label}{:.3}% ({} / {})", pct(c, tot), fmt_u64(c), fmt_u64(tot));
+        } else {
+            eprintln!("{label}not extracted (--context {})", if context == ContextSel::Cg { "CG" } else { "CH" });
+        }
+    };
+    let cg_on = context.wants(crate::context::Context::Cg);
+    let ch_on = context.wants(crate::context::Context::Ch);
+    line("CpG Methylation:       ", cg_on, cg_c, cg_all);
+    line("CHG Methylation:       ", ch_on, chg_c, chg_all);
+    line("CHH Methylation:       ", ch_on, chh_c, chh_all);
+    line("CH (Combined):         ", ch_on, ch_c, ch_all);
+    line("Pooled (All C/G sites):", true, total_mod, total_calls);
     eprintln!("======================================================================");
 }
 

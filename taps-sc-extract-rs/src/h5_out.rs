@@ -594,8 +594,10 @@ pub fn write_master_h5(out_dir: &Path, n_shards: usize) -> Result<std::path::Pat
     let file = File::create(&master_path)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", master_path.display()))?;
     write_version(&file)?;
-    let cg = file.create_group("CG")?;
-    let ch = file.create_group("CH")?;
+    // Groups are created when a shard has them, so a --context CG run has no /CH
+    // (like its shards). CG first, then CH, as in every file.
+    let mut cg: Option<hdf5_metno::Group> = None;
+    let mut ch: Option<hdf5_metno::Group> = None;
     for s in 0..n_shards.max(1) {
         let shard_fn = format!("shard_{s:03}.h5");
         let shard_path = out_dir.join(&shard_fn);
@@ -605,12 +607,20 @@ pub fn write_master_h5(out_dir: &Path, n_shards: usize) -> Result<std::path::Pat
         let shard = File::open(&shard_path)
             .map_err(|e| anyhow::anyhow!("open {}: {e}", shard_path.display()))?;
         if let Ok(g) = shard.group("CG") {
+            if cg.is_none() {
+                cg = Some(file.create_group("CG")?);
+            }
+            let cg = cg.as_ref().expect("created above");
             for bc in g.member_names()? {
                 cg.link_external(&shard_fn, &format!("CG/{bc}"), &bc)
                     .map_err(|e| anyhow::anyhow!("CG external link {bc}: {e}"))?;
             }
         }
         if let Ok(g) = shard.group("CH") {
+            if ch.is_none() {
+                ch = Some(file.create_group("CH")?);
+            }
+            let ch = ch.as_ref().expect("created above");
             for bc in g.member_names()? {
                 ch.link_external(&shard_fn, &format!("CH/{bc}"), &bc)
                     .map_err(|e| anyhow::anyhow!("CH external link {bc}: {e}"))?;

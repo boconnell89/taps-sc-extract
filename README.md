@@ -15,7 +15,8 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 - **Bounded memory**: The run summary reports the extraction process's peak RSS and, separately, the shard-writer processes' combined peak.
 - **One writer process per shard**: hdf5-metno serializes every HDF5 call in a process behind one lock. With more than one shard, the Rust engine writes each shard in its own child process (`--writer-mode process`, default), so shards compress and write in parallel.
 - **Machine tuning (`--test`)**: Measures this machine on a built-in synthetic workload, optionally samples your BAM, and recommends `-t`, decompression and writer settings. `--save-profile` makes them the defaults on this host.
-- **HDF5 compression options**: `lzf` (default), `blosc` (LZ4 level 9: as fast as `lzf`, 2.7× smaller files), `gzip` (readable by plain `rhdf5`), `gzip-shuffle`, `gzip6`, `blosc-zstd` (smallest) and uncompressed `none`. See [Compression](#1-compression---compression).
+- **HDF5 compression options**: `blosc` (Rust default; LZ4 level 9), `lzf`, `gzip` (Python default; readable by plain `rhdf5`), `gzip-shuffle`, `gzip6`, `blosc-zstd` (smallest) and uncompressed `none`. See [Compression](#1-compression---compression).
+- **Context selection (`--context CG|CH`)**: extract only CpG (or only CH). CG-only skips the CH columns, writes no `/CH` group, and runs 98% faster end to end on the test data.
 - **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
 - **Single-Pass HDF5 Writer**: Bypasses HDF5 B-tree resizing overhead, writing tens of thousands of cell datasets in **seconds** rather than hours.
 - **Multi-File Sharded Directories**: Partitions cell barcodes across $N$ parallel shard files (`shard_000.h5`..`shard_NNN.h5`) and creates a portable `master.h5` with relative `ExternalLink` references.
@@ -100,7 +101,7 @@ taps-sc-extract \
   --log-file extraction.log
 ```
 
-### 3. Maximum Speed Run with LZF or Raw Writing
+### 3. CpG Only
 ```bash
 taps-sc-extract \
   -b /path/to/aligned_taps.srt.bam \
@@ -108,9 +109,10 @@ taps-sc-extract \
   -o /path/to/sharded_output/ \
   -t 24 \
   --shards 16 \
-  --compression lzf \
+  --context CG \
   --log-file extraction.log
 ```
+The output has `/CG` only. In Amethyst, index only that context: `indexChr(obj, "CG")` (indexing `"CH"` on it prints a missing-object error for every cell).
 
 ---
 
@@ -127,7 +129,8 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--no-temp-file] [--temp-dir TEMP_DIR]
                        [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
-                       [--no-baq] [--baq {taps,taps-full,taps-partial,htslib}] [--no-overlap-clip]
+                       [--no-baq] [--baq {taps,taps-full,taps-partial,htslib}] [--baq-simd {auto,avx512,avx2,off}]
+                       [--context {both,CG,CH}] [--no-overlap-clip]
                        [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
                        [--writer-mode {auto,process,thread}] [--profile-json PROFILE_JSON]
                        [--test] [--test-quick] [--save-profile] [--test-report TEST_REPORT]
@@ -155,7 +158,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--decomp-threads` | `int` | Rust: 4 / 2 / 0 by worker count; Python: 1 | BAM BGZF decompression threads per worker (`0` = inflate on the worker thread). |
 | `--chunk-size-mb` | `int` | `10` Python / auto Rust | Genomic window size in megabases. Rust auto: about 6 windows per worker, 2–100 Mb. |
 | `--shards` | `int` | `1` | Number of output HDF5 shard files to write in parallel (`0` = auto: 1/8/16/32). An `.h5` file name with multiple shards is written to a directory named after the file stem. Rust balances shards by site count (barcodes are hashed into 4 buckets per shard, and buckets are packed by size), so which `shard_XXX.h5` holds a cell differs from the Python engine; `master.h5` links every cell either way. A single cell is never split, so the largest cell sets a floor on write time. |
-| `--compression` | `str` | `gzip` Python / `lzf` Rust | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc`, `blosc-zstd`, `none`. |
+| `--compression` | `str` | `gzip` Python / `blosc` Rust | Compression: `gzip` (level 1 deflate), `gzip-shuffle`, `gzip6`, `lzf`, `blosc` (LZ4 level 9), `blosc-zstd`, `none`. Reading `blosc`/`lzf` in R needs `rhdf5filters`; in Python, `import hdf5plugin` before `h5py` for `blosc`. |
 | `--max-writer-threads` | `int` | `0` | Maximum concurrent shard writers after extraction (`0` = auto: up to shard count, cores and memory; in-process writers capped at 6). |
 | `--writer-mode` | `str` | `auto` | Rust shard writers: `process` (one child per shard, default when shards > 1) or `thread` (in-process, one shared HDF5 lock). |
 | `--profile-json` | `str` | `None` | Rust: write per-phase CPU use, per-stage and per-window timings (1 in 16 reads and pileup columns are timed and scaled up) and per-shard writer reports (read, create, fill, HDF5 write seconds, bytes, peak memory) to JSON. Adds ~2% to processing time. |
@@ -168,7 +171,9 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--min-mapq` | `int` | `0` | Minimum mapping quality for alignment filtering. |
 | `--max-depth` | `int` | `250` | Maximum pileup depth. |
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
-| `--baq` | `taps`\|`taps-full`\|`taps-partial`\|`htslib` | `taps` | BAQ mode (Rust engine). The `taps` modes realign OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `taps` skips reads that already match that reference exactly (~2× faster than `taps-full`, 0.0007% of CG calls differ); `taps-full` runs every read; `taps-partial` only reads with an indel or clip (~4×, 0.06%). `htslib` is samtools/asTair BAQ on the plain reference and under-calls methylation. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
+| `--baq` | `taps`\|`taps-full`\|`taps-partial`\|`htslib` | `taps` | BAQ mode (Rust engine). The `taps` modes realign OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `taps` skips reads that already match that reference exactly (processing 69% faster than `taps-full`, 0.0007% of CG calls differ); `taps-full` runs every read; `taps-partial` only reads with an indel or clip (50% faster than `taps`, 0.06% of CG calls differ). `htslib` is samtools/asTair BAQ on the plain reference and under-calls methylation. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
+| `--baq-simd` | `auto`\|`avx512`\|`avx2`\|`off` | `auto` | BAQ kernel: 8 reads per vector (AVX-512), 4 (AVX2), or htslib one read at a time. All give identical results. |
+| `--context` | `both`\|`CG`\|`CH` | `both` | Contexts to extract. `CG` or `CH` skips the other context's pileup columns and leaves its HDF5 group out. See [`--context`](#10---context-cg-or-ch-only). |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
 | `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
 | `--trim-r1` | `int` | `0` | Drop this many 5′ sequenced bases of read 1 before calling. |
@@ -182,25 +187,26 @@ Comparisons in this guide are relative (fold change or percent) and come from th
 
 ### 1. Compression (`--compression`)
 
-Rust engine, full test dataset, 16 shards, one run per codec (2026-10-16). Compression runs inside the writer processes, so it changes only the HDF5 write phase; processing is the same for every codec. Write-time differences under about 10% are within run-to-run noise.
+Rust engine, full test dataset, 16 shards, one run per codec (2026-10-16). Compression runs inside the writer processes, so it changes only the HDF5 write phase; processing is the same for every codec. Differences under about 10% are within run-to-run noise. Speed is relative to the Rust default, `blosc` (negative = slower).
 
-| Codec | HDF5 write time vs `lzf` | Total wall vs `lzf` | Output size vs `none` | R / Bioconductor requirement |
+| Codec | HDF5 write speed vs `blosc` | Total wall speed vs `blosc` | Output size vs `none` | R / Bioconductor requirement |
 | :--- | :---: | :---: | :---: | :--- |
-| **`lzf`** *(Rust default)* | 1.00× | 1.00× | 8.6× smaller | `library(rhdf5filters)` |
-| **`blosc`** (LZ4, level 9) | 0.93× | 0.97× | 23× smaller | `library(rhdf5filters)` |
-| **`gzip`** (deflate level 1; Python default) | 1.13× | 1.06× | 17× smaller | **Plain `rhdf5`, no extra packages** |
-| **`gzip-shuffle`** (byte shuffle + deflate 1) | 1.40× | 1.16× | 28× smaller | Plain `rhdf5` |
-| **`gzip6`** (deflate level 6) | 1.73× | 1.28× | 18× smaller | Plain `rhdf5` |
-| **`blosc-zstd`** | 1.92× | 1.41× | **32× smaller** (smallest) | `library(rhdf5filters)` |
-| **`none`** | 3.6× | 2.2× | 1× (34 GB here) | Plain `rhdf5` |
+| **`blosc`** (LZ4, level 9) *(Rust default)* | 0% | 0% | 96% smaller | `library(rhdf5filters)` |
+| **`lzf`** | −7% | −3% | 88% smaller | `library(rhdf5filters)` |
+| **`gzip`** (deflate level 1; Python default) | −18% | −8% | 94% smaller | **Plain `rhdf5`, no extra packages** |
+| **`gzip-shuffle`** (byte shuffle + deflate 1) | −34% | −17% | 96% smaller | Plain `rhdf5` |
+| **`gzip6`** (deflate level 6) | −46% | −24% | 95% smaller | Plain `rhdf5` |
+| **`blosc-zstd`** | −52% | −31% | **97% smaller** (smallest) | `library(rhdf5filters)` |
+| **`none`** | −74% | −55% | 0% (34 GB here) | Plain `rhdf5` |
 
-- **`blosc` writes as fast as `lzf` and its files are 2.7× smaller**, with the same R requirement. It is the better choice when you have `rhdf5filters`.
+- **`blosc` is the Rust default since 2026-10-16**: it wrote as fast as the previous default `lzf` with files 63% smaller (1.5 GB vs 4.0 GB here), and R needs the same `rhdf5filters` package for both. Python readers need `import hdf5plugin` before opening the file with `h5py` (`lzf` is built into h5py; Blosc is not).
 - **`gzip-shuffle`** is the smallest output that plain `rhdf5` reads without plugins.
+- **`blosc-zstd`** gives the smallest files, at about half the write speed.
 - **`none`** is slowest here because 34 GB has to reach the disk; the writers are disk-bound, not compression-bound.
 
 ### 2. `-t, --workers`
 - **Mechanism**: Rayon threads, each processing genomic windows. Extraction is CPU-bound. With the default BAQ, worker time splits about 38% BAQ, 36% calling, 14% BAM read and inflate, 13% pileup.
-- **Recommendation**: Use all logical CPUs. On the 16-core / 32-thread reference machine, 32 workers process 1.4× faster than 16 (SMT). `0` = auto (CPUs, bounded by the memory budget), or the saved `--test` profile.
+- **Recommendation**: Use all logical CPUs. On the 16-core / 32-thread reference machine, 32 workers process 39% faster than 16 (SMT). `0` = auto (CPUs, bounded by the memory budget), or the saved `--test` profile.
 
 ### 3. `--decomp-threads` (BAM BGZF decompression)
 - **Mechanism**: htslib threads per worker that inflate BGZF blocks ahead of the reader.
@@ -213,7 +219,7 @@ Rust engine, full test dataset, 16 shards, one run per codec (2026-10-16). Compr
 
 ### 5. `--shards`
 - **Mechanism**: Writes $N$ shard files and `master.h5` with relative `ExternalLink`s. Rust hashes barcodes into 4N buckets and packs buckets into shards by site count, so a few deep cells do not land in one shard (the slowest shard sets the write time). Python assigns `md5(bc) % N`.
-- **Recommendation**: Depends on the filesystem and the cell count. On local NVMe, 16 shards write 2.2× faster than one shard (1.5× faster end to end). On a server filesystem with fewer cells, more shards were much slower, so measure there (`--test` probes the output filesystem). The default stays 1 shard below 10,000 cells.
+- **Recommendation**: Depends on the filesystem and the cell count. On local NVMe, 16 shards write 125% faster than one shard (51% faster end to end). On a server filesystem with fewer cells, more shards were much slower, so measure there (`--test` probes the output filesystem). The default stays 1 shard below 10,000 cells.
 - **Few, deep cells** (hundreds of cells, ~1M sites each): one cell is one writer's serial work, so beyond about cells/2 shards, more shards add nothing. The run summary's `Shard writers:` line shows the sites per shard (median, max), the slowest shard, and where writer time went (read, create, fill, HDF5 write).
 
 ### 6. `--max-writer-threads` and `--writer-mode`
@@ -228,10 +234,22 @@ Rust engine, full test dataset, 16 shards, one run per codec (2026-10-16). Compr
 - **`auto`**: the Rust engine estimates sites from the BAM index's mapped-read count (about 14 per read). It picks memory mode only if the extraction process plus the writer processes fit the budget without fewer writers than stream mode would allow; otherwise stream. The writer count is bounded by the same budget. The config block prints the plan (`Memory plan: ... est. peak ~X GB of Y GB`). Set the budget with `--max-memory-fraction` (default 0.6 of available memory) or `--max-memory-gb`.
 
 ### 8. `--temp-dir`
-- Point it at fast local storage. Keep inputs, temp and output off slow network or 9p mounts: on the reference machine the same job ran 1.8× slower from a 9p-mounted HDD than from local NVMe (measured before the 2026-10-15 upgrades).
+- Point it at fast local storage. Keep inputs, temp and output off slow network or 9p mounts: on the reference machine the same job took 80% longer from a 9p-mounted HDD than from local NVMe (measured before the 2026-10-15 upgrades).
 
 ### 9. Profiling a run (`--profile-json`)
 Writes per-phase wall and CPU time, utilisation, a per-stage split of worker time (read/inflate, BAQ, pileup, calling), per-window timings and writer memory. Use it to see what limits a run on a new system.
+
+### 10. `--context` (CG or CH only)
+- **Mechanism**: each pileup column's context is decided before any per-read work; with `--context CG` the CH columns return there, so their calls are never made, stored or written, and no `/CH` group is created (in shards, single files or `master.h5`). The kept context's calls are identical to a `both` run, cell for cell. BAQ and the pileup itself still run on every read, since any read can cover a CpG. Both engines support it.
+- **Measured** (full test dataset, two runs each, CH is 96% of sites):
+
+| | Processing | HDF5 write | Total wall | Extraction memory | Writer memory |
+|---|---:|---:|---:|---:|---:|
+| `--context CG` vs `both` | 18% faster | ~1,900% faster | **98% faster** | 47% less | 87% less |
+| `--context CG --no-baq` vs `both --no-baq` | 49% faster | ~1,900% faster | **234% faster** | 81% less | 87% less |
+| `--context CH` vs `both` | same | same | same | 3% less | 4% less |
+
+- **Amethyst**: index only the extracted context (`indexChr(obj, "CG")`); list barcodes from that group (`ls_df$group == "/CG"`, or `"/CH"` for CH-only output).
 
 ---
 
@@ -267,23 +285,23 @@ chr19, change in calls against `--no-baq`:
 | `--baq htslib` | −3.00% | −0.37% | 66.48 | −4.93% | −0.42% | 0.284 |
 | `--baq taps-full` | −0.07% | −0.84% | 67.24 | −0.60% | −0.38% | 0.297 |
 
-BAQ is the largest single cost in processing. About 72% of reads have an all-M CIGAR and match the masked reference at every A/C/G/T base; for those the HMM mostly lowers end bases that the R2 trim or `--min-baseq` drop anyway. The default `--baq taps` skips them. Full test dataset, AVX2 kernel, speed relative to the default:
+BAQ is the largest single cost in processing. About 72% of reads have an all-M CIGAR and match the masked reference at every A/C/G/T base; for those the HMM mostly lowers end bases that the R2 trim or `--min-baseq` drop anyway. The default `--baq taps` skips them. Full test dataset, AVX2 kernel, speed relative to the default (negative = slower):
 
 | BAQ | Reads through the HMM | Processing speed | Total wall speed | CpG % | CG cell-sites differing from `taps-full` |
 |---|---:|---:|---:|---:|---:|
-| `taps-full` (HMM on every read) | 99% | 0.59× | 0.71× | 71.615 | — |
-| `taps` (default) | 28% | 1.00× | 1.00× | 71.615 | 172 of 25.9M (0.0007%) |
-| `taps-partial` (indel/clip reads only) | 8.5% | 1.5× | 1.26× | 71.585 | 15,671 (0.06%) |
-| `--no-baq` | 0% | 2.0× | 1.36× | 71.543 | 64,056 (0.25%) |
+| `taps-full` (HMM on every read) | 99% | −41% | −29% | 71.615 | — |
+| `taps` (default) | 28% | 0% | 0% | 71.615 | 172 of 25.9M (0.0007%) |
+| `taps-partial` (indel/clip reads only) | 8.5% | +50% | +26% | 71.585 | 15,671 (0.06%) |
+| `--no-baq` | 0% | +106% | +36% | 71.543 | 64,056 (0.25%) |
 
 `htslib` costs the same as `taps-full`.
 
 The HMM runs on SIMD kernels (`--baq-simd`, default `auto`): 8 reads per vector with AVX-512, 4 with AVX2. Results are identical to htslib's scalar code for every read (whole test dataset, 53.7M reads, checked with `baq-selftest`). AVX2 against htslib (`--baq-simd off`) on the reference machine:
 
-| BAQ | BAQ CPU time | Processing speed |
+| BAQ | BAQ speed | Processing speed |
 |---|---:|---:|
-| `taps-full` | 1.9× less | 1.5–1.6× faster |
-| `taps` (default) | 1.9× less | 1.2× faster |
+| `taps-full` | 82–100% faster | 50–60% faster |
+| `taps` (default) | 81–89% faster | 22% faster |
 
 ---
 
@@ -297,19 +315,26 @@ The HMM runs on SIMD kernels (`--baq-simd`, default `auto`): 8 reads per vector 
 | Memory | ~58 GB visible to WSL2 |
 | Storage | WSL2 ext4 VHDX on NVMe; input, temp and output all on it |
 | Dataset | `5base_ucbTn5_sp2.srt.bam`: 53.5M mapped reads, 7,351 cells, mm10, 3.7 GB BAM |
-| Build | `./install.sh` (native), commit `a733a66`; BAQ kernel AVX2 |
-| Settings | `-t 32 --shards 16 --memory-mode memory --compression lzf`, default BAQ (`--baq taps`), auto window size (14.2 Mb, 203 windows), 16 writer processes |
+| Build | `./install.sh` (native); BAQ kernel AVX2 |
+| Settings | `-t 32 --shards 16 --memory-mode memory`, defaults otherwise: `--compression blosc`, `--baq taps`, `--context both`, auto window size (14.2 Mb, 203 windows), 16 writer processes |
 
-Best case on this machine, three runs:
+Best case on this machine with the defaults, two runs:
 
 | Phase | Time |
 |---|---:|
-| Processing (BAM read, BAQ, pileup, calling) | 16.1–17.5 s |
-| HDF5 write (4.0 GB, 16 shards) | 12.2–14.0 s |
-| **Total wall** | **28.3–30.5 s** (~1.8M reads/s) |
-| Peak memory | 13.3 GB extraction + 10.7 GB writers (stream mode: 7.3 GB + 10.7 GB, same speed) |
+| Processing (BAM read, BAQ, pileup, calling) | 15.4–16.0 s |
+| HDF5 write (1.5 GB, 16 shards) | 11.3–12.2 s |
+| **Total wall** | **27.3–27.6 s** (~1.9M reads/s) |
+| Peak memory | 13.2 GB extraction + 10.7 GB writers (stream mode: 7.3 GB + 10.7 GB, same speed) |
 
-Fastest options on the same machine: `--baq taps-partial` 23.6 s, `--no-baq` 21.8 s, `--compression blosc` 28.8 s with 2.7× smaller output.
+Faster options on the same machine:
+
+| Options | Total wall | Output |
+|---|---:|---|
+| `--baq taps-partial` | 23.6 s | same contexts; 0.06% of CG calls differ |
+| `--no-baq` | 20.4 s | no BAQ |
+| `--context CG` | 13.8 s | CpG only, 0.15 GB |
+| `--context CG --no-baq` | 6.1 s | CpG only, no BAQ |
 
 How speed changed across releases: [Performance History](#performance-history).
 
@@ -321,7 +346,7 @@ How speed changed across releases: [Performance History](#performance-history).
 
 ## HDF5 Output Structure & Schema
 
-The output HDF5 matches the Amethyst 1.0+ / Facet specification:
+The output HDF5 matches the Amethyst 1.0+ / Facet specification. With `--context CG` or `--context CH`, only that group is present.
 
 ```
 all_cells.h5 (or master.h5)
@@ -412,18 +437,21 @@ The chr19 tests check the Rust engine bit for bit against a frozen reference (`t
 
 ## Performance History
 
-Reduction in time and memory relative to the first measured build (2026-10-14, `026c52e`), on the reference workstation and test dataset under [Performance](#performance), `-t 32 --shards 16`, LZF. Negative is better.
+How much faster each release is than the first measured build (2026-10-14, `026c52e`), on the reference workstation and test dataset under [Performance](#performance), `-t 32 --shards 16`, default options of each release.
 
-| Release | Processing time | HDF5 write time | Total wall time | Peak memory |
+| Release | Processing | HDF5 write | Total wall | Peak memory |
 |---|---:|---:|---:|---:|
-| First measured build (2026-10-14): htslib BAQ, 100 Mb windows, in-process writers | 0% | 0% | 0% | 0% |
-| 2026-10-15: balanced windows, libdeflate, shared BAQ references, one writer process per shard, native build, per-cell sorted vectors | −35% | −55% | −42% | −27% |
-| 2026-10-16: TAPS-aware BAQ (correctness fix; same cost) | −36% | −59% | −44% | −22% |
-| 2026-10-16: skip BAQ for reads that already match the masked reference (new default) | −67% | −59% | −65% | −22% |
-| 2026-10-16: SIMD BAQ, AVX2 (current) | **−74%** | **−59%** | **−69%** | −19% (−39% in stream mode) |
+| First measured build (2026-10-14): htslib BAQ, 100 Mb windows, in-process writers, LZF | — | — | — | — |
+| 2026-10-15: balanced windows, libdeflate, shared BAQ references, one writer process per shard, native build, per-cell sorted vectors | 54% faster | 123% faster | 72% faster | 27% less |
+| 2026-10-16: TAPS-aware BAQ (correctness fix; same cost) | 56% faster | 146% faster | 77% faster | 22% less |
+| 2026-10-16: skip BAQ for reads that already match the masked reference | 202% faster | 142% faster | 183% faster | 22% less |
+| 2026-10-16: SIMD BAQ (AVX2) | 280% faster | 144% faster | 220% faster | 19% less |
+| 2026-10-16: `blosc` default compression (current; output 63% smaller than LZF) | **304% faster** | **168% faster** | **246% faster** | 20% less (39% less in stream mode) |
 
+- "% faster" is throughput: 246% faster means 3.46 runs in the time the first build took for one.
 - Peak memory counts the extraction process plus the writer processes.
-- The first build used htslib BAQ (CpG 70.86%); later builds use TAPS-aware BAQ (CpG 71.62%). Running BAQ on every read (`--baq taps-full`) the current build still needs 55% less processing time than the first.
+- The first build used htslib BAQ (CpG 70.86%); later builds use TAPS-aware BAQ (CpG 71.62%). Running BAQ on every read (`--baq taps-full`), the current build's processing is still 124% faster than the first build's.
+- Not in the table: `--context CG` (98% faster than the current default end to end).
 - Detailed snapshots: [`code/nvme-profiling-2026-10-14.md`](code/nvme-profiling-2026-10-14.md), [`2026-10-15`](code/nvme-profiling-2026-10-15.md), [`2026-10-16`](code/nvme-profiling-2026-10-16.md); change log: [`code/rust-implementation-log.md`](code/rust-implementation-log.md).
 
 ---

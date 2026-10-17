@@ -170,6 +170,8 @@ pub struct MemoryInputs<'a> {
     pub budget_gb: f64,
     /// Mapped reads on the selected contigs (BAM index); 0 if unknown.
     pub mapped_reads: u64,
+    /// Share of sites in the extracted contexts (`ContextSel::site_share`).
+    pub site_share: f64,
     /// Fallback when `mapped_reads` is 0.
     pub cell_count: usize,
     pub genome_mb: u64,
@@ -185,7 +187,7 @@ pub struct MemoryInputs<'a> {
 pub fn plan_memory(i: &MemoryInputs) -> MemoryPlan {
     let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let sites = if i.mapped_reads > 0 {
-        i.mapped_reads as f64 * SITES_PER_READ
+        i.mapped_reads as f64 * SITES_PER_READ * i.site_share
     } else {
         // No index stats: the old per-cell guess.
         i.cell_count as f64 * (i.genome_mb * 500).min(200_000) as f64
@@ -327,6 +329,7 @@ mod tests {
             mode,
             budget_gb,
             mapped_reads,
+            site_share: 1.0,
             cell_count: 7_351,
             genome_mb: 2_725,
             n_shards,

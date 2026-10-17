@@ -1062,6 +1062,7 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
             mode: "auto",
             budget_gb: budget,
             mapped_reads: d.mapped_reads,
+            site_share: 1.0,
             cell_count: d.cells,
             genome_mb: 0,
             n_shards: rec_writers.max(16),

@@ -190,6 +190,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     n_shards = params.get("n_shards", 1)
     trim_r1 = params.get("trim_r1", DEFAULT_TRIM_R1)
     trim_r2 = params.get("trim_r2", DEFAULT_TRIM_R2)
+    contexts = params.get("contexts", ("CG", "CH"))
 
     # Fetch reference sequence with 2bp padding on each side
     ref_len = fai.get_reference_length(contig)
@@ -258,6 +259,8 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
                     ctx_tri = "CHH"
                 ctx = "CH"
         else:
+            continue
+        if ctx not in contexts:
             continue
 
         target_accum = accum_cg if ctx == "CG" else accum_ch
@@ -560,6 +563,7 @@ def extract_methylation_parallel(
     ignore_overlaps: bool = True,
     trim_r1: int = DEFAULT_TRIM_R1,
     trim_r2: int = DEFAULT_TRIM_R2,
+    contexts: Tuple[str, ...] = ("CG", "CH"),
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -636,6 +640,7 @@ def extract_methylation_parallel(
         "n_shards": effective_shards,
         "trim_r1": trim_r1,
         "trim_r2": trim_r2,
+        "contexts": tuple(contexts),
     }
 
     if effective_shards > 1:
@@ -760,19 +765,17 @@ def extract_methylation_parallel(
             with h5py.File(master_path, "w") as master_h5:
                 meta_group = master_h5.require_group("metadata")
                 meta_group.create_dataset("version", data=b"amethyst2.0.0")
-                cg_master = master_h5.require_group("CG")
-                ch_master = master_h5.require_group("CH")
 
+                # Groups only for contexts some shard has (none for a skipped context).
                 for s in range(effective_shards):
                     shard_fn = shard_filenames[s]
                     shard_fp = shard_paths[s]
                     with h5py.File(shard_fp, "r") as sf:
-                        if "CG" in sf:
-                            for bc in sf["CG"].keys():
-                                cg_master[bc] = h5py.ExternalLink(shard_fn, f"CG/{bc}")
-                        if "CH" in sf:
-                            for bc in sf["CH"].keys():
-                                ch_master[bc] = h5py.ExternalLink(shard_fn, f"CH/{bc}")
+                        for ctx in ("CG", "CH"):
+                            if ctx in sf:
+                                grp = master_h5.require_group(ctx)
+                                for bc in sf[ctx].keys():
+                                    grp[bc] = h5py.ExternalLink(shard_fn, f"{ctx}/{bc}")
 
             logger.info(f"Created master index file: {master_path}")
 

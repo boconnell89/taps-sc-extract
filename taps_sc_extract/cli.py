@@ -139,7 +139,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["gzip", "gzip-shuffle", "gzip6", "lzf", "none", "blosc", "blosc-zstd"],
         default="gzip",
         help=(
-            "HDF5 dataset compression (default: gzip for Python, lzf for Rust). "
+            "HDF5 dataset compression (default: gzip for Python, blosc for Rust). "
             "gzip (level 1 deflate) is fast and 100%% portable to Amethyst/rhdf5 with no extra packages. "
             "gzip-shuffle applies byte shuffling before level 1 deflate for high ratio and speed. "
             "gzip6 uses standard level 6 deflate. "
@@ -237,6 +237,14 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "runs only reads with an indel or clip (~4x faster, 0.06%% of CG calls differ). "
         "'htslib' uses the plain reference like samtools/asTair, which lowers "
         "methylated calls.",
+    )
+    parser.add_argument(
+        "--context",
+        choices=["both", "CG", "CH"],
+        type=lambda v: {"both": "both", "cg": "CG", "ch": "CH"}.get(v.lower(), v),
+        default="both",
+        help="Methylation contexts to extract (default: both). CG or CH skips the other "
+        "context's pileup columns and leaves its HDF5 group (/CG or /CH) out.",
     )
     parser.add_argument(
         "--baq-simd",
@@ -349,7 +357,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 RUST_DEFAULT_CHUNK_SIZE_MB = 0  # auto: sized from worker count
-RUST_DEFAULT_COMPRESSION = "lzf"
+RUST_DEFAULT_COMPRESSION = "blosc"
 
 
 def option_was_set(argv: List[str], option: str) -> bool:
@@ -403,6 +411,8 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.extend(["--baq", parsed.baq])
     if parsed.baq_simd:
         cmd.extend(["--baq-simd", parsed.baq_simd])
+    if parsed.context != "both":
+        cmd.extend(["--context", parsed.context])
     if parsed.no_overlap_clip:
         cmd.append("--no-overlap-clip")
     if parsed.profile_json:
@@ -539,6 +549,7 @@ def main(args: Optional[List[str]] = None) -> int:
             ignore_overlaps=not parsed.no_overlap_clip,
             trim_r1=parsed.trim_r1,
             trim_r2=parsed.trim_r2,
+            contexts=("CG", "CH") if parsed.context == "both" else (parsed.context,),
         )
         return 0
     except Exception as e:

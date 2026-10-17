@@ -5,6 +5,7 @@ Unit and integration tests for taps_sc_extract.
 import os
 import tempfile
 import h5py
+import hdf5plugin  # noqa: F401  (Blosc filter: Rust output is blosc by default)
 import numpy as np
 import pysam
 import pytest
@@ -554,6 +555,65 @@ def chr19_slice_inputs(tmp_path_factory):
     ro.chmod(0o755)
 
 
+def _cells_of(h5_path, ctx):
+    """{barcode: (pos, t, c) array} for one context of a file or master.h5; None if no group."""
+    import hdf5plugin  # noqa: F401  (Blosc filter: the Rust default)
+
+    with h5py.File(str(h5_path), "r") as f:
+        if ctx not in f:
+            return None
+        return {bc: f[ctx][bc]["1"][()][["pos", "t", "c"]] for bc in f[ctx]}
+
+
+def test_cli_forwards_context():
+    from taps_sc_extract.cli import build_rust_command
+
+    for given, want in (("CG", "CG"), ("cg", "CG"), ("CH", "CH")):
+        argv = ["-b", "x.bam", "-f", "x.fa", "-o", "out", "--context", given]
+        cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+        assert cmd[cmd.index("--context") + 1] == want
+
+
+def test_context_selection_both_engines(chr19_slice_inputs, tmp_path):
+    """--context CG / CH: same calls as the full run for that context, no group
+    for the other (shards and master.h5), Rust --no-baq equal to Python."""
+    import subprocess
+    from taps_sc_extract.cli import find_rust_binary
+    from taps_sc_extract.parallel_extractor import extract_methylation_parallel
+
+    paths, _ = chr19_slice_inputs
+    bam = str(paths["ref"])
+    py = {}
+    for name, ctxs in (("both", ("CG", "CH")), ("CG", ("CG",)), ("CH", ("CH",))):
+        out = tmp_path / f"py_{name}"
+        extract_methylation_parallel(
+            bam_path=bam, fasta_path=CHR19_FASTA, out_h5_path=str(out), chroms=["chr19"],
+            n_workers=2, n_shards=2, contexts=ctxs,
+        )
+        py[name] = out / "master.h5"
+    for keep, gone in (("CG", "CH"), ("CH", "CG")):
+        assert _cells_of(py[keep], gone) is None
+        for shard in (tmp_path / f"py_{keep}").glob("shard_*.h5"):
+            with h5py.File(str(shard), "r") as f:
+                assert gone not in f
+        a, b = _cells_of(py["both"], keep), _cells_of(py[keep], keep)
+        assert a.keys() == b.keys() and all(np.array_equal(a[k], b[k]) for k in a)
+
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        pytest.skip("Rust binary not built.")
+    for keep, gone in (("CG", "CH"), ("CH", "CG")):
+        out = tmp_path / f"rs_{keep}"
+        subprocess.run(
+            [rust_bin, "extract", "-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
+             "-t", "2", "--shards", "2", "--no-baq", "--context", keep],
+            check=True, capture_output=True,
+        )
+        assert _cells_of(out / "master.h5", gone) is None
+        a, b = _cells_of(py[keep], keep), _cells_of(out / "master.h5", keep)
+        assert a.keys() == b.keys() and all(np.array_equal(a[k], b[k]) for k in a), keep
+
+
 def test_inputs_index_sam_cram_python(chr19_slice_inputs):
     """prepare_alignment builds missing indexes, converts SAM, reads CRAM."""
     from taps_sc_extract.inputs import prepare_alignment
@@ -825,8 +885,9 @@ def test_rust_command_uses_rust_defaults_unless_set():
     parsed = parse_args(base)
     cmd = build_rust_command("taps-sc-extract-rs", parsed, base)
     assert cmd[cmd.index("--chunk-size-mb") + 1] == "0"
-    assert cmd[cmd.index("--compression") + 1] == "lzf"
+    assert cmd[cmd.index("--compression") + 1] == "blosc"
     assert "--decomp-threads" not in cmd
+    assert "--context" not in cmd
 
     explicit = base + ["--chunk-size-mb", "10", "--compression", "gzip", "--shards", "4"]
     parsed = parse_args(explicit)

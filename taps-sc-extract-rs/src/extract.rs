@@ -207,6 +207,8 @@ pub struct ExtractParams {
     pub baq_mode: BaqMode,
     /// BAQ kernel: SIMD width or htslib.
     pub baq_width: baq_simd::Width,
+    /// Contexts to extract; columns of the others are skipped.
+    pub context: ContextSel,
     pub decomp_threads: usize,
     /// Fill per-barcode (pos, t, c) maps. Off for stats-only (saves RAM).
     pub accumulate: bool,
@@ -229,11 +231,55 @@ impl Default for ExtractParams {
             compute_baq: true,
             baq_mode: BaqMode::Taps,
             baq_width: baq_simd::Width::cpu_best(),
+            context: ContextSel::Both,
             decomp_threads: 1,
             accumulate: false,
             trim_r1: DEFAULT_TRIM_R1,
             trim_r2: DEFAULT_TRIM_R2,
             profile: false,
+        }
+    }
+}
+
+/// `--context`: which methylation contexts to extract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ContextSel {
+    /// CG and CH (default).
+    Both,
+    /// CpG only: CH columns are skipped before any per-read work, and no /CH
+    /// group is written.
+    #[value(name = "CG", alias = "cg")]
+    Cg,
+    /// CH only (CHG + CHH); no /CG group is written.
+    #[value(name = "CH", alias = "ch")]
+    Ch,
+}
+
+impl ContextSel {
+    #[inline]
+    pub fn wants(self, c: Context) -> bool {
+        match self {
+            ContextSel::Both => true,
+            ContextSel::Cg => c == Context::Cg,
+            ContextSel::Ch => c == Context::Ch,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextSel::Both => "CG and CH",
+            ContextSel::Cg => "CG only",
+            ContextSel::Ch => "CH only",
+        }
+    }
+
+    /// Share of methylation sites in the selected contexts (mm10 test data:
+    /// CG ~4% of C/G cell-sites, CH ~96%), for memory estimates.
+    pub fn site_share(self) -> f64 {
+        match self {
+            ContextSel::Both => 1.0,
+            ContextSel::Cg => 0.04,
+            ContextSel::Ch => 0.96,
         }
     }
 }
@@ -473,6 +519,10 @@ pub fn process_window(
             TriContext::Cpg => Context::Cg,
             _ => Context::Ch,
         };
+        // --context: skip the other context's columns before any per-read work.
+        if !params.context.wants(ctx) {
+            return;
+        }
         let pile = unsafe { std::slice::from_raw_parts(col, n_plp as usize) };
         for p in pile {
             let aln = Alignment::new(p);

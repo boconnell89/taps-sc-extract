@@ -106,9 +106,8 @@ class AmethystH5Writer:
         self.compression = compression
         self.compression_level = compression_level
         self.h5 = h5py.File(filepath, mode)
-        # Ensure CG and CH groups exist
-        self.cg_group = self.h5.require_group('CG')
-        self.ch_group = self.h5.require_group('CH')
+        # CG / CH groups are created with their first dataset, so a context
+        # that was not extracted (--context) has no group, as in the Rust engine.
         self.write_metadata()
 
     def write_metadata(self, version: str = "amethyst2.0.0"):
@@ -127,7 +126,7 @@ class AmethystH5Writer:
         if len(records) == 0:
             return
 
-        group = self.cg_group if context == 'CG' else self.ch_group
+        group = self.h5.require_group(context)
         bc_group = group.require_group(barcode)
 
         if '1' in bc_group:
@@ -151,7 +150,7 @@ class AmethystH5Writer:
         if len(records) == 0:
             return
 
-        group = self.cg_group if context == 'CG' else self.ch_group
+        group = self.h5.require_group(context)
         bc_group = group.require_group(barcode)
 
         if '1' not in bc_group:
@@ -261,9 +260,6 @@ def write_sharded_hdf5_dir(
     with h5py.File(master_path, "w") as master_h5:
         meta_group = master_h5.require_group("metadata")
         meta_group.create_dataset("version", data=version.encode("utf-8"))
-        cg_master = master_h5.require_group("CG")
-        ch_master = master_h5.require_group("CH")
-
         for i in range(n_shards):
             shard_bcs = shard_assignments[i]
             if not shard_bcs:
@@ -271,8 +267,8 @@ def write_sharded_hdf5_dir(
             shard_filename = shard_filenames[i]
             for bc in shard_bcs:
                 if bc in cg_data:
-                    cg_master[bc] = h5py.ExternalLink(shard_filename, f"CG/{bc}")
+                    master_h5.require_group("CG")[bc] = h5py.ExternalLink(shard_filename, f"CG/{bc}")
                 if bc in ch_data:
-                    ch_master[bc] = h5py.ExternalLink(shard_filename, f"CH/{bc}")
+                    master_h5.require_group("CH")[bc] = h5py.ExternalLink(shard_filename, f"CH/{bc}")
 
     return master_path
