@@ -7,7 +7,7 @@
 //!   `shard_XXX/chunk_YYYYYY.bin` or merged by barcode string after join.
 //! - Cancellation is `Arc<AtomicBool>`; workers only load it.
 
-use crate::extract::{open_bam, process_window_with_baq, BaqRefs, ExtractParams, WindowResult};
+use crate::extract::{open_bam, process_window, ExtractParams, WindowResult};
 use crate::fasta::FastFaiReader;
 use crate::shard_io::{prepare_shard_dirs, write_window_shards};
 use crate::window::Window;
@@ -146,13 +146,12 @@ fn with_thread_bam<R>(
 fn process_one(
     bam_path: &Path,
     fasta: &FastFaiReader,
-    baq_refs: &BaqRefs,
     window: &Window,
     whitelist: Option<&HashSet<String>>,
     params: &ExtractParams,
 ) -> Result<WindowResult> {
     with_thread_bam(bam_path, params.decomp_threads, |bam| {
-        process_window_with_baq(bam, fasta, baq_refs, window, whitelist, params)
+        process_window(bam, fasta, window, whitelist, params)
     })
 }
 
@@ -179,7 +178,6 @@ pub fn extract_stats_parallel(
     cancel: &CancelFlag,
 ) -> Result<WindowResult> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
-    let baq_refs = BaqRefs::new(fasta.as_ref(), windows);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
     let bam_path = bam_path.to_path_buf();
     let params = params.clone();
@@ -194,7 +192,6 @@ pub fn extract_stats_parallel(
             let r = process_one(
                 &bam_path,
                 fasta.as_ref(),
-                &baq_refs,
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
@@ -235,7 +232,6 @@ pub fn extract_stream_parallel(
 ) -> Result<WindowResult> {
     prepare_shard_dirs(temp_dir, n_shards)?;
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
-    let baq_refs = BaqRefs::new(fasta.as_ref(), windows);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
     let bam_path = bam_path.to_path_buf();
     let temp_dir = temp_dir.to_path_buf();
@@ -253,7 +249,6 @@ pub fn extract_stream_parallel(
             let r = process_one(
                 &bam_path,
                 fasta.as_ref(),
-                &baq_refs,
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
@@ -294,7 +289,6 @@ pub fn extract_memory_parallel(
     cancel: &CancelFlag,
 ) -> Result<(WindowResult, Vec<Vec<crate::shard_io::ChunkFile>>)> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
-    let baq_refs = BaqRefs::new(fasta.as_ref(), windows);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
     let bam_path = bam_path.to_path_buf();
     let mut params = params.clone();
@@ -313,7 +307,6 @@ pub fn extract_memory_parallel(
             let r = process_one(
                 &bam_path,
                 fasta.as_ref(),
-                &baq_refs,
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,

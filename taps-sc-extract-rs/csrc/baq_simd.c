@@ -21,6 +21,7 @@
 
 #define _GNU_SOURCE /* qsort_r */
 #include <errno.h>
+#include <stdio.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -114,11 +115,41 @@ int taps_baq_width_ok(int width)
 
 /* ---- workspace ---- */
 
+/*
+ * One read to BAQ. ref points at reference bases [ref_lo, ref_hi) of the
+ * read's contig (uppercase, unmasked); ref_hi is the contig length when the
+ * slice reaches the contig end. The slice must cover taps_baq_need(b), clipped
+ * to the contig. mask is the base the HMM sees as N ('C' for OT reads, 'G'
+ * for OB reads in the TAPS modes, 0 for none), so no masked copy of the
+ * reference is ever stored.
+ */
 typedef struct {
     bam1_t *b;
     const char *ref;
-    hts_pos_t ref_len;
+    int64_t ref_lo;
+    int64_t ref_hi;
+    int mask;
 } taps_baq_job;
+
+/*
+ * Reference span sam_prob_realn can read for b: [pos - slack, end + slack)
+ * with slack = 2*l_qseq + ref span + 16 (realn.c widens the window by at most
+ * l_qseq plus half a band, and the band is at most ref span + l_qseq + 3).
+ * Not clipped to the contig. Must match `baq_need` in extract.rs.
+ */
+static void taps_baq_need(const bam1_t *b, int64_t *lo, int64_t *hi)
+{
+    const uint32_t *cigar = bam_get_cigar(b);
+    int64_t span = 0;
+    for (uint32_t k = 0; k < b->core.n_cigar; ++k) {
+        int op = cigar[k] & 0xf;
+        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF || op == BAM_CDEL || op == BAM_CREF_SKIP)
+            span += cigar[k] >> 4;
+    }
+    int64_t slack = 2 * (int64_t)b->core.l_qseq + span + 16;
+    *lo = b->core.pos - slack < 0 ? 0 : b->core.pos - slack;
+    *hi = b->core.pos + span + slack;
+}
 
 typedef struct {
     int job;            /* index into jobs[] */
@@ -133,6 +164,7 @@ typedef struct {
     int *order; size_t order_cap;
     void *mat; size_t mat_cap;   /* f, b, s, R, Q, QL for one group */
     uint8_t *fin; size_t fin_cap; /* bq, left, rght for finish() */
+    char *fb; size_t fb_cap;      /* masked reference span for htslib_one() */
 } taps_baq_ws;
 
 void *taps_baq_ws_new(void)
@@ -144,7 +176,7 @@ void taps_baq_ws_free(void *p)
 {
     taps_baq_ws *ws = p;
     if (!ws) return;
-    free(ws->arena); free(ws->prep); free(ws->order); free(ws->mat); free(ws->fin);
+    free(ws->arena); free(ws->prep); free(ws->order); free(ws->mat); free(ws->fin); free(ws->fb);
     free(ws);
 }
 
@@ -221,9 +253,13 @@ static int prepare(taps_baq_ws *ws, size_t *used, const taps_baq_job *j, int job
     uint8_t *seq = bam_get_seq(b);
     for (i = 0; i < (hts_pos_t)lq; ++i)
         tseq[i] = seq_nt16_int[bam_seqi(seq, i)];
+    if (xb < j->ref_lo) return 2; /* slice does not cover it (should not happen) */
     for (i = xb; i < xe; ++i) {
-        if (i >= j->ref_len || j->ref[i] == '\0') { xe = i; break; }
-        tref[i-xb] = seq_nt16_int[seq_nt16_table[(unsigned char)j->ref[i]]];
+        if (i >= j->ref_hi) { xe = i; break; }
+        unsigned char ch = (unsigned char)j->ref[i - j->ref_lo];
+        if (ch == '\0') { xe = i; break; }
+        if (j->mask && ch == j->mask) ch = 'N'; /* TAPS mask, applied here instead of stored */
+        tref[i-xb] = seq_nt16_int[seq_nt16_table[ch]];
     }
     /* probaln_glocal returns 0 without writing state/q here; leave to htslib. */
     if (xe - xb <= 0) return 2;
@@ -360,6 +396,32 @@ static int run_group(taps_baq_ws *ws, const taps_baq_job *jobs, const int *idx, 
 }
 
 /*
+ * htslib's sam_prob_realn on one read. It indexes the reference by contig
+ * coordinate, so it gets a masked copy of only the span it can read
+ * (taps_baq_need), addressed as if the copy started at coordinate 0.
+ */
+static void htslib_one(taps_baq_ws *ws, const taps_baq_job *j)
+{
+    int64_t lo, hi;
+    taps_baq_need(j->b, &lo, &hi);
+    if (lo < j->ref_lo) lo = j->ref_lo;
+    if (hi > j->ref_hi) hi = j->ref_hi;
+    size_t n = hi > lo ? (size_t)(hi - lo) : 0;
+    if (grow((void **)&ws->fb, &ws->fb_cap, n + 1, 0) < 0) {
+        fprintf(stderr, "taps BAQ: out of memory\n");
+        abort();
+    }
+    const char *src = j->ref + (lo - j->ref_lo);
+    for (size_t i = 0; i < n; ++i)
+        ws->fb[i] = (j->mask && src[i] == j->mask) ? 'N' : src[i];
+    ws->fb[n] = '\0';
+    /* Reads stay within [lo, hi); sam_prob_realn stops at ref_len = hi, which
+     * is the contig end whenever the read's span reaches it. */
+    const char *base = (const char *)((uintptr_t)ws->fb - (uintptr_t)lo);
+    sam_prob_realn(j->b, base, hi, BAQ_APPLY | BAQ_EXTEND);
+}
+
+/*
  * BAQ (BAQ_APPLY|BAQ_EXTEND) for jobs[0..n). width: 0 htslib, 4 AVX2,
  * 8 AVX-512, 108 eight lanes on AVX2. Every read is processed exactly once.
  * Returns the number of reads that went through the SIMD kernel.
@@ -371,7 +433,7 @@ int taps_baq_batch(void *wsp, const taps_baq_job *jobs, int n, int width)
         || grow((void **)&ws->prep, &ws->prep_cap, (size_t)n * sizeof(prep_t), 0) < 0
         || grow((void **)&ws->order, &ws->order_cap, (size_t)n * sizeof(int), 0) < 0) {
         for (int j = 0; j < n; ++j)
-            sam_prob_realn(jobs[j].b, jobs[j].ref, jobs[j].ref_len, BAQ_APPLY | BAQ_EXTEND);
+            htslib_one(ws, &jobs[j]);
         return 0;
     }
     size_t used = 0;
@@ -382,7 +444,7 @@ int taps_baq_batch(void *wsp, const taps_baq_job *jobs, int n, int width)
             ws->order[np] = np;
             ++np;
         } else if (r != 1) {
-            sam_prob_realn(jobs[j].b, jobs[j].ref, jobs[j].ref_len, BAQ_APPLY | BAQ_EXTEND);
+            htslib_one(ws, &jobs[j]);
         }
     }
     qsort_r(ws->order, np, sizeof(int), cmp_prep, ws->prep);
@@ -400,8 +462,7 @@ int taps_baq_batch(void *wsp, const taps_baq_job *jobs, int n, int width)
             simd += h - g;
         } else {
             for (int t = g; t < h; ++t) {
-                const taps_baq_job *j = &jobs[ws->prep[ws->order[t]].job];
-                sam_prob_realn(j->b, j->ref, j->ref_len, BAQ_APPLY | BAQ_EXTEND);
+                htslib_one(ws, &jobs[ws->prep[ws->order[t]].job]);
             }
         }
         g = h;

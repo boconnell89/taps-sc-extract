@@ -379,7 +379,8 @@ fn main() -> Result<()> {
         }
         Commands::BaqSelftest { bam, fasta, contig, max_reads, synthetic_reads } => {
             use baq_simd::Width;
-            let mut widths = vec![Width::AVX2, Width::AVX2_X8, Width::AVX512];
+            // htslib: the masked fallback (one copied span per read) must match too.
+            let mut widths = vec![Width::HTSLIB, Width::AVX2, Width::AVX2_X8, Width::AVX512];
             widths.retain(|w| w.supported());
             eprintln!(
                 "BAQ self-test: CPU kernel {}; testing {}",

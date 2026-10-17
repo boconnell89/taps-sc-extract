@@ -15,11 +15,17 @@ use rust_htslib::htslib;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 
+/// One read for `taps_baq_batch` (layout matches `taps_baq_job` in C).
+/// `reference` points at the contig's bases `[ref_lo, ref_hi)` (uppercase,
+/// unmasked; `ref_hi` = contig length when the slice reaches the end), which
+/// must cover `extract::baq_need`. `mask` is the base the HMM sees as N.
 #[repr(C)]
 pub struct BaqJob {
     pub b: *mut htslib::bam1_t,
     pub reference: *const c_char,
-    pub ref_len: i64,
+    pub ref_lo: i64,
+    pub ref_hi: i64,
+    pub mask: c_int,
 }
 
 extern "C" {
@@ -121,20 +127,56 @@ pub struct SelftestResult {
     pub mismatched: usize,
 }
 
-/// BAQ `recs` (with references `refs[i]`) through htslib and through `width`,
-/// on copies, and count reads whose QUAL differs.
-fn compare(recs: &[Record], refs: &[&[u8]], width: Width, ws: &mut Workspace) -> SelftestResult {
+/// One contig, plain and with each strand's TAPS mask applied (for the htslib
+/// reference run in the self-tests).
+struct Contig {
+    plain: Vec<u8>,
+    c_masked: Vec<u8>,
+    g_masked: Vec<u8>,
+}
+
+impl Contig {
+    fn new(plain: Vec<u8>) -> Self {
+        let m = |x: u8| plain.iter().map(|&b| if b == x { b'N' } else { b }).collect();
+        Self { c_masked: m(b'C'), g_masked: m(b'G'), plain }
+    }
+
+    fn masked(&self, mask: u8) -> &[u8] {
+        match mask {
+            b'C' => &self.c_masked,
+            b'G' => &self.g_masked,
+            _ => &self.plain,
+        }
+    }
+}
+
+/// BAQ `recs` two ways and count reads whose QUAL differs: htslib
+/// `sam_prob_realn` against a fully masked contig copy, and `taps_baq_batch`
+/// at `width` with the production inputs (unmasked slice covering
+/// `baq_need`, mask per read).
+fn compare(recs: &[Record], contig: &Contig, masks: &[u8], width: Width, ws: &mut Workspace) -> SelftestResult {
     let mut a: Vec<Record> = recs.to_vec();
     let mut b: Vec<Record> = recs.to_vec();
-    for (r, s) in a.iter_mut().zip(refs) {
+    for (r, &m) in a.iter_mut().zip(masks) {
+        let s = contig.masked(m);
         unsafe {
             htslib::sam_prob_realn(r.inner_mut(), s.as_ptr() as *const c_char, s.len() as i64, 3);
         }
     }
+    let len = contig.plain.len() as u64;
     let jobs: Vec<BaqJob> = b
         .iter_mut()
-        .zip(refs)
-        .map(|(r, s)| BaqJob { b: r.inner_mut(), reference: s.as_ptr() as *const c_char, ref_len: s.len() as i64 })
+        .zip(masks)
+        .map(|(r, &m)| {
+            let (lo, hi) = crate::extract::baq_need(r, len);
+            BaqJob {
+                b: r.inner_mut(),
+                reference: contig.plain[lo as usize..].as_ptr() as *const c_char,
+                ref_lo: lo as i64,
+                ref_hi: hi as i64,
+                mask: c_int::from(m),
+            }
+        })
         .collect();
     let simd_reads = ws.run(&jobs, width);
     let mut mismatched = 0;
@@ -153,7 +195,7 @@ fn compare(recs: &[Record], refs: &[&[u8]], width: Width, ws: &mut Workspace) ->
                 .map(|(i, (p, q))| format!("{i}:{p}/{q}"))
                 .collect();
             eprintln!(
-                "    differs: {} flag {} pos {} cigar {} len {} (htslib/simd at index: {})",
+                "    differs: {} flag {} pos {} cigar {} len {} (htslib/batch at index: {})",
                 String::from_utf8_lossy(orig.qname()),
                 orig.flags(),
                 orig.pos(),
@@ -280,11 +322,17 @@ pub fn selftest_synthetic(width: Width, n_reads: usize, seed: u64) -> Result<Sel
         r.set_mapq(60);
         recs.push(r);
     }
-    let refs: Vec<&[u8]> = vec![reference.as_slice(); recs.len()];
+    // A quarter of the reads use the plain reference (--baq htslib).
+    let masks: Vec<u8> = recs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| if i % 4 == 3 { 0 } else { crate::extract::baq_mask(crate::extract::BaqMode::TapsFull, r.flags()) })
+        .collect();
+    let contig = Contig::new(reference);
     let mut ws = Workspace::new();
     let mut total = SelftestResult::default();
-    for (chunk, rchunk) in recs.chunks(4096).zip(refs.chunks(4096)) {
-        let r = compare(chunk, rchunk, width, &mut ws);
+    for (chunk, mchunk) in recs.chunks(4096).zip(masks.chunks(4096)) {
+        let r = compare(chunk, &contig, mchunk, width, &mut ws);
         total.reads += r.reads;
         total.simd_reads += r.simd_reads;
         total.mismatched += r.mismatched;
@@ -299,7 +347,7 @@ pub fn selftest_bam(bam_path: &Path, fasta: &Path, contig: &str, max_reads: usiz
     let len = fa
         .reference_length(contig)
         .ok_or_else(|| anyhow::anyhow!("contig {contig} not in FASTA"))?;
-    let baq_ref = crate::extract::BaqRef::new(fa.fetch(contig, 0, len)?, crate::extract::BaqMode::TapsFull);
+    let seqs = Contig::new(fa.fetch(contig, 0, len)?);
     let mut bam = crate::input::open_indexed(bam_path)?;
     bam.fetch(contig).map_err(|e| anyhow::anyhow!("fetch {contig}: {e}"))?;
     let mut ws = Workspace::new();
@@ -307,11 +355,11 @@ pub fn selftest_bam(bam_path: &Path, fasta: &Path, contig: &str, max_reads: usiz
     let mut batch: Vec<Record> = Vec::with_capacity(4096);
     let mut rec = Record::new();
     let mut flush = |batch: &mut Vec<Record>, total: &mut SelftestResult| {
-        let refs: Vec<&[u8]> = batch
+        let masks: Vec<u8> = batch
             .iter()
-            .map(|r| if crate::extract::baq_is_ob(r.flags()) { &*baq_ref.ob } else { &*baq_ref.ot })
+            .map(|r| crate::extract::baq_mask(crate::extract::BaqMode::TapsFull, r.flags()))
             .collect();
-        let r = compare(batch, &refs, width, &mut ws);
+        let r = compare(batch, &seqs, &masks, width, &mut ws);
         total.reads += r.reads;
         total.simd_reads += r.simd_reads;
         total.mismatched += r.mismatched;

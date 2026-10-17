@@ -32,13 +32,10 @@ use anyhow::{Context as AnyhowContext, Result};
 use rust_htslib::bam::pileup::Alignment;
 use rust_htslib::bam::{IndexedReader, Read, Record};
 use rust_htslib::htslib;
-use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
@@ -320,15 +317,59 @@ impl BaqMode {
         }
     }
 
-    /// Run the HMM on this read? (`seq` is the reference BAQ would use.)
+    /// Run the HMM on this read? `r` covers the read; `mask` is the base BAQ
+    /// sees as N for it (`baq_mask`).
     #[inline]
-    fn wants(self, rec: &Record, seq: &[u8]) -> bool {
+    fn wants(self, rec: &Record, r: &RefSlice, mask: u8) -> bool {
         match self {
             BaqMode::TapsFull | BaqMode::Htslib => true,
             BaqMode::TapsPartial => !cigar_all_match(rec),
-            BaqMode::Taps => !(cigar_all_match(rec) && matches_masked_ref(rec, seq)),
+            BaqMode::Taps => !(cigar_all_match(rec) && matches_masked_ref(rec, r, mask)),
         }
     }
+}
+
+/// The reference base BAQ sees as N for this read: C on OT reads, G on OB
+/// reads in the TAPS modes; none for `htslib`. The SIMD kernel and the htslib
+/// fallback apply it while reading the reference, so no masked copy is stored.
+#[inline]
+pub(crate) fn baq_mask(mode: BaqMode, flags: u16) -> u8 {
+    match mode {
+        BaqMode::Htslib => 0,
+        _ if baq_is_ob(flags) => b'G',
+        _ => b'C',
+    }
+}
+
+/// Unmasked, uppercase reference bases `[lo, hi)` of one contig; `hi` is the
+/// contig length when the slice reaches the contig end.
+#[derive(Clone, Copy)]
+pub(crate) struct RefSlice<'a> {
+    pub seq: &'a [u8],
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl RefSlice<'_> {
+    #[inline]
+    fn covers(&self, lo: u64, hi: u64) -> bool {
+        lo >= self.lo && hi <= self.hi
+    }
+}
+
+/// Reference span `sam_prob_realn` can read for this read, clipped to the
+/// contig: `[pos - slack, end + slack)` with slack = 2 * read length + ref span
+/// + 16. Must match `taps_baq_need` in csrc/baq_simd.c.
+pub(crate) fn baq_need(rec: &Record, contig_len: u64) -> (u64, u64) {
+    let span: u64 = rec
+        .raw_cigar()
+        .iter()
+        .filter(|&&c| matches!(c & 0xf, 0 | 2 | 3 | 7 | 8)) // M D N = X
+        .map(|&c| u64::from(c >> 4))
+        .sum();
+    let slack = 2 * rec.seq_len() as u64 + span + 16;
+    let pos = rec.pos().max(0) as u64;
+    (pos.saturating_sub(slack), (pos + span + slack).min(contig_len))
 }
 
 /// CIGAR is only M operations (no clip, indel or skip).
@@ -338,19 +379,23 @@ fn cigar_all_match(rec: &Record) -> bool {
 }
 
 /// Every read base equals the reference base where the reference is A/C/G/T
-/// (masked N positions match anything; a read N is a mismatch). Assumes an
-/// all-M CIGAR, so read base i sits at `pos + i`.
+/// and not the masked base (masked positions match anything; a read N is a
+/// mismatch). Assumes an all-M CIGAR, so read base i sits at `pos + i`.
 #[inline]
-fn matches_masked_ref(rec: &Record, refseq: &[u8]) -> bool {
-    let n = rec.seq_len();
-    let Ok(pos) = usize::try_from(rec.pos()) else {
+fn matches_masked_ref(rec: &Record, r: &RefSlice, mask: u8) -> bool {
+    let n = rec.seq_len() as u64;
+    let Ok(pos) = u64::try_from(rec.pos()) else {
         return false;
     };
-    let Some(r) = refseq.get(pos..pos + n) else {
+    if !r.covers(pos, pos + n) {
         return false;
-    };
+    }
+    let bases = &r.seq[(pos - r.lo) as usize..(pos - r.lo + n) as usize];
     let raw = rec.seq().encoded;
-    for (i, &rb) in r.iter().enumerate() {
+    for (i, &rb) in bases.iter().enumerate() {
+        if rb == mask {
+            continue;
+        }
         // BAM 4-bit codes: A=1 C=2 G=4 T=8, high nibble first.
         let want = match rb {
             b'A' => 1,
@@ -406,14 +451,13 @@ extern "C" {
 /// `--profile-json` times one record (and one pileup column) in this many.
 const PROFILE_STRIDE: u64 = 16;
 
-/// Filters, and the reference to run BAQ against (`None`: no BAQ for this
-/// read). Returns `None` when the read is not pushed at all.
-fn accept_record<'r>(
+/// Filters. `None`: the read is not pushed; `Some(true)`: pushed and a BAQ
+/// candidate (BAQ on and the cell kept); `Some(false)`: pushed without BAQ.
+fn accept_record(
     rec: &Record,
     params: &ExtractParams,
-    baq_ref: Option<&'r BaqRef>,
     whitelist: Option<&HashSet<String>>,
-) -> Option<Option<&'r [u8]>> {
+) -> Option<bool> {
     let flags = rec.flags();
     if flags & FLAG_FILTER != 0 {
         return None;
@@ -436,29 +480,30 @@ fn accept_record<'r>(
     let excluded = whitelist.is_some_and(|wl| {
         !wl.contains(std::str::from_utf8(barcode_from_qname_bytes(rec.qname())).unwrap_or(""))
     });
-    let Some(r) = baq_ref.filter(|_| params.compute_baq && !excluded) else {
-        return Some(None);
-    };
-    let seq: &[u8] = if baq_is_ob(flags) { &r.ob } else { &r.ot };
-    Some(params.baq_mode.wants(rec, seq).then_some(seq))
+    Some(params.compute_baq && !excluded)
 }
+
+/// Padding around a window's reference slice when BAQ is on. A short read's
+/// BAQ span (`baq_need`) reaches a few hundred bases past the window; reads
+/// that reach further get their own fetch.
+const BAQ_PAD: u64 = 16_384;
 
 /// Process one genomic window `[start, end)` with column-wise `bam_plp` pileup.
 ///
-/// `baq_ref` must be the full contig starting at position 0 when `compute_baq`
-/// is true (same contract as pysam `faidx_fetch_seq(..., 0, MAX_POS)`).
+/// The window's reference (padded by `BAQ_PAD` when BAQ is on) serves both
+/// context calls and BAQ; `sam_prob_realn`'s contig-coordinate contract is
+/// kept by passing slice bounds (`BaqJob::ref_lo`/`ref_hi`).
 pub fn process_window(
     bam: &mut IndexedReader,
     fasta: &FastFaiReader,
     window: &Window,
     whitelist: Option<&HashSet<String>>,
     params: &ExtractParams,
-    baq_ref: Option<&BaqRef>,
 ) -> Result<WindowResult> {
     let profile = params.profile;
     let t_window = Instant::now();
     let mut timing = WindowTiming::default();
-    let pad = 2u64;
+    let pad = if params.compute_baq { BAQ_PAD } else { 2 };
     let ref_len = fasta
         .reference_length(&window.contig)
         .ok_or_else(|| anyhow::anyhow!("contig {} missing in FASTA", window.contig))?;
@@ -631,6 +676,10 @@ pub fn process_window(
     let mut keep = vec![false; READ_BATCH];
     let mut jobs: Vec<BaqJob> = Vec::with_capacity(READ_BATCH);
     let mut ws = baq_simd::Workspace::new();
+    let win_ref = RefSlice { seq: &ref_seq, lo: ref_start, hi: ref_end };
+    // Reads whose BAQ span reaches past the padded window (rare): own fetches,
+    // alive until their batch's BAQ has run.
+    let mut extras: Vec<Vec<u8>> = Vec::new();
     // Stage clock: `lap` returns seconds since the previous lap when profiling.
     let mut mark = Instant::now();
     let mut lap = |on: bool| -> f64 {
@@ -647,6 +696,7 @@ pub fn process_window(
     while !eof {
         lap(profile);
         jobs.clear();
+        extras.clear();
         let mut n = 0;
         while n < READ_BATCH {
             match bam.read(&mut pool[n]) {
@@ -657,14 +707,29 @@ pub fn process_window(
                 Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
                 Some(Ok(())) => {
                     timing.records += 1;
-                    let acc = accept_record(&pool[n], params, baq_ref, whitelist);
+                    let acc = accept_record(&pool[n], params, whitelist);
                     keep[n] = acc.is_some();
-                    if let Some(Some(seq)) = acc {
-                        jobs.push(BaqJob {
-                            b: pool[n].inner_mut(),
-                            reference: seq.as_ptr() as *const c_char,
-                            ref_len: seq.len() as i64,
-                        });
+                    if acc == Some(true) {
+                        let rec = &mut pool[n];
+                        let (lo, hi) = baq_need(rec, ref_len);
+                        let r = if win_ref.covers(lo, hi) {
+                            win_ref
+                        } else {
+                            extras.push(fasta.fetch(&window.contig, lo, hi).with_context(|| {
+                                format!("FASTA BAQ fetch {}:{lo}-{hi}", window.contig)
+                            })?);
+                            RefSlice { seq: extras.last().expect("pushed above"), lo, hi }
+                        };
+                        let mask = baq_mask(params.baq_mode, rec.flags());
+                        if params.baq_mode.wants(rec, &r, mask) {
+                            jobs.push(BaqJob {
+                                b: rec.inner_mut(),
+                                reference: r.seq.as_ptr() as *const c_char,
+                                ref_lo: r.lo as i64,
+                                ref_hi: r.hi as i64,
+                                mask: c_int::from(mask),
+                            });
+                        }
                     }
                     n += 1;
                 }
@@ -707,115 +772,6 @@ pub fn process_window(
         timing,
         window_timings: Vec::new(),
     })
-}
-
-/// Full-contig BAQ references for one contig (each starts at coordinate 0):
-/// `ot` for top-strand reads, `ob` for bottom-strand reads. With
-/// `BaqMode::Htslib` both are the same plain sequence.
-pub struct BaqRef {
-    pub ot: Arc<[u8]>,
-    pub ob: Arc<[u8]>,
-}
-
-impl BaqRef {
-    pub(crate) fn new(seq: Vec<u8>, mode: BaqMode) -> Self {
-        match mode {
-            BaqMode::Htslib => {
-                let s: Arc<[u8]> = seq.into();
-                Self { ot: Arc::clone(&s), ob: s }
-            }
-            BaqMode::Taps | BaqMode::TapsFull | BaqMode::TapsPartial => {
-                // FastFaiReader::fetch returns uppercase.
-                let mask = |from: u8| -> Arc<[u8]> {
-                    seq.iter().map(|&b| if b == from { b'N' } else { b }).collect()
-                };
-                Self { ot: mask(b'C'), ob: mask(b'G') }
-            }
-        }
-    }
-}
-
-/// Full-contig BAQ references (`BaqRef`), shared by all workers. A contig is
-/// fetched once, by the first window that needs it, and dropped when its last
-/// window releases it.
-pub struct BaqRefs<'a> {
-    fasta: &'a FastFaiReader,
-    slots: FxHashMap<String, BaqSlot>,
-}
-
-struct BaqSlot {
-    seq: Mutex<Option<Arc<BaqRef>>>,
-    remaining: AtomicUsize,
-}
-
-impl<'a> BaqRefs<'a> {
-    pub fn new(fasta: &'a FastFaiReader, windows: &[Window]) -> Self {
-        let mut slots: FxHashMap<String, BaqSlot> = FxHashMap::default();
-        for w in windows {
-            slots
-                .entry(w.contig.clone())
-                .or_insert_with(|| BaqSlot {
-                    seq: Mutex::new(None),
-                    remaining: AtomicUsize::new(0),
-                })
-                .remaining
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        Self { fasta, slots }
-    }
-
-    /// Sequence for `contig`. Pair every call with `release`.
-    pub fn acquire(&self, contig: &str, mode: BaqMode) -> Result<Arc<BaqRef>> {
-        let slot = self
-            .slots
-            .get(contig)
-            .ok_or_else(|| anyhow::anyhow!("contig {contig} not in window plan"))?;
-        let mut guard = slot.seq.lock().expect("BAQ ref mutex");
-        if let Some(seq) = guard.as_ref() {
-            return Ok(Arc::clone(seq));
-        }
-        let len = self
-            .fasta
-            .reference_length(contig)
-            .ok_or_else(|| anyhow::anyhow!("contig {contig} missing in FASTA"))?;
-        let seq = Arc::new(BaqRef::new(
-            self.fasta
-                .fetch(contig, 0, len)
-                .with_context(|| format!("FASTA BAQ fetch {contig}"))?,
-            mode,
-        ));
-        *guard = Some(Arc::clone(&seq));
-        Ok(seq)
-    }
-
-    /// One window on `contig` is done. The last one drops the shared copy.
-    pub fn release(&self, contig: &str) {
-        if let Some(slot) = self.slots.get(contig) {
-            if slot.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                *slot.seq.lock().expect("BAQ ref mutex") = None;
-            }
-        }
-    }
-}
-
-/// `process_window` with the BAQ reference taken from (and returned to) `baq_refs`.
-pub fn process_window_with_baq(
-    bam: &mut IndexedReader,
-    fasta: &FastFaiReader,
-    baq_refs: &BaqRefs,
-    window: &Window,
-    whitelist: Option<&HashSet<String>>,
-    params: &ExtractParams,
-) -> Result<WindowResult> {
-    let baq_ref = if params.compute_baq {
-        Some(baq_refs.acquire(&window.contig, params.baq_mode)?)
-    } else {
-        None
-    };
-    let r = process_window(bam, fasta, window, whitelist, params, baq_ref.as_deref());
-    drop(baq_ref);
-    baq_refs.release(&window.contig);
-    r
 }
 
 /// Mapped reads on `contigs`, and an estimated share of the BAM file those reads occupy.
@@ -884,10 +840,8 @@ pub fn extract_regions_stats(
     let fasta = FastFaiReader::open(fasta_path)?;
     let mut bam = open_bam(bam_path, params.decomp_threads)?;
     let mut total = WindowResult::empty();
-    // Full-contig reference for sam_prob_realn (pysam fetches 0..MAX_POS per tid).
-    let baq_refs = BaqRefs::new(&fasta, windows);
     for (i, w) in windows.iter().enumerate() {
-        let r = process_window_with_baq(&mut bam, &fasta, &baq_refs, w, whitelist, params)?;
+        let r = process_window(&mut bam, &fasta, w, whitelist, params)?;
         total.stats.merge(&r.stats);
         if params.accumulate {
             merge_window_cells(&mut total.intern, &mut total.cells, &r.intern, &r.cells);
@@ -923,12 +877,11 @@ pub fn extract_windows_to_temp(
     let fasta = FastFaiReader::open(fasta_path)?;
     let mut bam = open_bam(bam_path, params.decomp_threads)?;
     let mut total = WindowResult::empty();
-    let baq_refs = BaqRefs::new(&fasta, windows);
     let mut n_files = 0usize;
     for (i, w) in windows.iter().enumerate() {
         let mut p = params.clone();
         p.accumulate = true;
-        let r = process_window_with_baq(&mut bam, &fasta, &baq_refs, w, whitelist, &p)?;
+        let r = process_window(&mut bam, &fasta, w, whitelist, &p)?;
         n_files += crate::shard_io::write_window_shards(temp_dir, w, &r.intern, &r.cells, n_shards)?;
         total.stats.merge(&r.stats);
         for name in r.intern.names() {
@@ -967,13 +920,22 @@ mod tests {
     }
 
     #[test]
-    fn taps_baq_ref_masks_convertible_base_per_strand() {
-        let r = BaqRef::new(b"ACGTNCCGG".to_vec(), BaqMode::Taps);
-        assert_eq!(&*r.ot, b"ANGTNNNGG");
-        assert_eq!(&*r.ob, b"ACNTNCCNN");
-        let h = BaqRef::new(b"ACGT".to_vec(), BaqMode::Htslib);
-        assert_eq!(&*h.ot, b"ACGT");
-        assert!(Arc::ptr_eq(&h.ot, &h.ob));
+    fn baq_mask_by_strand_and_mode() {
+        assert_eq!(baq_mask(BaqMode::Taps, 99), b'C');
+        assert_eq!(baq_mask(BaqMode::TapsFull, 147), b'C');
+        assert_eq!(baq_mask(BaqMode::TapsPartial, 83), b'G');
+        assert_eq!(baq_mask(BaqMode::Taps, 163), b'G');
+        assert_eq!(baq_mask(BaqMode::Htslib, 99), 0);
+    }
+
+    #[test]
+    fn baq_need_covers_band_and_clips_to_contig() {
+        let r = record("2S96M1D2M", &[b'A'; 100], 1_000);
+        let (lo, hi) = baq_need(&r, 1_000_000);
+        // span 99, slack 2*100 + 99 + 16 = 315
+        assert_eq!((lo, hi), (685, 1_000 + 99 + 315));
+        assert_eq!(baq_need(&r, 1_200), (685, 1_200));
+        assert_eq!(baq_need(&record("4M", b"ACGT", 3), 100).0, 0);
     }
 
     fn record(cigar: &str, seq: &[u8], pos: i64) -> Record {
@@ -986,18 +948,25 @@ mod tests {
 
     #[test]
     fn taps_baq_skips_only_perfect_all_match_reads() {
-        // Masked OT reference: C -> N.
-        let masked = BaqRef::new(b"AACGTTCGAA".to_vec(), BaqMode::Taps).ot;
+        // OT read: reference C is masked.
+        let seq = b"AACGTTCGAA";
+        let full = RefSlice { seq, lo: 0, hi: 10 };
+        let m = b'C';
         let perfect = record("4M", b"ATGT", 1); // ref ANGT: T vs masked C is fine
         let mismatch = record("4M", b"AAGA", 1);
         let read_n = record("4M", b"ATNT", 1); // N against reference G
         let clipped = record("1S3M", b"ATGT", 2);
         for (rec, taps, partial) in [(&perfect, false, false), (&mismatch, true, false), (&read_n, true, false), (&clipped, true, true)] {
-            assert_eq!(BaqMode::Taps.wants(rec, &masked), taps, "{:?}", rec.seq().as_bytes());
-            assert_eq!(BaqMode::TapsPartial.wants(rec, &masked), partial, "{:?}", rec.seq().as_bytes());
-            assert!(BaqMode::TapsFull.wants(rec, &masked));
+            assert_eq!(BaqMode::Taps.wants(rec, &full, m), taps, "{:?}", rec.seq().as_bytes());
+            assert_eq!(BaqMode::TapsPartial.wants(rec, &full, m), partial, "{:?}", rec.seq().as_bytes());
+            assert!(BaqMode::TapsFull.wants(rec, &full, m));
         }
+        // Without the mask (htslib) the T against C is a mismatch.
+        assert!(BaqMode::Taps.wants(&perfect, &full, 0));
+        // A slice that starts later: same answer, indexed by contig position.
+        let part = RefSlice { seq: &seq[1..], lo: 1, hi: 10 };
+        assert!(!BaqMode::Taps.wants(&perfect, &part, m));
         // Running off the reference end: run BAQ.
-        assert!(BaqMode::Taps.wants(&record("4M", b"AAAA", 8), &masked));
+        assert!(BaqMode::Taps.wants(&record("4M", b"AAAA", 8), &full, m));
     }
 }
