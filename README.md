@@ -275,6 +275,8 @@ Writes per-phase wall and CPU time, utilisation, a per-stage split of worker tim
 | Battlemage | `taps-full` | CPU | 0.65M reads/s | 0.54M reads/s |
 | Battlemage | `taps-full` | **Arc Pro B70, OpenCL** | **1.23M reads/s (+89%)** | **0.87M reads/s (+61%)** |
 
+The Battlemage rows were measured before read-centric calling (`--caller pileup` behaviour). That host is limited by its CPU, so the new caller should help it most; it has not been re-measured.
+
 On the reference workstation (32 threads, 2026-10-18):
 
 | BAQ | Device | Processing | End to end |
