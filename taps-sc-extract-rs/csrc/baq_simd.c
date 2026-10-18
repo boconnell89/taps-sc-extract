@@ -201,6 +201,66 @@ static int grow(void **p, size_t *cap, size_t want, size_t align)
 
 static size_t al16(size_t n) { return (n + 15) & ~(size_t)15; }
 
+/* Per-read lookup tables (filled once at load): SEQ byte -> two HMM base
+ * codes, and reference byte -> HMM code with the TAPS mask (none, C, G)
+ * already applied, as seq_nt16_int[seq_nt16_table[ch]]. */
+static uint8_t taps_seq_pair[256][2];
+static uint8_t taps_ref_code[3][256];
+
+__attribute__((constructor)) static void taps_tables_init(void)
+{
+    for (int v = 0; v < 256; ++v) {
+        taps_seq_pair[v][0] = seq_nt16_int[v >> 4];
+        taps_seq_pair[v][1] = seq_nt16_int[v & 0xf];
+        int code = seq_nt16_int[seq_nt16_table[v]];
+        int n = seq_nt16_int[seq_nt16_table['N']];
+        taps_ref_code[0][v] = code;
+        taps_ref_code[1][v] = v == 'C' ? n : code;
+        taps_ref_code[2][v] = v == 'G' ? n : code;
+    }
+}
+
+/* bam_aux_get(b, "BQ") || bam_aux_get(b, "ZQ") in one pass over the aux
+ * data. Malformed aux data counts as present (htslib then handles the read). */
+static int has_bq_or_zq(const bam1_t *b)
+{
+    const uint8_t *s = bam_get_aux(b), *end = b->data + b->l_data;
+    while (end - s >= 3) {
+        if ((s[0] == 'B' || s[0] == 'Z') && s[1] == 'Q') return 1;
+        uint8_t t = s[2];
+        s += 3;
+        switch (t) {
+        case 'A': case 'c': case 'C': s += 1; break;
+        case 's': case 'S': s += 2; break;
+        case 'i': case 'I': case 'f': s += 4; break;
+        case 'd': s += 8; break;
+        case 'Z': case 'H': {
+            const uint8_t *z = memchr(s, 0, end - s);
+            if (!z) return 1;
+            s = z + 1;
+            break;
+        }
+        case 'B': {
+            if (end - s < 5) return 1;
+            int sz;
+            switch (s[0]) {
+            case 'c': case 'C': sz = 1; break;
+            case 's': case 'S': sz = 2; break;
+            case 'i': case 'I': case 'f': sz = 4; break;
+            default: return 1;
+            }
+            uint32_t cnt;
+            memcpy(&cnt, s + 1, 4);
+            if ((uint64_t)cnt * sz > (uint64_t)(end - s - 5)) return 1;
+            s += 5 + (size_t)cnt * sz;
+            break;
+        }
+        default: return 1;
+        }
+    }
+    return s != end; /* trailing bytes: malformed */
+}
+
 /*
  * Before the HMM: sam_prob_realn up to the probaln_glocal call.
  * Returns 0 queued, 1 no-op (htslib returns without changes), 2 use htslib,
@@ -217,7 +277,7 @@ static int prepare(taps_baq_ws *ws, size_t *used, const taps_baq_job *j, int job
 
     if (c->l_qseq > 1000) return 2;
     if ((c->flag & BAM_FUNMAP) || c->l_qseq == 0 || qual[0] == (uint8_t)-1) return 1;
-    if (bam_aux_get(b, "BQ") || bam_aux_get(b, "ZQ")) return 2;
+    if (has_bq_or_zq(b)) return 2;
 
     x = c->pos, y = 0, yb = ye = xb = xe = -1;
     for (k = 0; k < c->n_cigar; ++k) {
@@ -252,15 +312,19 @@ static int prepare(taps_baq_ws *ws, size_t *used, const taps_baq_job *j, int job
     if (grow((void **)&ws->arena, &ws->arena_cap, end, 0) < 0) return -1;
     uint8_t *tseq = ws->arena + o_tseq, *tref = ws->arena + o_tref;
     uint8_t *seq = bam_get_seq(b);
-    for (i = 0; i < (hts_pos_t)lq; ++i)
-        tseq[i] = seq_nt16_int[bam_seqi(seq, i)];
+    for (i = 0; i + 1 < (hts_pos_t)lq; i += 2)
+        memcpy(tseq + i, taps_seq_pair[seq[i >> 1]], 2);
+    if (lq & 1) tseq[lq - 1] = taps_seq_pair[seq[lq >> 1]][0];
     if (xb < j->ref_lo) return 2; /* slice does not cover it (should not happen) */
+    /* TAPS mask applied here instead of stored (taps_ref_code). */
+    const uint8_t *rc = taps_ref_code[j->mask == 'C' ? 1 : j->mask == 'G' ? 2 : 0];
+    if (j->mask && j->mask != 'C' && j->mask != 'G') return 2;
+    if (xe > j->ref_hi) xe = j->ref_hi;
+    const unsigned char *rs = (const unsigned char *)j->ref - j->ref_lo;
     for (i = xb; i < xe; ++i) {
-        if (i >= j->ref_hi) { xe = i; break; }
-        unsigned char ch = (unsigned char)j->ref[i - j->ref_lo];
+        unsigned char ch = rs[i];
         if (ch == '\0') { xe = i; break; }
-        if (j->mask && ch == j->mask) ch = 'N'; /* TAPS mask, applied here instead of stored */
-        tref[i-xb] = seq_nt16_int[seq_nt16_table[ch]];
+        tref[i-xb] = rc[ch];
     }
     /* probaln_glocal returns 0 without writing state/q here; leave to htslib. */
     if (xe - xb <= 0) return 2;
@@ -281,9 +345,12 @@ static int prepare(taps_baq_ws *ws, size_t *used, const taps_baq_job *j, int job
 }
 
 /* After the HMM: sam_prob_realn's BAQ_EXTEND block and BAQ_APPLY, without ZQ. */
-static void finish(bam1_t *b, hts_pos_t xb0, const int *state, const uint8_t *q,
-                   uint8_t *bq, uint8_t *left, uint8_t *rght)
+/* state is int (CPU kernels) or, when state16 is set, the device's int16. */
+static inline __attribute__((always_inline)) void finish_t(bam1_t *b, hts_pos_t xb0, const int *state32,
+                                                           const int16_t *state16, const uint8_t *q,
+                                                           uint8_t *bq, uint8_t *left, uint8_t *rght)
 {
+#define STATE(i) (state16 ? (int)state16[i] : state32[i])
     bam1_core_t *c = &b->core;
     uint32_t *cigar = bam_get_cigar(b);
     uint8_t *qual = bam_get_qual(b);
@@ -309,7 +376,7 @@ static void finish(bam1_t *b, hts_pos_t xb0, const int *state, const uint8_t *q,
             if (l > c->l_qseq - y)
                 l = c->l_qseq - y;
             for (i = y; i < y + l; ++i)
-                bq[i] = ((state[i]&3) != 0 || state[i]>>2 != x - xb + (i - y))? 0 : q[i];
+                bq[i] = ((STATE(i)&3) != 0 || STATE(i)>>2 != x - xb + (i - y))? 0 : q[i];
             for (left[y] = bq[y], i = y + 1; i < y + l; ++i)
                 left[i] = bq[i] > left[i-1]? bq[i] : left[i-1];
             for (rght[y+l-1] = bq[y+l-1], i = y + l - 2; i >= y; --i)
@@ -327,6 +394,19 @@ static void finish(bam1_t *b, hts_pos_t xb0, const int *state, const uint8_t *q,
     }
     for (i = 0; i < c->l_qseq; ++i) bq[i] = 64 + (qual[i] <= bq[i]? 0 : qual[i] - bq[i]);
     for (i = 0; i < c->l_qseq; ++i) qual[i] -= bq[i] - 64;
+#undef STATE
+}
+
+static void finish(bam1_t *b, hts_pos_t xb0, const int *state, const uint8_t *q,
+                   uint8_t *bq, uint8_t *left, uint8_t *rght)
+{
+    finish_t(b, xb0, state, NULL, q, bq, left, rght);
+}
+
+static void finish16(bam1_t *b, hts_pos_t xb0, const int16_t *state, const uint8_t *q,
+                     uint8_t *bq, uint8_t *left, uint8_t *rght)
+{
+    finish_t(b, xb0, NULL, state, q, bq, left, rght);
 }
 
 static int cmp_prep(const void *a, const void *b, void *arg)
@@ -587,18 +667,19 @@ void taps_baq_gpu_finish(void *wsp, const taps_baq_job *jobs, const int16_t *sta
     for (int t = 0; t < ws->gpu_np; ++t) {
         const prep_t *p = &ws->prep[t];
         int lq = p->l_query;
-        int *st = (int *)(ws->arena + p->state);
-        uint8_t *qq = ws->arena + p->q;
-        for (int i = 0; i < lq; ++i) {
-            st[i] = state16[bo + i];
-            qq[i] = q[bo + i] != 0xFF ? q[bo + i] : q_of_max(maxv[bo + i]);
+        /* q == 0xFF (rare): recomputed from maxv into the arena copy. */
+        const uint8_t *qq = q + bo;
+        if (maxv && memchr(qq, 0xFF, lq)) {
+            uint8_t *fx = ws->arena + p->q;
+            for (int i = 0; i < lq; ++i) fx[i] = qq[i] != 0xFF ? qq[i] : q_of_max(maxv[bo + i]);
+            qq = fx;
         }
         if (grow((void **)&ws->fin, &ws->fin_cap, 3 * al16((size_t)lq + 1), 0) < 0) {
             fprintf(stderr, "taps BAQ: out of memory\n");
             abort();
         }
         uint8_t *bq = ws->fin, *left = bq + al16(lq + 1), *rght = left + al16(lq + 1);
-        finish(jobs[p->job].b, p->xb, st, qq, bq, left, rght);
+        finish16(jobs[p->job].b, p->xb, state16 + bo, qq, bq, left, rght);
         bo += lq;
     }
 }

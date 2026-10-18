@@ -18,8 +18,8 @@ use crate::baq_simd::{BaqJob, Width, Workspace};
 use anyhow::Result;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 /// `--baq-device`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -193,15 +193,6 @@ impl Engine {
     }
 }
 
-/// One worker's prepared reads (offsets from 0) and where to send the result.
-struct Request {
-    rd: Vec<GpuRead>,
-    refb: Vec<u8>,
-    qry: Vec<u8>,
-    qual: Vec<u8>,
-    reply: mpsc::SyncSender<Result<Reply, String>>,
-}
-
 struct Reply {
     state: Vec<i16>,
     q: Vec<u8>,
@@ -209,20 +200,33 @@ struct Reply {
     maxv: Vec<f64>,
 }
 
+/// Reads waiting for the next launch: workers append their batches here
+/// (each keeps a contiguous base range) while the device runs the previous
+/// launch, so launches grow as large as the device is slow.
+#[derive(Default)]
+struct Accum {
+    rd: Vec<GpuRead>,
+    refb: Vec<u8>,
+    qry: Vec<u8>,
+    qual: Vec<u8>,
+    ranges: Vec<(usize, usize)>,
+    replies: Vec<mpsc::SyncSender<Result<Reply, String>>>,
+}
+
+struct Shared {
+    acc: Mutex<Accum>,
+    ready: Condvar,
+}
+
 /// The running GPU service.
 pub struct Service {
-    tx: Mutex<mpsc::Sender<Request>>,
+    shared: Arc<Shared>,
     pub device: String,
     pub backend: GpuBackend,
 }
 
 static SERVICE: OnceLock<Service> = OnceLock::new();
 static WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Reads pooled per launch before the service stops waiting for more.
-const TARGET_READS: usize = 65_536;
-/// How long the service waits for more requests after the first one.
-const POOL_WAIT: Duration = Duration::from_micros(500);
 
 /// Start the GPU service (once per process). `want`: device name substring.
 pub fn start(backend: GpuBackend, want: &str, mem_mb: usize) -> Result<&'static Service> {
@@ -233,7 +237,8 @@ pub fn start(backend: GpuBackend, want: &str, mem_mb: usize) -> Result<&'static 
         GpuBackend::Auto => vec![GpuBackend::Cuda, GpuBackend::Hip, GpuBackend::Opencl],
         b => vec![b],
     };
-    let (tx, rx) = mpsc::channel::<Request>();
+    let shared = Arc::new(Shared { acc: Mutex::new(Accum::default()), ready: Condvar::new() });
+    let shared2 = Arc::clone(&shared);
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(GpuBackend, String), String>>();
     let want = want.to_string();
     let f_budget = mem_mb.max(64) * 1024 * 1024;
@@ -256,87 +261,45 @@ pub fn start(backend: GpuBackend, want: &str, mem_mb: usize) -> Result<&'static 
                 return;
             };
             let _ = ready_tx.send(Ok((engine.kind, name)));
-            serve(&mut engine, rx);
+            serve(&mut engine, &shared2);
         })?;
     let (kind, device) = ready_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("GPU service thread exited"))?
         .map_err(|e| anyhow::anyhow!("no usable GPU for BAQ ({e})"))?;
-    let _ = SERVICE.set(Service { tx: Mutex::new(tx), device, backend: kind });
+    let _ = SERVICE.set(Service { shared, device, backend: kind });
     Ok(SERVICE.get().expect("set above"))
 }
 
-/// A pooled launch: requests concatenated (each keeps a contiguous base
-/// range), reads sorted for the kernel.
-struct Packed {
-    rd: Vec<GpuRead>,
-    refb: Vec<u8>,
-    qry: Vec<u8>,
-    qual: Vec<u8>,
-    ranges: Vec<(usize, usize)>,
-    replies: Vec<mpsc::SyncSender<Result<Reply, String>>>,
-    pack_s: f64,
-}
-
-/// Packer thread: pools requests from all workers and concatenates them,
-/// while the launcher thread runs the previous batch on the device.
-fn pack_loop(rx: mpsc::Receiver<Request>, tx: mpsc::SyncSender<Packed>) {
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        let mut n = batch[0].rd.len();
-        let deadline = Instant::now() + POOL_WAIT;
-        while n < TARGET_READS {
-            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(r) => {
-                    n += r.rd.len();
-                    batch.push(r);
-                }
-                Err(_) => break,
-            }
-        }
-        let t0 = Instant::now();
-        let (mut rd, mut refb, mut qry, mut qual) = (Vec::with_capacity(n), Vec::new(), Vec::new(), Vec::new());
-        let mut ranges = Vec::with_capacity(batch.len());
-        let mut replies = Vec::with_capacity(batch.len());
-        for r in batch {
-            let (ro, bo) = (refb.len() as u32, qry.len() as u32);
-            rd.extend(r.rd.iter().map(|g| GpuRead { ref_off: g.ref_off + ro, base_off: g.base_off + bo, ..*g }));
-            ranges.push((bo as usize, r.qry.len()));
-            refb.extend_from_slice(&r.refb);
-            qry.extend_from_slice(&r.qry);
-            qual.extend_from_slice(&r.qual);
-            replies.push(r.reply);
-        }
-        // Band-7 reads (the kernel's fast path) first, then by length: a SIMD
-        // group that mixes fast and generic reads runs both paths.
-        rd.sort_by_key(|g| (!(g.bw == 7 && g.i_dim == 51), g.l_query, g.i_dim));
-        let pack_s = t0.elapsed().as_secs_f64();
-        if tx.send(Packed { rd, refb, qry, qual, ranges, replies, pack_s }).is_err() {
-            break;
-        }
-    }
-}
-
-/// Launcher (the thread that opened the device): runs packed batches and
-/// returns each request's slice of the results.
-fn serve(engine: &mut Engine, rx: mpsc::Receiver<Request>) {
+/// Launcher (the thread that opened the device): whenever it is free, takes
+/// every read accumulated so far, runs it, and returns each batch its slice.
+fn serve(engine: &mut Engine, shared: &Shared) {
     let mut q2p = [0f32; 256];
     unsafe { taps_baq_gpu_q2p(q2p.as_mut_ptr()) };
-    let (ptx, prx) = mpsc::sync_channel::<Packed>(1);
-    if std::thread::Builder::new().name("taps-gpu-pack".into()).spawn(move || pack_loop(rx, ptx)).is_err() {
-        return;
-    }
     // TAPS_GPU_PROFILE=N: cumulative service timings every N launches.
     let profile_every: u64 = std::env::var("TAPS_GPU_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let (mut launches, mut reads, mut fast_reads) = (0u64, 0u64, 0u64);
-    let (mut t_wait, mut t_pack, mut t_run, mut t_split) = (0f64, 0f64, 0f64, 0f64);
-    let mut idle = Instant::now();
+    let (mut t_wait, mut t_run, mut t_split) = (0f64, 0f64, 0f64);
     // Result buffers reused across launches (no per-launch allocation).
     let (mut state, mut q, mut maxv): (Vec<i16>, Vec<u8>, Vec<f64>) = (Vec::new(), Vec::new(), Vec::new());
-    for p in prx {
+    // The previous launch's (emptied) input buffers, swapped in for workers to
+    // fill so they keep their capacity.
+    let mut spare = Accum::default();
+    loop {
+        let t_idle = Instant::now();
+        let mut p = {
+            let mut acc = shared.acc.lock().expect("GPU accumulator");
+            while acc.rd.is_empty() {
+                acc = shared.ready.wait(acc).expect("GPU accumulator");
+            }
+            std::mem::swap(&mut *acc, &mut spare);
+            std::mem::take(&mut spare)
+        };
         let t_start = Instant::now();
-        t_wait += t_start.duration_since(idle).as_secs_f64();
-        t_pack += p.pack_s;
+        t_wait += t_start.duration_since(t_idle).as_secs_f64();
+        // Band-7 reads (the kernel's fast path) first, then by length: a SIMD
+        // group that mixes fast and generic reads runs both paths.
+        p.rd.sort_by_key(|g| (!(g.bw == 7 && g.i_dim == 51), g.l_query, g.i_dim));
         let nb = p.qry.len();
         if state.len() < nb {
             state.resize(nb, 0);
@@ -350,7 +313,7 @@ fn serve(engine: &mut Engine, rx: mpsc::Receiver<Request>) {
         if profile_every > 0 {
             fast_reads += p.rd.iter().filter(|g| g.bw == 7 && g.i_dim == 51).count() as u64;
         }
-        for (reply, (b0, len)) in p.replies.into_iter().zip(p.ranges) {
+        for (reply, &(b0, len)) in p.replies.drain(..).zip(&p.ranges) {
             let out = match res {
                 Ok(nflag) => Ok(Reply {
                     state: state[b0..b0 + len].to_vec(),
@@ -361,16 +324,22 @@ fn serve(engine: &mut Engine, rx: mpsc::Receiver<Request>) {
             };
             let _ = reply.send(out);
         }
-        idle = Instant::now();
+        p.rd.clear();
+        p.refb.clear();
+        p.qry.clear();
+        p.qual.clear();
+        p.ranges.clear();
+        spare = p;
+        let t_end = Instant::now();
         t_run += t_ran.duration_since(t_start).as_secs_f64();
-        t_split += idle.duration_since(t_ran).as_secs_f64();
+        t_split += t_end.duration_since(t_ran).as_secs_f64();
         if profile_every > 0 && launches % profile_every == 0 {
             let mut o = [0f64; 3];
             if engine.kind == GpuBackend::Opencl {
                 unsafe { taps_ocl_prof(o.as_mut_ptr()) };
             }
             eprintln!(
-                "GPU BAQ profile: {launches} launches, {reads} reads ({:.0}/launch, {:.1}% band-7 fast path); launcher s: waiting {t_wait:.1} run {t_run:.2} split {t_split:.2}; packer {t_pack:.1} s (overlapped); run = upload {:.2} kernel {:.2} download {:.2}; {:.0} reads/s while running",
+                "GPU BAQ profile: {launches} launches, {reads} reads ({:.0}/launch, {:.1}% band-7 fast path); launcher s: idle {t_wait:.1} run {t_run:.2} split {t_split:.2}; run = upload {:.2} kernel {:.2} download {:.2}; {:.0} reads/s while running",
                 reads as f64 / launches as f64,
                 100.0 * fast_reads as f64 / reads.max(1) as f64,
                 o[0],
@@ -393,6 +362,11 @@ pub struct Pending {
 /// Prepare `jobs` (CPU part of BAQ before the HMM) and send the device's
 /// share to the GPU service; returns at once. Nothing in the reads changes
 /// until `complete`, which must get the same `ws` and `jobs`.
+thread_local! {
+    /// Per-worker export buffers, reused across batches.
+    static EXPORT: std::cell::RefCell<Accum> = std::cell::RefCell::new(Accum::default());
+}
+
 pub fn submit(ws: &mut Workspace, jobs: &[BaqJob]) -> Pending {
     let mut p = Pending { reply: None, n_dev: 0, cpu: Vec::new(), n_cpu: 0 };
     if jobs.is_empty() {
@@ -405,22 +379,27 @@ pub fn submit(ws: &mut Workspace, jobs: &[BaqJob]) -> Pending {
     p.n_cpu = sz.n_cpu as usize;
     p.n_dev = sz.n_dev as usize;
     if p.n_dev > 0 {
-        let mut rd = vec![GpuRead::default(); p.n_dev];
-        let mut refb = vec![0u8; sz.ref_bytes as usize];
-        let mut qry = vec![0u8; sz.bases as usize];
-        let mut qual = vec![0u8; sz.bases as usize];
-        unsafe {
-            taps_baq_gpu_export(ws.raw(), jobs.as_ptr(), rd.as_mut_ptr(), refb.as_mut_ptr(), qry.as_mut_ptr(), qual.as_mut_ptr())
-        };
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let sent = svc
-            .tx
-            .lock()
-            .map_err(|_| ())
-            .and_then(|tx| tx.send(Request { rd, refb, qry, qual, reply: reply_tx }).map_err(|_| ()));
-        if sent.is_ok() {
-            p.reply = Some(reply_rx);
-        }
+        EXPORT.with_borrow_mut(|e| {
+            let Accum { rd, refb, qry, qual, .. } = e;
+            rd.resize(p.n_dev, GpuRead::default());
+            refb.resize(sz.ref_bytes as usize, 0);
+            qry.resize(sz.bases as usize, 0);
+            qual.resize(sz.bases as usize, 0);
+            unsafe {
+                taps_baq_gpu_export(ws.raw(), jobs.as_ptr(), rd.as_mut_ptr(), refb.as_mut_ptr(), qry.as_mut_ptr(), qual.as_mut_ptr())
+            };
+            let mut acc = svc.shared.acc.lock().expect("GPU accumulator");
+            let (ro, bo) = (acc.refb.len() as u32, acc.qry.len() as u32);
+            acc.rd.extend(rd.iter().map(|g| GpuRead { ref_off: g.ref_off + ro, base_off: g.base_off + bo, ..*g }));
+            acc.ranges.push((bo as usize, qry.len()));
+            acc.refb.extend_from_slice(refb);
+            acc.qry.extend_from_slice(qry);
+            acc.qual.extend_from_slice(qual);
+            acc.replies.push(reply_tx);
+        });
+        svc.shared.ready.notify_one();
+        p.reply = Some(reply_rx);
     }
     p
 }

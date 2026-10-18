@@ -269,8 +269,8 @@ Writes per-phase wall and CPU time, utilisation, a per-stage split of worker tim
 
 | Host | BAQ | Device | Processing | End to end |
 |---|---|---|---:|---:|
-| Battlemage | `taps` (default) | CPU (Ryzen 7 1700X) | 1.34M reads/s | 0.92M reads/s |
-| Battlemage | `taps` | **Arc Pro B70, OpenCL** | **1.76M reads/s (+31%)** | **1.11M reads/s (+21%)** |
+| Battlemage | `taps` (default) | CPU (Ryzen 7 1700X) | 1.34M reads/s (2026-10-18: 1.40M) | 0.92M reads/s (0.95M) |
+| Battlemage | `taps` | **Arc Pro B70, OpenCL** (2026-10-18: overlapped batches, faster CPU-side preparation) | **2.21M reads/s (+58% vs 1.40M)** | **1.27M reads/s (+34% vs 0.95M)** |
 | Battlemage | `taps-full` | CPU | 0.65M reads/s | 0.54M reads/s |
 | Battlemage | `taps-full` | **Arc Pro B70, OpenCL** | **1.23M reads/s (+89%)** | **0.87M reads/s (+61%)** |
 
@@ -285,7 +285,7 @@ On the reference workstation (32 threads):
 | `taps-full` | RTX 3060, CUDA | 0.59M reads/s | 0.53M reads/s |
 
 - **Check a host**: `taps-sc-extract --test` times BAQ on the GPU against the CPU and says which is faster (reported only; `--baq-device` still defaults to `cpu`).
-- **Intel Arc Pro B70**: works through Intel's compute runtime (`--gpu-backend opencl` or `auto`); `clinfo` lists double precision (`cl_khr_fp64`). Measured double-precision rate 0.70 TFLOP/s (8x the RTX 3060). The kernel runs at about 2.1M reads/s on real reads (the `--test` probe reports it), using Intel's 256-register mode automatically. With the GPU, BAQ stops being the limit on that host: `--no-baq` processes 2.71M reads/s, and workers still wait for their GPU batch before continuing, which is the next thing to overlap.
+- **Intel Arc Pro B70**: works through Intel's compute runtime (`--gpu-backend opencl` or `auto`); `clinfo` lists double precision (`cl_khr_fp64`). Measured double-precision rate 0.70 TFLOP/s (8x the RTX 3060). The kernel runs at about 2.1M reads/s on real reads (the `--test` probe reports it), using Intel's 256-register mode automatically. With the GPU, BAQ stops being the limit on that host: `--no-baq` processes 2.71M reads/s. Workers overlap their GPU batches with calling, and the GPU is idle part of the time. What remains is CPU work around the HMM: preparing reads, BAQ_EXTEND and the quality cap, all of which stay on the CPU because they are TAPS-specific and cheap per read.
 
 ---
 
@@ -348,14 +348,16 @@ The HMM runs on SIMD kernels (`--baq-simd`, default `auto`): 8 reads per vector 
 | Build | `./install.sh` (native); BAQ kernel AVX2 |
 | Settings | `-t 32 --shards 16 --memory-mode memory`, defaults otherwise: `--compression blosc`, `--baq taps`, `--context both`, auto window size (14.2 Mb, 203 windows), 16 writer processes. Measured 2026-10-17. |
 
-Best case on this machine with the defaults, median of five runs (range 1.78–1.93M reads/s end to end):
+Best case on this machine with the defaults, median of three runs measured 2026-10-18 (range 2.03–2.18M reads/s end to end):
 
 | Phase | Rate |
 |---|---:|
-| Processing (BAM read, BAQ, pileup, calling) | 3.29M reads/s |
-| HDF5 write (1.5 GB, 16 shards) | 4.29M reads/s |
-| **End to end** | **1.85M reads/s (111M reads/min)** |
-| Peak memory | 10.7 GB extraction + 10.5 GB writers (stream mode: 3.0 GB + 10.5 GB, same rate) |
+| Processing (BAM read, BAQ, pileup, calling) | 3.84M reads/s |
+| HDF5 write (1.5 GB, 16 shards) | 4.49M reads/s |
+| **End to end** | **2.07M reads/s (124M reads/min)** |
+| Peak memory | 11.0 GB extraction + 10.7 GB writers (stream mode, 2026-10-17: 3.0 GB + 10.5 GB, same rate) |
+
+The option rows below, and the BAQ, compression and context tables, were measured on 2026-10-17, before the 2026-10-18 BAQ preparation speedup. Rows that run BAQ are now faster.
 
 Faster options on the same machine:
 
@@ -477,9 +479,11 @@ End-to-end and per-phase rates on the reference workstation and test dataset und
 | 2026-10-16: skip BAQ for reads that already match the masked reference | 1.64M reads/s (192% faster) | 2.60M (208% faster) | 4.49M (165% faster) | 23.2 GB (22% less) |
 | 2026-10-16: SIMD BAQ (AVX2) | 1.76M reads/s (212% faster) | 3.24M (285% faster) | 4.14M (144% faster) | 24.0 GB (19% less) |
 | 2026-10-16: `blosc` default compression (output 63% smaller) | 1.95M reads/s (246% faster) | 3.41M (304% faster) | 4.55M (168% faster) | 23.9 GB (20% less) |
-| 2026-10-17: TAPS mask inside the BAQ kernel (current) | **1.85M reads/s (229% faster)** | **3.29M (291% faster)** | **4.29M (153% faster)** | **21.2 GB (29% less); stream mode 13.5 GB (55% less)** |
+| 2026-10-17: TAPS mask inside the BAQ kernel | 1.85M reads/s (229% faster) | 3.29M (291% faster) | 4.29M (153% faster) | 21.2 GB (29% less); stream mode 13.5 GB (55% less) |
+| 2026-10-18: branch-free BAQ skip check, table-driven BAQ preparation (current) | **2.07M reads/s (270% faster)** | **3.84M (357% faster)** | **4.49M (164% faster)** | **21.7 GB (27% less)** |
 
-- The last two rows run at the same rate within run-to-run spread (today's five runs: 1.78–1.93M reads/s; the 2026-10-16 runs: 1.94–1.96M). The 2026-10-17 change removed memory, not time.
+- 2026-10-18 figures are the median of three runs (end to end 2.03–2.18M reads/s). Rows above the 2026-10-17 one other than the end-to-end column are unchanged.
+- The 2026-10-16 `blosc` and 2026-10-17 rows run at the same rate within run-to-run spread (today's five runs: 1.78–1.93M reads/s; the 2026-10-16 runs: 1.94–1.96M). The 2026-10-17 change removed memory, not time.
 - Peak memory counts the extraction process plus the writer processes.
 - The first build used htslib BAQ (CpG 70.86%); later builds use TAPS-aware BAQ (CpG 71.62%). Running BAQ on every read (`--baq taps-full`), the current build processes 1.85M reads/s, 120% faster than the first build.
 - Not in the table: `--context CG`, 4.09M reads/s end to end (121% faster than the current default).

@@ -381,37 +381,54 @@ fn cigar_all_match(rec: &Record) -> bool {
     rec.raw_cigar().iter().all(|&c| c & 0xf == htslib::BAM_CMATCH)
 }
 
+/// BAM 4-bit code (A=1 C=2 G=4 T=8) of each reference byte, 0 where the base
+/// matches anything: non-ACGT bytes and the masked base.
+const fn ref_codes(mask: u8) -> [u8; 256] {
+    let mut t = [0u8; 256];
+    t[b'A' as usize] = 1;
+    t[b'C' as usize] = 2;
+    t[b'G' as usize] = 4;
+    t[b'T' as usize] = 8;
+    if mask != 0 {
+        t[mask as usize] = 0;
+    }
+    t
+}
+static REF_CODES_NONE: [u8; 256] = ref_codes(0);
+static REF_CODES_C: [u8; 256] = ref_codes(b'C');
+static REF_CODES_G: [u8; 256] = ref_codes(b'G');
+
 /// Every read base equals the reference base where the reference is A/C/G/T
 /// and not the masked base (masked positions match anything; a read N is a
 /// mismatch). Assumes an all-M CIGAR, so read base i sits at `pos + i`.
+/// Branch-free over the read: this runs on every read when BAQ is on.
 #[inline]
 fn matches_masked_ref(rec: &Record, r: &RefSlice, mask: u8) -> bool {
-    let n = rec.seq_len() as u64;
+    let n = rec.seq_len();
     let Ok(pos) = u64::try_from(rec.pos()) else {
         return false;
     };
-    if !r.covers(pos, pos + n) {
+    if !r.covers(pos, pos + n as u64) {
         return false;
     }
-    let bases = &r.seq[(pos - r.lo) as usize..(pos - r.lo + n) as usize];
+    let codes = match mask {
+        b'C' => &REF_CODES_C,
+        b'G' => &REF_CODES_G,
+        _ => &REF_CODES_NONE,
+    };
+    let bases = &r.seq[(pos - r.lo) as usize..(pos - r.lo) as usize + n];
     let raw = rec.seq().encoded;
-    for (i, &rb) in bases.iter().enumerate() {
-        if rb == mask {
-            continue;
-        }
-        // BAM 4-bit codes: A=1 C=2 G=4 T=8, high nibble first.
-        let want = match rb {
-            b'A' => 1,
-            b'C' => 2,
-            b'G' => 4,
-            b'T' => 8,
-            _ => continue,
-        };
-        if (raw[i / 2] >> (4 * (1 - (i & 1)))) & 0xf != want {
-            return false;
-        }
+    let mut bad = 0u8;
+    // Two read bases per SEQ byte, high nibble first.
+    for (pair, &byte) in bases.chunks_exact(2).zip(raw) {
+        let (c0, c1) = (codes[pair[0] as usize], codes[pair[1] as usize]);
+        bad |= u8::from(c0 != 0 && c0 != byte >> 4) | u8::from(c1 != 0 && c1 != byte & 0xf);
     }
-    true
+    if n % 2 == 1 {
+        let c = codes[bases[n - 1] as usize];
+        bad |= u8::from(c != 0 && c != raw[n / 2] >> 4);
+    }
+    bad == 0
 }
 
 /// Bottom-strand (OB) read for TAPS-aware BAQ: read 1 reverse or read 2

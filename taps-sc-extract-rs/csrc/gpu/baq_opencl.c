@@ -114,6 +114,7 @@ typedef struct {
     cl_program prog;
     cl_kernel k;
     size_t f_budget;
+    int q2p_done; /* the qual -> probability table is uploaded once */
     cbuf rd, refb, qry, qual, q2p, f, scr, state, qo, maxv, nflag;
 } octx;
 
@@ -224,12 +225,18 @@ int taps_ocl_run(void *cp, const taps_gpu_read *rd, int n, const uint8_t *refb, 
         return 2;
     int zero = 0;
     double t0 = now_s();
-    CK(p_clEnqueueWriteBuffer(c->q, c->rd.m, CL_TRUE, 0, (size_t)n * sizeof(taps_gpu_read), rd, 0, NULL, NULL));
-    CK(p_clEnqueueWriteBuffer(c->q, c->refb.m, CL_TRUE, 0, nref, refb, 0, NULL, NULL));
-    CK(p_clEnqueueWriteBuffer(c->q, c->qry.m, CL_TRUE, 0, nbase, qry, 0, NULL, NULL));
-    CK(p_clEnqueueWriteBuffer(c->q, c->qual.m, CL_TRUE, 0, nbase, qual, 0, NULL, NULL));
-    CK(p_clEnqueueWriteBuffer(c->q, c->q2p.m, CL_TRUE, 0, 256 * sizeof(float), q2p, 0, NULL, NULL));
-    CK(p_clEnqueueWriteBuffer(c->q, c->nflag.m, CL_TRUE, 0, sizeof(int), &zero, 0, NULL, NULL));
+    /* Non-blocking: one wait per launch instead of one per transfer (each
+     * blocking call costs about a millisecond on Intel's runtime). The host
+     * arrays outlive the launch. */
+    CK(p_clEnqueueWriteBuffer(c->q, c->rd.m, 0, 0, (size_t)n * sizeof(taps_gpu_read), rd, 0, NULL, NULL));
+    CK(p_clEnqueueWriteBuffer(c->q, c->refb.m, 0, 0, nref, refb, 0, NULL, NULL));
+    CK(p_clEnqueueWriteBuffer(c->q, c->qry.m, 0, 0, nbase, qry, 0, NULL, NULL));
+    CK(p_clEnqueueWriteBuffer(c->q, c->qual.m, 0, 0, nbase, qual, 0, NULL, NULL));
+    if (!c->q2p_done) {
+        CK(p_clEnqueueWriteBuffer(c->q, c->q2p.m, CL_TRUE, 0, 256 * sizeof(float), q2p, 0, NULL, NULL));
+        c->q2p_done = 1;
+    }
+    CK(p_clEnqueueWriteBuffer(c->q, c->nflag.m, 0, 0, sizeof(int), &zero, 0, NULL, NULL));
     double t1 = now_s();
     prof_up += t1 - t0;
     int start = 0;
@@ -251,6 +258,7 @@ int taps_ocl_run(void *cp, const taps_gpu_read *rd, int n, const uint8_t *refb, 
         if (start > 0) {
             if (cgrow(c, &sub, (size_t)cnt * sizeof(taps_gpu_read))) return 2;
             CK(p_clEnqueueWriteBuffer(c->q, sub.m, CL_TRUE, 0, (size_t)cnt * sizeof(taps_gpu_read), rd + start, 0, NULL, NULL));
+            /* (rare: only when one launch exceeds the f budget) */
         }
         cl_mem rdm = start > 0 ? sub.m : c->rd.m;
         int idim_pad = id + 3;
@@ -270,15 +278,18 @@ int taps_ocl_run(void *cp, const taps_gpu_read *rd, int n, const uint8_t *refb, 
         const char *ls = getenv("TAPS_OPENCL_LOCAL");
         size_t local = ls ? (size_t)atoi(ls) : 64, global = ((size_t)cnt + local - 1) / local * local;
         CK(p_clEnqueueNDRangeKernel(c->q, c->k, 1, NULL, &global, &local, 0, NULL, NULL));
-        CK(p_clFinish(c->q));
-        if (sub.m) p_clReleaseMemObject(sub.m);
+        if (sub.m) {
+            CK(p_clFinish(c->q));
+            p_clReleaseMemObject(sub.m);
+        }
         start += cnt;
     }
+    CK(p_clEnqueueReadBuffer(c->q, c->state.m, 0, 0, nbase * 2, state, 0, NULL, NULL));
+    CK(p_clEnqueueReadBuffer(c->q, c->qo.m, 0, 0, nbase, q, 0, NULL, NULL));
+    CK(p_clEnqueueReadBuffer(c->q, c->nflag.m, 0, 0, sizeof(int), nflag, 0, NULL, NULL));
+    CK(p_clFinish(c->q));
     double t2 = now_s();
-    prof_kern += t2 - t1;
-    CK(p_clEnqueueReadBuffer(c->q, c->state.m, CL_TRUE, 0, nbase * 2, state, 0, NULL, NULL));
-    CK(p_clEnqueueReadBuffer(c->q, c->qo.m, CL_TRUE, 0, nbase, q, 0, NULL, NULL));
-    CK(p_clEnqueueReadBuffer(c->q, c->nflag.m, CL_TRUE, 0, sizeof(int), nflag, 0, NULL, NULL));
+    prof_kern += t2 - t1; /* now kernel plus queued transfers */
     if (*nflag > 0)
         CK(p_clEnqueueReadBuffer(c->q, c->maxv.m, CL_TRUE, 0, nbase * 8, maxv, 0, NULL, NULL));
     prof_down += now_s() - t2;

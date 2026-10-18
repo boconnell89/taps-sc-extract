@@ -436,3 +436,27 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
 - `baq_gpu::submit` (prepare, export, send) and `complete` (wait, finish, CPU leftovers) replace the blocking call. `process_window` keeps `TAPS_GPU_DEPTH` batch slots (default 4) with the GPU: it reads and submits batches until the slots are full, then completes the oldest and pushes it in file order while the newer ones are on the GPU. The CPU path keeps one slot (unchanged behaviour).
 - chr19 with `--baq-device gpu` at depth 1 and 3, and the CPU path, equal the frozen default reference.
 - RTX 3060, full test BAM, `-t 32 --shards 16`, `--baq-device gpu`: processing 2.62M (depth 1), 2.93M (3), 3.14M (6) reads/s; extraction peak 11.0 / 11.5 / 12.3 GB. (CPU alone 3.3-3.6M on this host.) The B70-tuned kernel also lifted the 3060 from 1.94M to 2.62M at depth 1. B70 depth sweep pending (Battlemage unreachable at the time).
+
+### GPU throughput: per-read CPU overhead (2026-10-18)
+
+- B70 profile after the overlap: the GPU was no longer the limit. Making launches bigger (waiting for 30k or 60k reads before launching) left processing unchanged (1.99M and 2.02M vs 2.04M reads/s) and only added launcher idle time. Non-blocking OpenCL transfers with one wait per launch, and uploading the quality table once, also left processing unchanged (2.04M). Workers' CPU time set the pace: 50 thread-s for BAQ and +38 thread-s in the read stage against `--no-baq`.
+- Shared accumulator: workers append their reads to one buffer, and the service thread takes everything once the GPU is free. This replaces the packer thread; the result was the same rate.
+- Worker-side cost (thread-s, full test BAM on the B70): prepare 17.3, finish 18.2, export 7.4, enqueue 4.4, wait 2.8, CPU leftovers 3.5.
+- Changes, all exact:
+  - `matches_masked_ref` (the `taps` skip check, which runs on every read) is now branch-free: a 256-entry reference-code table per mask, comparing two read bases per SEQ byte. Read stage on chr1–3: 13.0 → 8.0 thread-s (7.3 with `--no-baq`). The skip decisions are unchanged (3,271,455 BAQ reads).
+  - `prepare` (CPU and GPU paths):
+    - one pass over the aux data for BQ/ZQ instead of two `bam_aux_get` scans (malformed aux data goes to htslib);
+    - SEQ decoded two bases per byte from a table;
+    - reference translated through one table per mask (none, C, G).
+  - GPU export buffers are reused per worker (thread-local), and the accumulator's buffers are reused across launches.
+  - `taps_baq_gpu_finish` reads the device's int16 state directly. It no longer copies the state into an int array, and copies q only when a base needs a glibc recompute.
+- Exactness:
+  - `baq-selftest`: chr19, all 1,100,661 reads, 0 differ (AVX2, 8-lane AVX2 and GPU), plus 50k synthetic reads.
+  - Full test BAM: CpG 22,263,688 / 31,087,996, the same as before, on both the CPU and the B70.
+- Results:
+  - B70, full test BAM, `-t 16 --shards 16`, `--baq-device gpu`, processing:
+    - 2.04M before;
+    - 2.09M with the skip check;
+    - 2.21M with the prepare and buffer changes (end to end 1.27M).
+  - Same host, CPU BAQ: 1.34M → 1.40M after the skip-check change alone.
+  - Reference workstation, CPU default, three runs: processing 3.70–4.09M (median 3.84M, previously 3.29M), end to end 2.03–2.18M (median 2.07M, previously 1.85M).
