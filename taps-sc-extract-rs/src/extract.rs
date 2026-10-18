@@ -133,6 +133,8 @@ pub struct WindowTiming {
     pub pushed: u64,
     /// Records that ran the BAQ HMM.
     pub baq_reads: u64,
+    /// Records the `--max-depth` cap dropped (read-centric calling only).
+    pub depth_dropped: u64,
     pub total_s: f64,
     /// FASTA window fetch plus BAM index seek.
     pub setup_s: f64,
@@ -151,6 +153,7 @@ impl WindowTiming {
         self.records += o.records;
         self.pushed += o.pushed;
         self.baq_reads += o.baq_reads;
+        self.depth_dropped += o.depth_dropped;
         self.total_s += o.total_s;
         self.setup_s += o.setup_s;
         self.read_s += o.read_s;
@@ -217,6 +220,19 @@ pub struct ExtractParams {
     pub trim_r2: u32,
     /// Time each stage of every window (`WindowResult.timing`).
     pub profile: bool,
+    /// How calls are made (`--caller`).
+    pub caller: Caller,
+}
+
+/// `--caller`: column pileup (htslib `bam_plp`) or read-centric calling
+/// (`readcall`), which replays the pileup's depth cap and mate-overlap rules
+/// and gives the same calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Caller {
+    /// One read at a time (`readcall::ReadPileup`).
+    Reads,
+    /// htslib `bam_plp` columns.
+    Pileup,
 }
 
 impl Default for ExtractParams {
@@ -237,6 +253,7 @@ impl Default for ExtractParams {
             trim_r1: DEFAULT_TRIM_R1,
             trim_r2: DEFAULT_TRIM_R2,
             profile: false,
+            caller: Caller::Reads,
         }
     }
 }
@@ -557,6 +574,18 @@ pub fn process_window(
     let mut stats = CallStats::default();
     let mut intern = BarcodeIntern::default();
     let mut cells: Vec<CellMaps> = Vec::new();
+    // Read-centric calling (`--caller reads`): same calls, no columns.
+    let read_mode = params.caller == Caller::Reads;
+    let mut rp = crate::readcall::ReadPileup::new(params.max_depth, params.ignore_overlaps);
+    let cw = crate::readcall::CallWindow {
+        ref_seq: &ref_seq,
+        ref_start,
+        win_start: window.start as u32,
+        win_end: window.end as u32,
+        params,
+        whitelist,
+    };
+    let mut sink = crate::readcall::CallSink::default();
     let win_start = window.start as u32;
     let win_end = window.end as u32;
 
@@ -666,6 +695,17 @@ pub fn process_window(
             call_ns.set(call_ns.get() + t.elapsed().as_nanos() as u64 * PROFILE_STRIDE);
         } else {
             consume_column(pos, n_plp, col);
+        }
+    };
+
+    let n_read = Cell::new(0u64);
+    let mut call_one = |r: &Record| {
+        if profile && n_read.replace(n_read.get() + 1) % PROFILE_STRIDE == 0 {
+            let t = Instant::now();
+            crate::readcall::call_read(&cw, r, &mut sink);
+            call_ns.set(call_ns.get() + t.elapsed().as_nanos() as u64 * PROFILE_STRIDE);
+        } else {
+            crate::readcall::call_read(&cw, r, &mut sink);
         }
     };
 
@@ -808,6 +848,10 @@ pub fn process_window(
         timing.baq_s += lap(profile);
         for (rec, _) in slot.pool[..slot.n].iter().zip(&slot.keep[..slot.n]).filter(|(_, k)| **k) {
             timing.pushed += 1;
+            if read_mode {
+                rp.push(rec, &mut call_one)?;
+                continue;
+            }
             if unsafe { htslib::bam_plp_push(plp, rec.inner()) } < 0 {
                 anyhow::bail!("bam_plp_push failed");
             }
@@ -819,10 +863,18 @@ pub fn process_window(
     if profile {
         lap(true);
     }
-    if unsafe { htslib::bam_plp_push(plp, std::ptr::null()) } < 0 {
-        anyhow::bail!("bam_plp_push(EOF) failed");
+    if read_mode {
+        rp.finish(&mut call_one);
+        timing.depth_dropped = rp.dropped;
+        stats = sink.stats;
+        intern = sink.intern;
+        cells = sink.cells;
+    } else {
+        if unsafe { htslib::bam_plp_push(plp, std::ptr::null()) } < 0 {
+            anyhow::bail!("bam_plp_push(EOF) failed");
+        }
+        drain_ready(plp, &mut consume_column)?;
     }
-    drain_ready(plp, &mut consume_column)?;
     plp_s += lap(profile);
     for cell in cells.iter_mut() {
         cell.normalize();

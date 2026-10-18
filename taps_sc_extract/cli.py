@@ -247,6 +247,14 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "context's pileup columns and leaves its HDF5 group (/CG or /CH) out.",
     )
     parser.add_argument(
+        "--caller",
+        choices=["reads", "pileup"],
+        default=None,
+        help="Rust engine: how calls are made. 'reads' (default) calls one read at a "
+        "time, replaying htslib's pileup depth cap and mate-overlap rules; 'pileup' "
+        "uses htslib's column pileup. Same calls; 'reads' is faster.",
+    )
+    parser.add_argument(
         "--baq-simd",
         choices=["auto", "avx512", "avx2", "off"],
         default=None,
@@ -446,6 +454,8 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.extend(["--gpu-mem-mb", str(parsed.gpu_mem_mb)])
     if parsed.context != "both":
         cmd.extend(["--context", parsed.context])
+    if parsed.caller:
+        cmd.extend(["--caller", parsed.caller])
     if parsed.no_overlap_clip:
         cmd.append("--no-overlap-clip")
     if parsed.profile_json:

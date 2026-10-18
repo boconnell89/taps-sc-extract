@@ -397,13 +397,14 @@ pub struct Pending {
     n_cpu: usize,
 }
 
-/// Prepare `jobs` (CPU part of BAQ before the HMM) and send the device's
-/// share to the GPU service; returns at once. Nothing in the reads changes
-/// until `complete`, which must get the same `ws` and `jobs`.
 thread_local! {
     /// Per-worker export buffers, reused across batches.
     static EXPORT: std::cell::RefCell<Accum> = std::cell::RefCell::new(Accum::default());
 }
+
+/// Prepare `jobs` (CPU part of BAQ before the HMM) and send the device's
+/// share to the GPU service; returns at once. Nothing in the reads changes
+/// until `complete`, which must get the same `ws` and `jobs`.
 
 pub fn submit(ws: &mut Workspace, jobs: &[BaqJob]) -> Pending {
     let mut p = Pending { reply: None, n_dev: 0, cpu: Vec::new(), n_cpu: 0 };

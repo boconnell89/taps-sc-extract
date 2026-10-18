@@ -600,6 +600,42 @@ def test_cli_forwards_context():
         assert cmd[cmd.index("--context") + 1] == want
 
 
+def test_cli_forwards_caller():
+    from taps_sc_extract.cli import build_rust_command
+
+    argv = ["-b", "x.bam", "-f", "x.fa", "-o", "out"]
+    assert "--caller" not in build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    argv += ["--caller", "pileup"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    assert cmd[cmd.index("--caller") + 1] == "pileup"
+
+
+@pytest.mark.parametrize("extra", [[], ["--no-baq", "--max-depth", "3"], ["--max-depth", "1", "--no-overlap-clip"]])
+def test_read_caller_matches_pileup(chr19_slice_inputs, tmp_path, extra):
+    """--caller reads (default) equals htslib's column pileup per cell, also
+    when a small --max-depth makes the depth cap drop reads."""
+    import subprocess
+    from taps_sc_extract.cli import find_rust_binary
+
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        pytest.skip("Rust binary not built.")
+    paths, _ = chr19_slice_inputs
+    cells = {}
+    for caller in ("reads", "pileup"):
+        out = tmp_path / caller
+        subprocess.run(
+            [rust_bin, "extract", "-b", str(paths["ref"]), "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
+             "-t", "2", "--shards", "2", "--caller", caller, *extra],
+            check=True, capture_output=True,
+        )
+        cells[caller] = {ctx: _cells_of(out / "master.h5", ctx) for ctx in ("CG", "CH")}
+    for ctx in ("CG", "CH"):
+        a, b = cells["reads"][ctx], cells["pileup"][ctx]
+        assert a and a.keys() == b.keys(), ctx
+        assert all(np.array_equal(a[k], b[k]) for k in a), ctx
+
+
 def test_context_selection_both_engines(chr19_slice_inputs, tmp_path):
     """--context CG / CH: same calls as the full run for that context, no group
     for the other (shards and master.h5), Rust --no-baq equal to Python."""

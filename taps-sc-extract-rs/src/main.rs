@@ -19,6 +19,7 @@ mod h5_out;
 mod input;
 mod parallel;
 mod profile;
+mod readcall;
 mod shard_io;
 mod tune;
 mod window;
@@ -144,6 +145,11 @@ enum Commands {
         /// (/CG or /CH) is not written.
         #[arg(long, value_enum, default_value_t = ContextSel::Both, ignore_case = true)]
         context: ContextSel,
+        /// How calls are made: `reads` (default; one read at a time, replaying
+        /// htslib's pileup depth cap and mate-overlap rules) or `pileup`
+        /// (htslib column pileup). Both give the same calls.
+        #[arg(long, value_enum, default_value_t = extract::Caller::Reads)]
+        caller: extract::Caller,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -270,6 +276,11 @@ enum Commands {
         /// (/CG or /CH) is not written.
         #[arg(long, value_enum, default_value_t = ContextSel::Both, ignore_case = true)]
         context: ContextSel,
+        /// How calls are made: `reads` (default; one read at a time, replaying
+        /// htslib's pileup depth cap and mate-overlap rules) or `pileup`
+        /// (htslib column pileup). Both give the same calls.
+        #[arg(long, value_enum, default_value_t = extract::Caller::Reads)]
+        caller: extract::Caller,
         /// Drop this many 5' sequenced bases of read 1 before calling.
         #[arg(long, default_value_t = 0)]
         trim_r1: u32,
@@ -476,6 +487,7 @@ fn main() -> Result<()> {
             baq,
             baq_simd,
             context,
+            caller,
             trim_r1,
             trim_r2,
             whitelist,
@@ -528,6 +540,7 @@ fn main() -> Result<()> {
                 baq_width: baq_simd::Width::resolve(baq_simd)?,
                 baq_device: baq_gpu::BaqDevice::Cpu,
                 context,
+                caller,
                 decomp_threads: decomp,
                 accumulate: dump_sites.is_some(),
                 trim_r1,
@@ -616,6 +629,7 @@ fn main() -> Result<()> {
             gpu_device,
             gpu_mem_mb,
             context,
+            caller,
             trim_r1,
             trim_r2,
             whitelist,
@@ -730,6 +744,7 @@ fn main() -> Result<()> {
                 baq_width: resolve_baq_width(baq_simd, saved.as_ref().map(|(p, _)| p))?,
                 baq_device,
                 context,
+                caller,
                 decomp_threads: decomp,
                 accumulate: true,
                 trim_r1,

@@ -64,8 +64,8 @@ fn esc(s: &str) -> String {
 
 fn timing_json(t: &WindowTiming) -> String {
     format!(
-        "\"records\": {}, \"pushed\": {}, \"baq_reads\": {}, \"total_s\": {:.4}, \"setup_s\": {:.4}, \"read_s\": {:.4}, \"baq_s\": {:.4}, \"pileup_s\": {:.4}, \"call_s\": {:.4}",
-        t.records, t.pushed, t.baq_reads, t.total_s, t.setup_s, t.read_s, t.baq_s, t.pileup_s, t.call_s
+        "\"records\": {}, \"pushed\": {}, \"baq_reads\": {}, \"depth_dropped\": {}, \"total_s\": {:.4}, \"setup_s\": {:.4}, \"read_s\": {:.4}, \"baq_s\": {:.4}, \"pileup_s\": {:.4}, \"call_s\": {:.4}",
+        t.records, t.pushed, t.baq_reads, t.depth_dropped, t.total_s, t.setup_s, t.read_s, t.baq_s, t.pileup_s, t.call_s
     )
 }
 

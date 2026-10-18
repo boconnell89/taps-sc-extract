@@ -110,6 +110,41 @@ impl CellMaps {
         }
     }
 
+    /// Add one read's calls in `ctx` (`(1-based pos, meth)`, positions
+    /// increasing). Read-centric calling visits a cell's reads in start
+    /// order, so a run usually appends; a mate that overlaps the previous
+    /// read lands inside the tail, which is merged in place.
+    pub fn add_run(&mut self, ctx: Context, run: &[(u32, u8)]) {
+        let Some(&(first, _)) = run.first() else {
+            return;
+        };
+        let v = match ctx {
+            Context::Cg => &mut self.cg,
+            Context::Ch => &mut self.ch,
+        };
+        let site = |&(p, m): &(u32, u8)| if m == 1 { (p, 0, 1) } else { (p, 1, 0) };
+        if v.last().is_none_or(|l| l.0 < first) {
+            v.extend(run.iter().map(site));
+            return;
+        }
+        // Entries at or after the run's first position (sorted, unique) plus
+        // the run (sorted, unique): sort the two together, then merge equals.
+        let s = v.partition_point(|e| e.0 < first);
+        v.extend(run.iter().map(site));
+        v[s..].sort_by_key(|e| e.0);
+        let mut w = s;
+        for i in s..v.len() {
+            if w > s && v[w - 1].0 == v[i].0 {
+                v[w - 1].1 += v[i].1;
+                v[w - 1].2 += v[i].2;
+            } else {
+                v[w] = v[i];
+                w += 1;
+            }
+        }
+        v.truncate(w);
+    }
+
     /// Restore the sorted, one-entry-per-position invariant if `add` saw an
     /// out-of-order position. No-op otherwise.
     pub fn normalize(&mut self) {
@@ -188,6 +223,18 @@ pub fn merge_window_cells(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_run_appends_and_merges_overlapping_mates() {
+        let mut m = CellMaps::default();
+        m.add_run(Context::Ch, &[(10, 1), (12, 0), (15, 1)]);
+        // A mate overlapping the tail: equal positions sum, others interleave.
+        m.add_run(Context::Ch, &[(11, 0), (12, 1), (16, 0)]);
+        m.add_run(Context::Ch, &[(20, 1)]);
+        m.add_run(Context::Cg, &[]);
+        assert_eq!(m.ch, vec![(10, 0, 1), (11, 1, 0), (12, 1, 1), (15, 0, 1), (16, 1, 0), (20, 0, 1)]);
+        assert!(m.cg.is_empty());
+    }
 
     #[test]
     fn intern_reuses_ids() {

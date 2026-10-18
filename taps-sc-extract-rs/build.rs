@@ -22,6 +22,7 @@ fn main() {
     let include = std::env::var("DEP_HTS_INCLUDE").expect("hts-sys exports its include dir");
     for f in [
         "csrc/baq_simd.c",
+        "csrc/olap.c",
         "csrc/baq_kernel.h",
         "csrc/gpu/baq_hmm_body.h",
         "csrc/gpu/baq_opencl.c",
@@ -41,7 +42,9 @@ fn main() {
     if std::env::var_os("TAPS_BAQ_NO_SIMD").is_some() {
         b.define("TAPS_BAQ_NO_SIMD", None);
     }
+    check_olap_verbatim();
     b.file("csrc/baq_simd.c")
+        .file("csrc/olap.c")
         .file("csrc/gpu/baq_opencl.c")
         .include(&include)
         .opt_level(3)
@@ -65,6 +68,26 @@ fn main() {
     let hipcc = std::env::var_os("HIPCC").map(PathBuf::from).or_else(|| which("hipcc"));
     if let (Some(hipcc), None) = (hipcc, std::env::var_os("TAPS_NO_HIP")) {
         build_hip(&hipcc);
+    }
+}
+
+/// csrc/olap.c must hold htslib's overlap functions unchanged: each function
+/// in it must appear verbatim in the (patched) sam.c that hts-sys compiled.
+fn check_olap_verbatim() {
+    let root = std::env::var("DEP_HTS_ROOT").unwrap_or_default();
+    let Ok(sam) = std::fs::read_to_string(Path::new(&root).join("htslib/sam.c")) else {
+        println!("cargo:warning=htslib sam.c not found under DEP_HTS_ROOT; csrc/olap.c not checked");
+        return;
+    };
+    let olap = std::fs::read_to_string("csrc/olap.c").expect("read csrc/olap.c");
+    for sig in [
+        "static inline int cigar_iref2iseq_set(",
+        "static inline int cigar_iref2iseq_next(",
+        "static int tweak_overlap_quality(bam1_t *a, bam1_t *b)",
+    ] {
+        let i = olap.find(sig).expect("function in csrc/olap.c");
+        let j = i + olap[i..].find("\n}\n").expect("function end") + 3;
+        assert!(sam.contains(&olap[i..j]), "csrc/olap.c: {sig} differs from htslib sam.c; copy it again");
     }
 }
 

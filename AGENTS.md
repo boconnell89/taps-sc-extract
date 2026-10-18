@@ -44,6 +44,7 @@ taps-sc-extract/
 │   ├── build.rs                # Compiles csrc/ against the vendored htslib headers (cc)
 │   ├── csrc/baq_simd.c         # Batched BAQ: realn.c wrapper + grouping by HMM shape; AVX2/AVX-512 dispatch
 │   ├── csrc/baq_kernel.h       # Lane-parallel probaln_glocal (included once per vector width)
+│   ├── csrc/olap.c             # htslib 1.21 tweak_overlap_quality + cigar helpers, verbatim (build.rs checks against vendored sam.c)
 │   ├── csrc/gpu/baq_hmm_body.h # GPU BAQ HMM, one read per work-item; shared by OpenCL, CUDA and HIP
 │   ├── csrc/gpu/baq_opencl.c   # OpenCL backend (libOpenCL loaded at run time; Intel Arc/Data Center GPUs)
 │   ├── csrc/gpu/baq_cuda.cu    # CUDA backend; the same file is the HIP backend with -DTAPS_HIP
@@ -52,7 +53,8 @@ taps-sc-extract/
 │       ├── main.rs             # Rust CLI: extract, stats, tune, baq-selftest, write-shard (hidden, spawned by extract)
 │       ├── baq_simd.rs         # FFI to csrc/baq_simd.c, --baq-simd widths, per-read self-tests
 │       ├── baq_gpu.rs          # --baq-device gpu: backend selection, GPU service thread (pools reads across workers)
-│       ├── extract.rs          # bam_plp pileup, batched read/BAQ/push loop, calling callback, BAQ modes/masks/reference slices, stage timing
+│       ├── extract.rs          # Batched read/BAQ/push loop, bam_plp column callback (--caller pileup), BAQ modes/masks/reference slices, stage timing
+│       ├── readcall.rs         # Read-centric calling (--caller reads, default): replays bam_plp's depth cap and mate overlap, calls each read when htslib would free it
 │       ├── extract_noodles.rs  # Slower pure-Rust reference pileup (noodles)
 │       ├── parallel.rs         # Rayon window pool, thread-local readers, cancellation
 │       ├── window.rs           # Genomic window planner
@@ -97,6 +99,13 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Barcode filters (`--whitelist`, `--complexity` + `--min/--max-complexity`) act at call time**, in both engines: a filtered cell's reads stay in the pileup, so depth caps and mate overlaps for kept cells are unchanged. Rust skips only their BAQ (`accept_record`), which touches no other read. Never drop filtered reads before `bam_plp_push`; that frees `--max-depth` slots and changes kept cells' calls. Complexity files: barcode in column 2, unique reads in column 4 (`barcode::parse_complexity`, `barcode.py::parse_complexity`).
 - **`--context CG|CH` skips at the column** (`ContextSel::wants` in `consume_column`; Python `if ctx not in contexts`), after the context is classified and before any per-read work, in both engines. Never filter reads for it: the pileup, BAQ, depth caps and overlaps must stay identical, so the kept context's calls equal a `both` run's. Groups (`/CG`, `/CH`) are created only when a cell has data, in shards, single files and `master.h5`, so a skipped context has no group.
 - **Rust default compression is `blosc`** (LZ4 level 9; `RUST_DEFAULT_COMPRESSION` in `cli.py`, `--compression` default in `main.rs`). Reading it from Python needs `import hdf5plugin` before `h5py` (tests do this in `_cells_of`); R needs `rhdf5filters`, as for `lzf`.
+- **Read-centric calling (`--caller reads`, the default) must equal htslib's column pileup per cell** (`--caller pileup` keeps the old path for A/B). `readcall::ReadPileup` replays `bam_plp_push` + drain for each kept read in file order, with fresh state per window:
+  - **Depth cap**: drop a read when it starts at the start of the last accepted read and live reads + 1 (htslib's sentinel node) > `--max-depth`. A dropped read removes its QNAME from the overlap table and does not move the position. The cap fires at the default 250 on the test BAM (805,351 reads dropped).
+  - **Retiring**: a read is freed, and only then called, once a later accepted read starts past its end (`end < pos`), or at window end. Reads with no reference span are never linked.
+  - **Mate overlap**: `overlap_push` rules verbatim (proper pair, mate mapped, same contig, the `isize`/`mpos >= end` exclusion, store only while the mate is ahead), then `taps_tweak_overlap_quality` (`csrc/olap.c`, htslib's code copied byte for byte; never rewrite it). Freeing any read removes its QNAME's entry. Supplementary reads are not filtered, so they take part.
+  - **Batches**: reads are copied (`bam_copy1`) at push, so batch slots can be reused after their push as before.
+  - **Accumulation**: per read, calls are collected in position order and merged into the cell with `CellMaps::add_run`; a mate that overlaps the previous read is merged into the tail.
+  - **Checks after any change**: `test_read_caller_matches_pileup` (includes `--max-depth 1`/`3`), plus per-site dumps (`stats --dump-sites`) of both callers on chr19.
 - **Per-cell sites arrive in position order** (columns ascend within a window), so `CellMaps::add` appends or adds to the last entry. Keep that invariant; `normalize()` repairs any out-of-order input.
 - **Parity checks must be per cell**, not totals: `test_chr19_rust_matches_python_per_cell` requires Rust `--no-baq` to equal Python exactly on chr19.
 - **BAQ is TAPS-aware by default** (`extract::BaqMode`): the HMM sees C as N for OT reads and G as N for OB reads (`baq_mask`, strand from `baq_is_ob`), so methylation conversions are not treated as mismatches. No masked reference is stored: each window fetches one unmasked slice padded by `BAQ_PAD` (16 kb), every `BaqJob` carries the slice bounds and its mask byte, and `csrc/baq_simd.c` applies the mask while translating the reference (the htslib fallback masks a per-read copy of `taps_baq_need`'s span). `baq_need` (Rust) and `taps_baq_need` (C) must agree and must cover every base `sam_prob_realn` can read; a read past the padded slice gets its own fetch. The default `--baq taps` skips the HMM for reads that are all-M and match the masked reference exactly (`BaqMode::wants`; ~72% of reads, 0.0007% of CG calls differ from `--baq taps-full`). `--baq taps-partial` runs it only for reads with an indel or clip. Any change to the skip rule needs a new frozen chr19 reference. `--baq htslib` is the plain reference (biased against methylated calls). Calling always uses the unmasked reference. The Python engine never applies BAQ, so parity with Python is only defined for `--no-baq`.
