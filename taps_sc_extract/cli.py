@@ -255,6 +255,31 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "(4), or off (htslib, one read at a time). All give identical results.",
     )
     parser.add_argument(
+        "--baq-device",
+        choices=["cpu", "gpu"],
+        default=None,
+        help="Where the BAQ HMM runs (Rust engine): cpu (default) or gpu. Results are "
+        "identical; see --gpu-backend.",
+    )
+    parser.add_argument(
+        "--gpu-backend",
+        choices=["auto", "opencl", "cuda", "hip"],
+        default=None,
+        help="GPU backend for --baq-device gpu: auto (CUDA, then HIP, then OpenCL), opencl "
+        "(Intel Arc / Data Center GPUs, any device with fp64), cuda (NVIDIA), hip (AMD).",
+    )
+    parser.add_argument(
+        "--gpu-device",
+        default=None,
+        help="Use the first GPU whose name contains this text.",
+    )
+    parser.add_argument(
+        "--gpu-mem-mb",
+        type=int,
+        default=None,
+        help="GPU memory for BAQ HMM matrices per launch, in MB (default 1024).",
+    )
+    parser.add_argument(
         "--no-overlap-clip",
         action="store_true",
         help="Do not ignore overlapping mate read bases.",
@@ -411,6 +436,14 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.extend(["--baq", parsed.baq])
     if parsed.baq_simd:
         cmd.extend(["--baq-simd", parsed.baq_simd])
+    if parsed.baq_device:
+        cmd.extend(["--baq-device", parsed.baq_device])
+    if parsed.gpu_backend:
+        cmd.extend(["--gpu-backend", parsed.gpu_backend])
+    if parsed.gpu_device:
+        cmd.extend(["--gpu-device", parsed.gpu_device])
+    if parsed.gpu_mem_mb is not None:
+        cmd.extend(["--gpu-mem-mb", str(parsed.gpu_mem_mb)])
     if parsed.context != "both":
         cmd.extend(["--context", parsed.context])
     if parsed.no_overlap_clip:

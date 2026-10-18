@@ -204,6 +204,8 @@ pub struct ExtractParams {
     pub baq_mode: BaqMode,
     /// BAQ kernel: SIMD width or htslib.
     pub baq_width: baq_simd::Width,
+    /// Where the BAQ HMM runs (`--baq-device`); the GPU service must be started.
+    pub baq_device: crate::baq_gpu::BaqDevice,
     /// Contexts to extract; columns of the others are skipped.
     pub context: ContextSel,
     pub decomp_threads: usize,
@@ -228,6 +230,7 @@ impl Default for ExtractParams {
             compute_baq: true,
             baq_mode: BaqMode::Taps,
             baq_width: baq_simd::Width::cpu_best(),
+            baq_device: crate::baq_gpu::BaqDevice::Cpu,
             context: ContextSel::Both,
             decomp_threads: 1,
             accumulate: false,
@@ -737,7 +740,11 @@ pub fn process_window(
         }
         timing.read_s += lap(profile);
         timing.baq_reads += jobs.len() as u64;
-        ws.run(&jobs, params.baq_width);
+        if params.baq_device == crate::baq_gpu::BaqDevice::Gpu {
+            crate::baq_gpu::run_batch(&mut ws, &jobs, params.baq_width);
+        } else {
+            ws.run(&jobs, params.baq_width);
+        }
         timing.baq_s += lap(profile);
         for (rec, _) in pool[..n].iter().zip(&keep[..n]).filter(|(_, k)| **k) {
             timing.pushed += 1;

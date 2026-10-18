@@ -165,6 +165,7 @@ typedef struct {
     void *mat; size_t mat_cap;   /* f, b, s, R, Q, QL for one group */
     uint8_t *fin; size_t fin_cap; /* bq, left, rght for finish() */
     char *fb; size_t fb_cap;      /* masked reference span for htslib_one() */
+    int gpu_np;                   /* reads prepared for the device (taps_baq_gpu_*) */
 } taps_baq_ws;
 
 void *taps_baq_ws_new(void)
@@ -468,4 +469,142 @@ int taps_baq_batch(void *wsp, const taps_baq_job *jobs, int n, int width)
         g = h;
     }
     return simd;
+}
+
+/* ---- GPU path (csrc/gpu/): prepare and finish here, HMM on the device ---- */
+
+#include "gpu/taps_gpu.h"
+
+typedef struct {
+    int64_t n_dev;     /* reads for the device */
+    int64_t ref_bytes; /* sum of their l_ref */
+    int64_t bases;     /* sum of their l_query */
+    int64_t n_cpu;     /* reads too long or too wide for the device kernel */
+} taps_gpu_sizes;
+
+/*
+ * Step 1: everything sam_prob_realn does before the HMM, for jobs[0..n).
+ * Nothing is modified yet. Reads the device does not take are listed in
+ * cpu_jobs (job indices; caller array of n) for the CPU path
+ * (taps_baq_batch), which must run after taps_baq_gpu_finish (they share the
+ * workspace): reads htslib must handle, and reads beyond the device kernel's
+ * limits (l_query > TAPS_GPU_MAXLQ or i_dim > TAPS_GPU_MAXIDIM). If the device
+ * fails, the caller can still run every job on the CPU.
+ */
+void taps_baq_gpu_prepare(void *wsp, const taps_baq_job *jobs, int n, taps_gpu_sizes *sz, int *cpu_jobs)
+{
+    taps_baq_ws *ws = wsp;
+    memset(sz, 0, sizeof *sz);
+    if (grow((void **)&ws->prep, &ws->prep_cap, (size_t)n * sizeof(prep_t), 0) < 0) {
+        for (int j = 0; j < n; ++j) cpu_jobs[sz->n_cpu++] = j;
+        ws->gpu_np = 0;
+        return;
+    }
+    size_t used = 0;
+    int np = 0;
+    for (int j = 0; j < n; ++j) {
+        int r = prepare(ws, &used, &jobs[j], j, &ws->prep[np]);
+        if (r == 0) {
+            const prep_t *p = &ws->prep[np];
+            int bw2 = p->bw_key * 2 + 1;
+            int i_dim = bw2 < p->l_ref ? bw2 * 3 + 6 : p->l_ref * 3 + 6;
+            if (p->l_query > TAPS_GPU_MAXLQ || i_dim > TAPS_GPU_MAXIDIM) {
+                cpu_jobs[sz->n_cpu++] = j;
+                continue;
+            }
+            sz->ref_bytes += p->l_ref;
+            sz->bases += p->l_query;
+            ++np;
+        } else if (r != 1) {
+            cpu_jobs[sz->n_cpu++] = j;
+        }
+    }
+    ws->gpu_np = np;
+    sz->n_dev = np;
+}
+
+/*
+ * Step 2: pack the prepared reads for the device. Offsets start at 0; the
+ * HMM parameters are computed here with probaln.c's float expressions.
+ */
+void taps_baq_gpu_export(void *wsp, const taps_baq_job *jobs, taps_gpu_read *rd, uint8_t *refb,
+                         uint8_t *qry, uint8_t *qual)
+{
+    taps_baq_ws *ws = wsp;
+    const float cd = 0.001f, ce = 0.1f; /* probaln_par_t {d, e} for reads <= 1000 bp */
+    size_t ro = 0, bo = 0;
+    for (int t = 0; t < ws->gpu_np; ++t) {
+        const prep_t *p = &ws->prep[t];
+        taps_gpu_read *g = &rd[t];
+        int l_query = p->l_query, l_ref = p->l_ref;
+        double sM, sI;
+        memset(g, 0, sizeof *g);
+        sM = sI = 1. / (2 * l_query + 2);
+        g->m[0*3+0] = (1 - cd - cd) * (1 - sM);
+        g->m[0*3+1] = g->m[0*3+2] = cd * (1 - sM);
+        g->m[1*3+0] = (1 - ce) * (1 - sI);
+        g->m[1*3+1] = ce * (1 - sI);
+        g->m[1*3+2] = 0.;
+        g->m[2*3+0] = 1 - ce;
+        g->m[2*3+1] = 0.;
+        g->m[2*3+2] = ce;
+        g->bM = (1 - cd) / l_ref;
+        g->bI = cd / l_ref;
+        g->sM = sM;
+        g->l_ref = l_ref;
+        g->l_query = l_query;
+        g->bw = p->bw_key;
+        {
+            int bw2 = p->bw_key * 2 + 1;
+            g->i_dim = bw2 < l_ref ? bw2 * 3 + 6 : l_ref * 3 + 6;
+        }
+        g->ref_off = (unsigned)ro;
+        g->base_off = (unsigned)bo;
+        memcpy(refb + ro, ws->arena + p->tref, l_ref);
+        memcpy(qry + bo, ws->arena + p->tseq, l_query);
+        memcpy(qual + bo, bam_get_qual(jobs[p->job].b), l_query);
+        ro += l_ref;
+        bo += l_query;
+    }
+}
+
+/* q from a posterior maximum, exactly as probaln_glocal and the CPU kernels. */
+static uint8_t q_of_max(double mx)
+{
+    int k = (int)(-4.343 * log(1. - mx) + .499);
+    return k > 100 ? 99 : k;
+}
+
+/*
+ * Step 3: the device's state[] and q[] (q == 0xFF: recompute from maxv with
+ * glibc) for each read, then sam_prob_realn's BAQ_EXTEND and QUAL cap.
+ */
+void taps_baq_gpu_finish(void *wsp, const taps_baq_job *jobs, const int16_t *state16, const uint8_t *q,
+                         const double *maxv)
+{
+    taps_baq_ws *ws = wsp;
+    size_t bo = 0;
+    for (int t = 0; t < ws->gpu_np; ++t) {
+        const prep_t *p = &ws->prep[t];
+        int lq = p->l_query;
+        int *st = (int *)(ws->arena + p->state);
+        uint8_t *qq = ws->arena + p->q;
+        for (int i = 0; i < lq; ++i) {
+            st[i] = state16[bo + i];
+            qq[i] = q[bo + i] != 0xFF ? q[bo + i] : q_of_max(maxv[bo + i]);
+        }
+        if (grow((void **)&ws->fin, &ws->fin_cap, 3 * al16((size_t)lq + 1), 0) < 0) {
+            fprintf(stderr, "taps BAQ: out of memory\n");
+            abort();
+        }
+        uint8_t *bq = ws->fin, *left = bq + al16(lq + 1), *rght = left + al16(lq + 1);
+        finish(jobs[p->job].b, p->xb, st, qq, bq, left, rght);
+        bo += lq;
+    }
+}
+
+/* Fill the qual -> probability table exactly as probaln.c (float). */
+void taps_baq_gpu_q2p(float *out)
+{
+    for (int i = 0; i < 256; ++i) out[i] = taps_qual2prob[i];
 }

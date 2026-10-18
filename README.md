@@ -37,6 +37,8 @@ conda install -c conda-forge hdf5 clang libclang pkg-config   # build dependenci
 
 BAQ runs on SIMD kernels that process 8 reads per vector (AVX-512F) or 4 (AVX2). Both are always compiled, including in `--portable` builds, and the binary picks the widest the CPU runs. After building, `install.sh` runs `taps-sc-extract-rs baq-selftest`, which runs every supported kernel and htslib's scalar BAQ on the same reads and requires identical base qualities for every read; the install stops on any difference. Override with `--baq-simd avx512|avx2|off`. `taps-sc-extract --test --save-profile` times each kernel under full load and saves the fastest, since some Intel CPUs lower their clock for AVX-512.
 
+BAQ can also run on a GPU (`--baq-device gpu`, off by default). The OpenCL backend is always built and needs, at run time, a GPU with double precision and its vendor's OpenCL runtime (Intel Arc / Data Center GPUs: Intel's compute runtime, e.g. the `intel-opencl-icd` package; check with `clinfo | grep -i fp64`). The CUDA backend is built when `nvcc` is on the PATH and the AMD HIP backend when `hipcc` is. When a usable GPU is present, `install.sh` also runs `baq-selftest --gpu` and stops on any difference. See [GPU BAQ](#11-gpu-baq---baq-device-gpu).
+
 ### Upgrading an existing install
 ```bash
 cd taps-sc-extract
@@ -130,6 +132,8 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
                        [--log-file LOG_FILE] [--min-baseq MIN_BASEQ]
                        [--min-mapq MIN_MAPQ] [--max-depth MAX_DEPTH]
                        [--no-baq] [--baq {taps,taps-full,taps-partial,htslib}] [--baq-simd {auto,avx512,avx2,off}]
+                       [--baq-device {cpu,gpu}] [--gpu-backend {auto,opencl,cuda,hip}]
+                       [--gpu-device NAME] [--gpu-mem-mb MB]
                        [--context {both,CG,CH}] [--no-overlap-clip]
                        [--trim-r2 TRIM_R2] [--trim-r1 TRIM_R1]
                        [--writer-mode {auto,process,thread}] [--profile-json PROFILE_JSON]
@@ -173,6 +177,10 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
 | `--baq` | `taps`\|`taps-full`\|`taps-partial`\|`htslib` | `taps` | BAQ mode (Rust engine). The `taps` modes realign OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `taps` skips reads that already match that reference exactly (processing 3.3M vs 1.85M reads/s for `taps-full`; 0.0007% of CG calls differ); `taps-full` runs every read; `taps-partial` only reads with an indel or clip (5.1M reads/s; 0.06% of CG calls differ). `htslib` is samtools/asTair BAQ on the plain reference and under-calls methylation. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
 | `--baq-simd` | `auto`\|`avx512`\|`avx2`\|`off` | `auto` | BAQ kernel: 8 reads per vector (AVX-512), 4 (AVX2), or htslib one read at a time. All give identical results. |
+| `--baq-device` | `cpu`\|`gpu` | `cpu` | Where the BAQ HMM runs. Identical results. See [GPU BAQ](#11-gpu-baq---baq-device-gpu). |
+| `--gpu-backend` | `auto`\|`opencl`\|`cuda`\|`hip` | `auto` | GPU backend: auto tries CUDA, then HIP, then OpenCL. Intel GPUs use `opencl`. |
+| `--gpu-device` | `str` | `None` | Use the first GPU whose name contains this text. |
+| `--gpu-mem-mb` | `int` | `1024` | GPU memory for HMM matrices per launch. |
 | `--context` | `both`\|`CG`\|`CH` | `both` | Contexts to extract. `CG` or `CH` skips the other context's pileup columns and leaves its HDF5 group out. See [`--context`](#10---context-cg-or-ch-only). |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
 | `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
@@ -253,6 +261,31 @@ Writes per-phase wall and CPU time, utilisation, a per-stage split of worker tim
 
   CG-only is 121% faster end to end than both contexts (234% with `--no-baq`), with 80% less extraction memory and 88% less writer memory. CH-only saves nothing beyond noise.
 - **Amethyst**: index only the extracted context (`indexChr(obj, "CG")`); list barcodes from that group (`ls_df$group == "/CG"`, or `"/CH"` for CH-only output).
+
+### 11. GPU BAQ (`--baq-device gpu`)
+- **What runs where**: the HMM at the core of BAQ (the dense double-precision part) runs on the GPU; everything TAPS-specific stays on the CPU: the C/G mask, the strand choice, skipping reads that already match, BAQ_EXTEND and the quality cap. Reads longer than 192 bp or with a very wide band (large indels) also stay on the CPU. One service thread owns the GPU and pools reads from all workers into large launches.
+- **Exact**: the GPU kernel is htslib's arithmetic operation for operation (no fused multiply-add, IEEE division, sums in order), with the HMM parameters computed on the CPU. A base whose quality sits within 1e-9 of a rounding point is recomputed on the CPU with glibc. `taps-sc-extract-rs baq-selftest --gpu -b BAM -f FA` checks every read: all 1,431,323 chr19 reads identical through CUDA and through OpenCL (99.98% of them on the GPU); chr19 extraction reproduces the frozen references in all BAQ modes.
+- **When it helps**: on GPUs with enough double precision relative to the host CPU. On an Intel Arc Pro B70 (Battlemage host, Ryzen 7 1700X, 16 threads) it is faster than the CPU; on the reference workstation's RTX 3060 (weak FP64, PCIe 3.0 x4) it is slower, so the default stays `cpu`. Full test dataset:
+
+| Host | BAQ | Device | Processing | End to end |
+|---|---|---|---:|---:|
+| Battlemage | `taps` (default) | CPU (Ryzen 7 1700X) | 1.34M reads/s | 0.92M reads/s |
+| Battlemage | `taps` | **Arc Pro B70, OpenCL** | **1.76M reads/s (+31%)** | **1.11M reads/s (+21%)** |
+| Battlemage | `taps-full` | CPU | 0.65M reads/s | 0.54M reads/s |
+| Battlemage | `taps-full` | **Arc Pro B70, OpenCL** | **1.23M reads/s (+89%)** | **0.87M reads/s (+61%)** |
+
+On the reference workstation (32 threads):
+
+| BAQ | Device | Processing | End to end |
+|---|---|---:|---:|
+| `taps` (default) | CPU, AVX2 | 3.62M reads/s | 2.04M reads/s |
+| `taps` | RTX 3060, CUDA | 1.94M reads/s | 1.33M reads/s |
+| `taps` | RTX 3060, OpenCL (PoCL) | 1.86M reads/s | 1.30M reads/s |
+| `taps-full` | CPU, AVX2 | 1.95M reads/s | 1.33M reads/s |
+| `taps-full` | RTX 3060, CUDA | 0.59M reads/s | 0.53M reads/s |
+
+- **Check a host**: `taps-sc-extract --test` times BAQ on the GPU against the CPU and says which is faster (reported only; `--baq-device` still defaults to `cpu`).
+- **Intel Arc Pro B70**: works through Intel's compute runtime (`--gpu-backend opencl` or `auto`); `clinfo` lists double precision (`cl_khr_fp64`). Measured double-precision rate 0.70 TFLOP/s (8x the RTX 3060). The kernel runs at about 2.1M reads/s on real reads (the `--test` probe reports it), using Intel's 256-register mode automatically. With the GPU, BAQ stops being the limit on that host: `--no-baq` processes 2.71M reads/s, and workers still wait for their GPU batch before continuing, which is the next thing to overlap.
 
 ---
 
@@ -337,7 +370,7 @@ How speed changed across releases: [Performance History](#performance-history).
 
 ### Servers
 
-*To be filled in: 64-thread server (`install.sh`, `--test`, T=32/64, shard counts on its filesystem, AVX-512 if available).*
+*To be filled in: 64-thread server with an Intel Arc Pro B70 (`install.sh`, `clinfo`, `--test` including the GPU BAQ probe, `baq-selftest --gpu`, T=32/64, `--baq-device cpu` vs `gpu`, shard counts on its filesystem).*
 
 ---
 

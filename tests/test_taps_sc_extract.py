@@ -353,6 +353,11 @@ def test_cli_forwards_baq_mode():
     argv = base + ["--baq-simd", "off"]
     cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
     assert cmd[cmd.index("--baq-simd") + 1] == "off"
+    assert "--baq-device" not in build_rust_command("taps-sc-extract-rs", parse_args(base), base)
+    argv = base + ["--baq-device", "gpu", "--gpu-backend", "opencl", "--gpu-device", "B70", "--gpu-mem-mb", "4096"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    for flag, val in (("--baq-device", "gpu"), ("--gpu-backend", "opencl"), ("--gpu-device", "B70"), ("--gpu-mem-mb", "4096")):
+        assert cmd[cmd.index(flag) + 1] == val
 
 
 # 10. Real BAM smoke test (chr19)
@@ -480,6 +485,27 @@ def test_chr19_rust_simd_baq_matches_htslib_kernel(tmp_path):
     _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
     out_h5 = tmp_path / "chr19_rust_simd_off.h5"
     _run_rust_chr19(out_h5, "--baq-simd", "off")
+    _assert_same_sites(CHR19_RUST_REFERENCE, out_h5)
+
+
+def _gpu_available(rust_bin):
+    """True if the Rust binary finds a GPU it can run BAQ on."""
+    import subprocess
+
+    r = subprocess.run([rust_bin, "baq-selftest", "--gpu", "--synthetic-reads", "100"], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def test_chr19_rust_gpu_baq_matches_reference(tmp_path):
+    """--baq-device gpu gives the frozen default reference exactly (skipped without a GPU)."""
+    from taps_sc_extract.cli import find_rust_binary
+
+    _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE)
+    rust_bin = find_rust_binary()
+    if not rust_bin or not _gpu_available(rust_bin):
+        pytest.skip("no GPU usable for BAQ")
+    out_h5 = tmp_path / "chr19_rust_gpu.h5"
+    _run_rust_chr19(out_h5, "--baq-device", "gpu")
     _assert_same_sites(CHR19_RUST_REFERENCE, out_h5)
 
 

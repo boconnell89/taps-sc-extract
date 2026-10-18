@@ -13,6 +13,12 @@
 # building, `baq-selftest` checks every kernel this CPU supports against htslib
 # read by read and the install stops on any difference.
 #
+# GPU BAQ (--baq-device gpu; off by default): the OpenCL backend is always
+# built (Intel Arc / Data Center GPUs need Intel's compute runtime with fp64 at
+# run time); the CUDA backend is built when nvcc is on PATH and the AMD HIP
+# backend when hipcc is. TAPS_NO_CUDA=1 / TAPS_NO_HIP=1 skip them. If a usable
+# GPU is found, `baq-selftest --gpu` must match htslib read by read too.
+#
 # A native build uses instructions of the CPU it was built on. Rerun this script
 # on each host; copying the binary to a different CPU can fail with SIGILL.
 #
@@ -122,6 +128,16 @@ else
 fi
 
 # Flag changes do not always trigger a rebuild of the vendored C, so start clean.
+# Native builds compile CUDA code only for this host's GPU generation (faster build).
+if [[ $PORTABLE -eq 0 && -z "${TAPS_CUDA_ARCH:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
+    [[ "$cap" =~ ^[0-9]+$ ]] && export TAPS_CUDA_ARCH="$cap"
+fi
+GPU_BACKENDS="opencl"
+command -v "${NVCC:-nvcc}" >/dev/null 2>&1 && [[ -z "${TAPS_NO_CUDA:-}" ]] && GPU_BACKENDS+=" cuda${TAPS_CUDA_ARCH:+ (sm_$TAPS_CUDA_ARCH)}"
+command -v "${HIPCC:-hipcc}" >/dev/null 2>&1 && [[ -z "${TAPS_NO_HIP:-}" ]] && GPU_BACKENDS+=" hip"
+echo "GPU BAQ backends: $GPU_BACKENDS"
+
 (cd "$CRATE" && cargo clean --release -q && cargo build --release)
 
 BIN="$CRATE/target/release/taps-sc-extract-rs"
@@ -134,6 +150,7 @@ target_cpu=$TARGET_CPU
 march=$MARCH
 prefix=$PREFIX
 baq_simd_cpu=$(grep -qw avx512f /proc/cpuinfo && echo avx512 || (grep -qw avx2 /proc/cpuinfo && echo avx2 || echo off))
+gpu_backends=$GPU_BACKENDS
 git=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 INFO
 
@@ -148,6 +165,21 @@ fi
 if ! "${selftest[@]}"; then
     echo "install.sh: SIMD BAQ self-test failed; extraction would differ from htslib." >&2
     echo "Report this, and run with --baq-simd off until it is fixed." >&2
+    exit 1
+fi
+
+# GPU BAQ, when a usable GPU is present: the same read-by-read check.
+gpu_selftest=("$BIN" baq-selftest --gpu --synthetic-reads 100000)
+if [[ -n "$SMOKE_BAM" && -n "$SMOKE_FASTA" ]]; then
+    gpu_selftest+=(-b "$SMOKE_BAM" -f "$SMOKE_FASTA" -c chr19 --max-reads 300000)
+fi
+if gpu_out="$("${gpu_selftest[@]}" 2>&1)"; then
+    echo "$gpu_out"
+elif grep -q "no usable GPU" <<<"$gpu_out"; then
+    echo "GPU BAQ: no usable GPU on this host ($(grep -o 'no usable GPU.*' <<<"$gpu_out" | head -1)); BAQ runs on the CPU."
+else
+    echo "$gpu_out" >&2
+    echo "install.sh: GPU BAQ self-test failed; do not use --baq-device gpu on this host. Report this." >&2
     exit 1
 fi
 

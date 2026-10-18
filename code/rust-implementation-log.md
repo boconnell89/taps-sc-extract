@@ -403,3 +403,30 @@ Balanced and hash-sharded outputs are identical per cell (701.7M sites over 900 
 ## 2026-10-17 — GPU acceleration plan (adversarial review, no code shipped)
 
 Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds (Grok measured on the RTX 3060, Gemini source/literature). Findings: an exact GPU BAQ kernel is possible (0 differences on 1,048,576 synthetic reads, CUDA and OpenCL), but on this RTX 3060 over PCIe 3.0 x4 it reaches 0.91M HMM reads/s with transfers against ~2.7M on 32 AVX2 threads, so GPU BAQ stays off here. Only strong-FP64 GPUs (A100/H100, Instinct, Intel Max) are expected to win; the server GPU decides (gate G0). Non-BAQ GPU offloads (HDF5 compression, BGZF, pileup) dropped. glibc `log` differs in the last bit between FMA and non-FMA libm on 1,509 of 20M inputs, with 0 quality-score differences. Prototypes and raw results: `scratch/gpu-plan/` (not in git).
+
+## 2026-10-17 — GPU BAQ: `--baq-device gpu` (OpenCL, CUDA, HIP), CPU stays the default
+
+- Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md) (Phase 1 and a first Phase 2). Target server GPU: Intel Arc Pro B70 (OpenCL).
+- `csrc/gpu/baq_hmm_body.h`: htslib's HMM, one read per work-item, each read with its own shape (no grouping: real batches fragment into tiny shape groups), f interleaved across the launch, MAP fused into the backward pass (two b rows), rows zeroed to i_dim+3. HMM parameters and the quality→probability table come from the host; q is computed on the device and flagged (0xFF, max returned) within 1e-9 of a rounding point for host recomputation with glibc.
+- Backends: OpenCL (`baq_opencl.c`, libOpenCL loaded with dlopen, kernel built at run time; picks a GPU with fp64), CUDA (`baq_cuda.cu`, nvcc run directly from build.rs with exact-math flags, static cudart; `TAPS_CUDA_ARCH` limits code generation, install.sh sets it from `nvidia-smi` on native builds), HIP (same file, `-DTAPS_HIP`, hipcc; compiled only when hipcc exists; untested — no AMD GPU here).
+- CPU side (`baq_simd.c`): `taps_baq_gpu_prepare` (span, band, TAPS-masked translation; htslib-only and oversize reads listed for the CPU), `taps_baq_gpu_export` (packed reads + host-computed parameters), `taps_baq_gpu_finish` (flag recompute, BAQ_EXTEND, quality cap). `baq_gpu.rs`: one service thread per process pools requests from all workers (up to 65,536 reads or 0.5 ms), sorts by length, launches, splits results; workers wait for theirs. A failed launch falls back to the CPU for that batch (nothing is modified before finish).
+- Exactness: `baq-selftest --gpu`: 200k synthetic and all 1,431,323 chr19 reads identical to htslib through CUDA and through OpenCL (PoCL-CUDA in an isolated conda env; 1,431,045 reads on the GPU). chr19 extraction with `--baq-device gpu` reproduces the frozen `taps`, `taps-full` and `htslib` references. Full test BAM: CpG totals identical.
+- RTX 3060 (PCIe 3.0 x4), full test BAM, `-t 32 --shards 16`: default BAQ processing 3.62M reads/s CPU vs 1.94M CUDA vs 1.86M OpenCL (end to end 2.04M / 1.33M / 1.30M); `taps-full` 1.95M vs 0.59M. Slower, as the plan predicted; the default stays `cpu`. `--test` now times GPU vs CPU BAQ and reports which is faster (3060: -66%).
+- Not done yet: overlapping GPU BAQ with calling (workers wait for their batch), multiple launches in flight, device-side finish, read-centric calling (plan Phase 4).
+
+### Intel Arc Pro B70 (Battlemage host, 2026-10-18)
+
+- Host: Ryzen 7 1700X (16 threads, Zen 1), 60 GB, Intel compute runtime 26.05 (OpenCL 3.0 NEO), `cl_khr_fp64`. Measured with a probe: FP64 mul+add 0.70 TFLOP/s (RTX 3060: 0.087), FP32 11.4 TFLOP/s. Portable (x86-64-v3) binary shipped with its conda libraries.
+- Exactness: `baq-selftest --gpu` on the B70: all 1,100,661 chr19 reads of the test BAM and 200k synthetic reads identical; full-dataset CpG/CH totals identical to the CPU in `taps` and `taps-full`.
+- Kernel tuning on real chr19 reads (kernel time per ~1.05M HMM reads; 0.86M -> ~2.1M reads/s, every step exact):
+  - first port: 1.1 s (f, s, b rows and qualities in private arrays; whole rows zeroed in global memory);
+  - forward rows private, only M/I band cells to global, no global zeroing: no change;
+  - per-read scratch moved to global memory interleaved across reads: 0.8 s;
+  - 32-bit index arithmetic (Xe emulates 64-bit integer multiply): no change;
+  - band-7 fast path (99.1% of reads): band loops written out cell by cell so rows live in registers, with Intel's 256-register mode (now the default on Intel devices): 0.6 s (0.75M/s without the 256-register mode);
+  - sliding register window for reference codes (one load per row instead of one per cell): no change; FP32 instead of FP64: no faster (0.7 s), so arithmetic is not the limit, and 4.2% of reads changed — no fast mode for now;
+  - row zero/copy written out (no indexed loops) and band-7 reads grouped ahead of generic ones (no mixed SIMD groups): 0.5 s;
+  - single in-place row (half the registers): 0.47 s with 256 registers, 1.0 s without; not adopted.
+  - Ablation: removing the backward pass and the global f traffic together only moved 0.6 -> 0.5 s.
+- Service: packing now overlaps the device (separate packer thread); result buffers reused across launches.
+- Full test BAM on Battlemage, `-t 16 --shards 16`: default BAQ processing CPU 1.34M vs B70 1.76M reads/s (end to end 0.92M vs 1.11M); `taps-full` CPU 0.65M vs B70 1.23M (0.54M vs 0.87M). `--no-baq` 2.71M processing (calling 62% of worker time on that CPU). RTX 3060 + CUDA/OpenCL remain exact with the rewritten kernel.

@@ -1,5 +1,14 @@
 # GPU acceleration plan (v4, 2026-10-17)
 
+**Status (2026-10-17):** Phase 1 and a first Phase 2 are implemented: `--baq-device gpu` (default `cpu`) with
+OpenCL, CUDA and HIP backends sharing one kernel body, variable-shape launches, device-side q with boundary flags,
+and a pooling service thread. Exact on all chr19 reads through CUDA and OpenCL; slower than the CPU on the RTX
+3060, as predicted. **B70 (2026-10-18):** exact (Intel OpenCL), FP64 measured 0.70 TFLOP/s; after kernel tuning
+~2.1M HMM reads/s; on its host (Ryzen 7 1700X) GPU BAQ is +31% processing at the default and +89% with BAQ on every
+read. Next: overlap GPU BAQ with calling (workers still wait), then read-centric calling (Phase 4; calling is 62%
+of worker time on that host without BAQ).
+See `code/rust-implementation-log.md` (2026-10-17, GPU BAQ).
+
 Developed by two rounds of adversarial review: Claude drafts, Grok 4.6 (xhigh; measured on this machine's GPU)
 and Gemini 3.8 Flash (high; source + literature review), each round cross-examining the other. Working files,
 prototype code and raw measurements: `scratch/gpu-plan/` (`plan-v1.md`, `plan-v2.md`, `grok/review-r1.md`,

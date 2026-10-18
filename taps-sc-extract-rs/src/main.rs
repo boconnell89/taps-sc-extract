@@ -7,6 +7,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod accumulate;
 mod autotune;
+mod baq_gpu;
 mod baq_simd;
 mod barcode;
 mod calling;
@@ -249,6 +250,21 @@ enum Commands {
         /// identical results (`baq-selftest`).
         #[arg(long, value_enum, default_value_t = baq_simd::BaqSimd::Auto)]
         baq_simd: baq_simd::BaqSimd,
+        /// Where the BAQ HMM runs: cpu (default, SIMD kernels) or gpu
+        /// (identical results; see --gpu-backend). Reads too long or with a
+        /// band too wide for the GPU kernel stay on the CPU.
+        #[arg(long, value_enum, default_value_t = baq_gpu::BaqDevice::Cpu)]
+        baq_device: baq_gpu::BaqDevice,
+        /// GPU backend for --baq-device gpu: auto (CUDA, then HIP, then
+        /// OpenCL), opencl (Intel Arc/Data Center, any fp64 device), cuda, hip.
+        #[arg(long, value_enum, default_value_t = baq_gpu::GpuBackend::Auto)]
+        gpu_backend: baq_gpu::GpuBackend,
+        /// Use the first GPU whose name contains this text.
+        #[arg(long, default_value = "")]
+        gpu_device: String,
+        /// GPU memory for HMM matrices per launch, in MB.
+        #[arg(long, default_value_t = 1024)]
+        gpu_mem_mb: usize,
         /// Methylation contexts to extract: both (default), CG or CH. With one
         /// context the other's pileup columns are skipped and its HDF5 group
         /// (/CG or /CH) is not written.
@@ -316,6 +332,13 @@ enum Commands {
         max_reads: usize,
         #[arg(long, default_value_t = 200_000)]
         synthetic_reads: usize,
+        /// Test the GPU path (HMM on the GPU) instead of the CPU kernels.
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
+        #[arg(long, value_enum, default_value_t = baq_gpu::GpuBackend::Auto)]
+        gpu_backend: baq_gpu::GpuBackend,
+        #[arg(long, default_value = "")]
+        gpu_device: String,
     },
     /// Internal: write one shard file from window chunks (spawned by `extract`).
     #[command(hide = true)]
@@ -377,11 +400,16 @@ fn main() -> Result<()> {
                 json: report,
             })?;
         }
-        Commands::BaqSelftest { bam, fasta, contig, max_reads, synthetic_reads } => {
+        Commands::BaqSelftest { bam, fasta, contig, max_reads, synthetic_reads, gpu, gpu_backend, gpu_device } => {
             use baq_simd::Width;
             // htslib: the masked fallback (one copied span per read) must match too.
             let mut widths = vec![Width::HTSLIB, Width::AVX2, Width::AVX2_X8, Width::AVX512];
             widths.retain(|w| w.supported());
+            if gpu {
+                let svc = baq_gpu::start(gpu_backend, &gpu_device, 1024)?;
+                eprintln!("BAQ self-test on GPU {} ({:?}); CPU kernel {} for reads the GPU does not take", svc.device, svc.backend, Width::cpu_best().label());
+                widths = vec![Width::cpu_best()];
+            }
             eprintln!(
                 "BAQ self-test: CPU kernel {}; testing {}",
                 Width::cpu_best().label(),
@@ -390,13 +418,13 @@ fn main() -> Result<()> {
             let mut bad = 0usize;
             for w in &widths {
                 let t = Instant::now();
-                let r = baq_simd::selftest_synthetic(*w, synthetic_reads, 0x5eed)?;
-                eprintln!("  synthetic  {:32} {:>9} reads, {:>9} via SIMD, {} differ ({:.1} s)", w.label(), r.reads, r.simd_reads, r.mismatched, t.elapsed().as_secs_f64());
+                let r = baq_simd::selftest_synthetic(*w, synthetic_reads, 0x5eed, gpu)?;
+                eprintln!("  synthetic  {:32} {:>9} reads, {:>9} via {}, {} differ ({:.1} s)", if gpu { "gpu (+cpu)" } else { w.label() }, r.reads, r.simd_reads, if gpu { "GPU" } else { "SIMD" }, r.mismatched, t.elapsed().as_secs_f64());
                 bad += r.mismatched;
                 if let (Some(b), Some(f)) = (&bam, &fasta) {
                     let t = Instant::now();
-                    let r = baq_simd::selftest_bam(b, f, &contig, max_reads, *w)?;
-                    eprintln!("  {contig:<10} {:32} {:>9} reads, {:>9} via SIMD, {} differ ({:.1} s)", w.label(), r.reads, r.simd_reads, r.mismatched, t.elapsed().as_secs_f64());
+                    let r = baq_simd::selftest_bam(b, f, &contig, max_reads, *w, gpu)?;
+                    eprintln!("  {contig:<10} {:32} {:>9} reads, {:>9} via {}, {} differ ({:.1} s)", if gpu { "gpu (+cpu)" } else { w.label() }, r.reads, r.simd_reads, if gpu { "GPU" } else { "SIMD" }, r.mismatched, t.elapsed().as_secs_f64());
                     bad += r.mismatched;
                 }
             }
@@ -498,6 +526,7 @@ fn main() -> Result<()> {
                 compute_baq,
                 baq_mode: baq,
                 baq_width: baq_simd::Width::resolve(baq_simd)?,
+                baq_device: baq_gpu::BaqDevice::Cpu,
                 context,
                 decomp_threads: decomp,
                 accumulate: dump_sites.is_some(),
@@ -582,6 +611,10 @@ fn main() -> Result<()> {
             no_baq,
             baq,
             baq_simd,
+            baq_device,
+            gpu_backend,
+            gpu_device,
+            gpu_mem_mb,
             context,
             trim_r1,
             trim_r2,
@@ -695,6 +728,7 @@ fn main() -> Result<()> {
                 compute_baq: !no_baq,
                 baq_mode: baq,
                 baq_width: resolve_baq_width(baq_simd, saved.as_ref().map(|(p, _)| p))?,
+                baq_device,
                 context,
                 decomp_threads: decomp,
                 accumulate: true,
@@ -733,7 +767,16 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("  Compression:     {compression_name}");
             }
-            eprintln!("  BAQ:             {} (kernel: {})", baq_label(&params), baq_kernel_label(&params));
+            let gpu_label = if params.compute_baq && params.baq_device == baq_gpu::BaqDevice::Gpu {
+                let svc = baq_gpu::start(gpu_backend, &gpu_device, gpu_mem_mb)?;
+                Some(format!("GPU {} ({:?})", svc.device, svc.backend))
+            } else {
+                None
+            };
+            match &gpu_label {
+                Some(g) => eprintln!("  BAQ:             {} (HMM on {g}; CPU kernel {} for the rest)", baq_label(&params), baq_kernel_label(&params)),
+                None => eprintln!("  BAQ:             {} (kernel: {})", baq_label(&params), baq_kernel_label(&params)),
+            }
             eprintln!("  Contexts:        {}", params.context.label());
             eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
@@ -858,6 +901,7 @@ fn main() -> Result<()> {
                         ("compression", compression_name.clone()),
                         ("baq", baq_label(&params).to_string()),
                         ("baq_kernel", baq_kernel_label(&params).to_string()),
+                        ("baq_device", gpu_label.clone().unwrap_or_else(|| "cpu".to_string())),
                         ("context", params.context.label().to_string()),
                         ("bam", bam.display().to_string()),
                         ("nproc", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).to_string()),

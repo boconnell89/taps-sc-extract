@@ -20,6 +20,7 @@ use std::path::Path;
 /// unmasked; `ref_hi` = contig length when the slice reaches the end), which
 /// must cover `extract::baq_need`. `mask` is the base the HMM sees as N.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct BaqJob {
     pub b: *mut htslib::bam1_t,
     pub reference: *const c_char,
@@ -93,6 +94,13 @@ impl Width {
 /// Per-thread scratch for `taps_baq_batch` (grows to the largest batch seen).
 pub struct Workspace(*mut c_void);
 
+impl Workspace {
+    /// The C workspace, for the GPU path (`baq_gpu`).
+    pub(crate) fn raw(&mut self) -> *mut c_void {
+        self.0
+    }
+}
+
 // The workspace is plain heap memory owned by one thread at a time.
 unsafe impl Send for Workspace {}
 
@@ -154,7 +162,7 @@ impl Contig {
 /// `sam_prob_realn` against a fully masked contig copy, and `taps_baq_batch`
 /// at `width` with the production inputs (unmasked slice covering
 /// `baq_need`, mask per read).
-fn compare(recs: &[Record], contig: &Contig, masks: &[u8], width: Width, ws: &mut Workspace) -> SelftestResult {
+fn compare(recs: &[Record], contig: &Contig, masks: &[u8], width: Width, gpu: bool, ws: &mut Workspace) -> SelftestResult {
     let mut a: Vec<Record> = recs.to_vec();
     let mut b: Vec<Record> = recs.to_vec();
     for (r, &m) in a.iter_mut().zip(masks) {
@@ -178,7 +186,7 @@ fn compare(recs: &[Record], contig: &Contig, masks: &[u8], width: Width, ws: &mu
             }
         })
         .collect();
-    let simd_reads = ws.run(&jobs, width);
+    let simd_reads = if gpu { crate::baq_gpu::run_batch(ws, &jobs, width) } else { ws.run(&jobs, width) };
     let mut mismatched = 0;
     for ((x, y), orig) in a.iter().zip(&b).zip(recs) {
         if x.qual() == y.qual() {
@@ -225,7 +233,7 @@ impl Rng {
 /// Random reads against a random reference: varied lengths, mismatches, N,
 /// clips, insertions and deletions, low and high qualities, and reads running
 /// off the reference end. Many reads share lengths so lanes fill.
-pub fn selftest_synthetic(width: Width, n_reads: usize, seed: u64) -> Result<SelftestResult> {
+pub fn selftest_synthetic(width: Width, n_reads: usize, seed: u64, gpu: bool) -> Result<SelftestResult> {
     let mut rng = Rng(seed | 1);
     let ref_len = 50_000usize;
     let reference: Vec<u8> = (0..ref_len)
@@ -331,8 +339,10 @@ pub fn selftest_synthetic(width: Width, n_reads: usize, seed: u64) -> Result<Sel
     let contig = Contig::new(reference);
     let mut ws = Workspace::new();
     let mut total = SelftestResult::default();
-    for (chunk, mchunk) in recs.chunks(4096).zip(masks.chunks(4096)) {
-        let r = compare(chunk, &contig, mchunk, width, &mut ws);
+    // GPU: production-sized launches (the service pools ~64k reads).
+    let chunk_n = if gpu { 65_536 } else { 4096 };
+    for (chunk, mchunk) in recs.chunks(chunk_n).zip(masks.chunks(chunk_n)) {
+        let r = compare(chunk, &contig, mchunk, width, gpu, &mut ws);
         total.reads += r.reads;
         total.simd_reads += r.simd_reads;
         total.mismatched += r.mismatched;
@@ -342,7 +352,7 @@ pub fn selftest_synthetic(width: Width, n_reads: usize, seed: u64) -> Result<Sel
 
 /// Every mapped primary read of `region` (contig name), up to `max_reads`,
 /// against the TAPS-masked reference for its strand.
-pub fn selftest_bam(bam_path: &Path, fasta: &Path, contig: &str, max_reads: usize, width: Width) -> Result<SelftestResult> {
+pub fn selftest_bam(bam_path: &Path, fasta: &Path, contig: &str, max_reads: usize, width: Width, gpu: bool) -> Result<SelftestResult> {
     let fa = crate::fasta::FastFaiReader::open(fasta)?;
     let len = fa
         .reference_length(contig)
@@ -352,14 +362,15 @@ pub fn selftest_bam(bam_path: &Path, fasta: &Path, contig: &str, max_reads: usiz
     bam.fetch(contig).map_err(|e| anyhow::anyhow!("fetch {contig}: {e}"))?;
     let mut ws = Workspace::new();
     let mut total = SelftestResult::default();
-    let mut batch: Vec<Record> = Vec::with_capacity(4096);
+    let chunk_n = if gpu { 65_536 } else { 4096 };
+    let mut batch: Vec<Record> = Vec::with_capacity(chunk_n);
     let mut rec = Record::new();
     let mut flush = |batch: &mut Vec<Record>, total: &mut SelftestResult| {
         let masks: Vec<u8> = batch
             .iter()
             .map(|r| crate::extract::baq_mask(crate::extract::BaqMode::TapsFull, r.flags()))
             .collect();
-        let r = compare(batch, &seqs, &masks, width, &mut ws);
+        let r = compare(batch, &seqs, &masks, width, gpu, &mut ws);
         total.reads += r.reads;
         total.simd_reads += r.simd_reads;
         total.mismatched += r.mismatched;
@@ -374,7 +385,7 @@ pub fn selftest_bam(bam_path: &Path, fasta: &Path, contig: &str, max_reads: usiz
                     continue;
                 }
                 batch.push(rec.clone());
-                if batch.len() == 4096 {
+                if batch.len() == chunk_n {
                     flush(&mut batch, &mut total);
                 }
             }
@@ -399,7 +410,7 @@ mod tests {
             }
         }
         for w in widths {
-            let r = selftest_synthetic(w, 20_000, 7).unwrap();
+            let r = selftest_synthetic(w, 20_000, 7, false).unwrap();
             assert_eq!(r.mismatched, 0, "{}: {r:?}", w.label());
             if w != Width::HTSLIB {
                 assert!(r.simd_reads > r.reads / 2, "{}: {r:?}", w.label());

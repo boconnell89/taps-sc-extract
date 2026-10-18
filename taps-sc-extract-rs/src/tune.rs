@@ -847,6 +847,26 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         })
         .map(|k| k.0)
         .unwrap_or(crate::baq_simd::Width::HTSLIB);
+    // GPU BAQ, if a GPU is usable: synthetic processing rate at the knee with
+    // the HMM on every read, GPU vs the best CPU kernel. Reported only; the
+    // default stays the CPU (--baq-device gpu opts in).
+    let mut gpu_probe: Option<(String, f64, f64)> = None;
+    if let Ok(svc) = crate::baq_gpu::start(crate::baq_gpu::GpuBackend::Auto, "", 1024) {
+        let wins = if knee < 8 {
+            synthetic_windows(&fai, small_names, small_bp, knee)
+        } else {
+            synthetic_windows(&fai, &names, total_bp, knee)
+        };
+        let cpu_p = ExtractParams { baq_width: best_kernel, ..tune_params(true, false) };
+        let gpu_p = ExtractParams { baq_device: crate::baq_gpu::BaqDevice::Gpu, ..cpu_p.clone() };
+        let (rc, _, sc) = run_extract(&syn.bam, &syn.fasta, &wins, &cpu_p, knee, 1)?;
+        let (rg, _, sg) = run_extract(&syn.bam, &syn.fasta, &wins, &gpu_p, knee, 1)?;
+        gpu_probe = Some((
+            format!("{} ({:?})", svc.device, svc.backend),
+            rc.timing.records as f64 / sc,
+            rg.timing.records as f64 / sg,
+        ));
+    }
 
     // --- Memory bandwidth.
     eprintln!("[3/5] Memory bandwidth ...");
@@ -964,6 +984,19 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
                 rate / base_k,
                 if *w == best_kernel { "  <- fastest (--baq-simd auto uses it with --save-profile)" } else { "" }
             );
+        }
+    }
+    match &gpu_probe {
+        Some((dev, cpu, gpu)) => {
+            let _ = writeln!(
+                rpt,
+                "GPU BAQ at W={knee} (HMM on every read): {dev}: {gpu:.0} reads/s vs CPU {cpu:.0} reads/s ({:+.0}%){}",
+                (gpu / cpu - 1.0) * 100.0,
+                if gpu > cpu { " -> --baq-device gpu is faster here" } else { " -> keep --baq-device cpu (default)" }
+            );
+        }
+        None => {
+            let _ = writeln!(rpt, "GPU BAQ: no usable GPU (backends built: {})", crate::baq_gpu::built_backends().join(", "));
         }
     }
     let _ = writeln!(rpt, "Memory copy bandwidth: {bw1:.1} GB/s (1 thread), {bwn:.1} GB/s ({} threads)", host.nproc);
@@ -1172,6 +1205,12 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         let _ = writeln!(toml, "baq_kernel_{}_reads_per_thread_s = {rate:.0}", w.0);
     }
     let _ = writeln!(toml, "recommended_baq_simd = \"{}\"", simd_name(best_kernel));
+    if let Some((dev, cpu, gpu)) = &gpu_probe {
+        let _ = writeln!(toml, "gpu_device = \"{}\"", dev.replace('"', "'"));
+        let _ = writeln!(toml, "gpu_baq_reads_per_s = {gpu:.0}");
+        let _ = writeln!(toml, "cpu_baq_reads_per_s = {cpu:.0}");
+        let _ = writeln!(toml, "gpu_baq_faster = {}", gpu > cpu);
+    }
 
     if let Some(j) = &a.json {
         std::fs::write(j, toml.clone() + "\n# report\n" + &rpt.lines().map(|l| format!("# {l}\n")).collect::<String>())
