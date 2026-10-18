@@ -308,10 +308,12 @@ fn serve(engine: &mut Engine, shared: &Shared) {
     unsafe { taps_baq_gpu_q2p(q2p.as_mut_ptr()) };
     // TAPS_GPU_PROFILE=N: cumulative service timings every N launches.
     let profile_every: u64 = std::env::var("TAPS_GPU_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    // Cap a launch at TAPS_GPU_MAX_READS (whole submissions; the rest waits
-    // for the next launch): bounds device buffers and per-launch latency.
-    // Without it, `taps-full` launches grew to ~250k reads.
-    let max_reads: usize = std::env::var("TAPS_GPU_MAX_READS").ok().and_then(|v| v.parse().ok()).unwrap_or(65_536);
+    // TAPS_GPU_MAX_READS caps a launch (whole submissions; the rest waits for
+    // the next launch). Off by default: when the GPU is the bottleneck a cap
+    // leaves workers blocked on reads not yet launched, and the GPU then
+    // idles (RTX 3060: 64k cap 2.41M vs uncapped 2.58M reads/s, 16k 1.70M).
+    // Device memory is already bounded by the backends' f-budget chunking.
+    let max_reads: usize = std::env::var("TAPS_GPU_MAX_READS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     let (mut launches, mut reads, mut fast_reads) = (0u64, 0u64, 0u64);
     let (mut t_wait, mut t_run, mut t_split) = (0f64, 0f64, 0f64);
     // Result buffers reused across launches (no per-launch allocation).

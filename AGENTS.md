@@ -9,7 +9,7 @@
 `taps-sc-extract` is a high-performance Python package and CLI tool for extracting single-cell DNA methylation from TAPS (mC-to-T chemistry) coordinate-sorted BAM files. It writes base-resolution methylation calls into **Amethyst-compatible HDF5 files** (`/CG/<barcode>/1` and `/CH/<barcode>/1`).
 
 ### Target Scale
-- **Workstations**: 16 cores / 32 threads, ~60 GB RAM on this host. Latest snapshot: [`code/nvme-profiling-2026-10-17.md`](code/nvme-profiling-2026-10-17.md) (README [Performance](README.md#performance) has the summary and history); earlier: [`2026-10-16`](code/nvme-profiling-2026-10-16.md), [`2026-10-15`](code/nvme-profiling-2026-10-15.md), [`2026-10-14`](code/nvme-profiling-2026-10-14.md). README performance figures are rates (mapped reads/s or reads/min) and percent changes, never clock times; raw times live in the snapshots. On a new machine run `taps-sc-extract --test` before quoting or tuning anything.
+- **Workstations**: 16 cores / 32 threads, ~60 GB RAM on this host. Latest snapshot: [`code/nvme-profiling-2026-10-18.md`](code/nvme-profiling-2026-10-18.md) (README [Performance](README.md#performance) has the summary and history); earlier: [`2026-10-17`](code/nvme-profiling-2026-10-17.md), [`2026-10-16`](code/nvme-profiling-2026-10-16.md), [`2026-10-15`](code/nvme-profiling-2026-10-15.md), [`2026-10-14`](code/nvme-profiling-2026-10-14.md). README performance figures are rates (mapped reads/s or reads/min) and percent changes, never clock times; raw times live in the snapshots. On a new machine run `taps-sc-extract --test` before quoting or tuning anything.
 - **Production Servers**: 96 cores, 720 GB RAM (scales to >200k cells and >1B reads).
 
 ---

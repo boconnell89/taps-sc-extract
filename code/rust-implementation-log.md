@@ -487,3 +487,5 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   | `--no-baq`, reads | 9.18M (+44%) | 3.03M (+15%) |
 
   Peak memory is unchanged (10.9 GB extraction). End to end is now limited mostly by the HDF5 write (about 4.5M reads/s).
+- GPU launch cap removed (`TAPS_GPU_MAX_READS` now defaults to unlimited). When the GPU is the bottleneck, a cap leaves workers blocked on reads that have not been launched, so the GPU idles. RTX 3060, `--caller reads`: 64k cap 2.41M reads/s (4.6 s idle), 16k cap 1.70M (10 s idle), uncapped 2.58–2.65M (0.2 s idle). `taps-full`: 0.60M → 0.76M. Device memory stays bounded by the backends' f-budget chunking.
+- README re-measured with the new defaults: [`nvme-profiling-2026-10-18.md`](nvme-profiling-2026-10-18.md). Defaults, median of five runs: processing 5.08M, write 4.73M, end to end 2.45M reads/s (2.39–2.56M). `--context CG` 5.99M end to end, `--context CG --no-baq` 14.1M.
