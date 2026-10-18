@@ -209,7 +209,8 @@ struct Accum {
     refb: Vec<u8>,
     qry: Vec<u8>,
     qual: Vec<u8>,
-    ranges: Vec<(usize, usize)>,
+    /// Per submission: first base, bases, reads, reference bytes.
+    ranges: Vec<(usize, usize, usize, usize)>,
     replies: Vec<mpsc::SyncSender<Result<Reply, String>>>,
 }
 
@@ -273,11 +274,44 @@ pub fn start(backend: GpuBackend, want: &str, mem_mb: usize) -> Result<&'static 
 
 /// Launcher (the thread that opened the device): whenever it is free, takes
 /// every read accumulated so far, runs it, and returns each batch its slice.
+/// Move whole submissions from the front of `acc` into the empty `out` until
+/// `max_reads` (at least one submission), rebasing what stays in `acc`.
+fn take_front(acc: &mut Accum, out: &mut Accum, max_reads: usize) {
+    let (mut k, mut nr, mut nref, mut nb) = (0, 0, 0, 0);
+    for &(_, len, r, rb) in &acc.ranges {
+        if k > 0 && nr + r > max_reads {
+            break;
+        }
+        k += 1;
+        nr += r;
+        nref += rb;
+        nb += len;
+    }
+    out.rd.extend(acc.rd.drain(..nr));
+    out.refb.extend(acc.refb.drain(..nref));
+    out.qry.extend(acc.qry.drain(..nb));
+    out.qual.extend(acc.qual.drain(..nb));
+    out.ranges.extend(acc.ranges.drain(..k));
+    out.replies.extend(acc.replies.drain(..k));
+    let (dref, db) = (nref as u32, nb as u32);
+    for g in &mut acc.rd {
+        g.ref_off -= dref;
+        g.base_off -= db;
+    }
+    for r in &mut acc.ranges {
+        r.0 -= nb;
+    }
+}
+
 fn serve(engine: &mut Engine, shared: &Shared) {
     let mut q2p = [0f32; 256];
     unsafe { taps_baq_gpu_q2p(q2p.as_mut_ptr()) };
     // TAPS_GPU_PROFILE=N: cumulative service timings every N launches.
     let profile_every: u64 = std::env::var("TAPS_GPU_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Cap a launch at TAPS_GPU_MAX_READS (whole submissions; the rest waits
+    // for the next launch): bounds device buffers and per-launch latency.
+    // Without it, `taps-full` launches grew to ~250k reads.
+    let max_reads: usize = std::env::var("TAPS_GPU_MAX_READS").ok().and_then(|v| v.parse().ok()).unwrap_or(65_536);
     let (mut launches, mut reads, mut fast_reads) = (0u64, 0u64, 0u64);
     let (mut t_wait, mut t_run, mut t_split) = (0f64, 0f64, 0f64);
     // Result buffers reused across launches (no per-launch allocation).
@@ -292,7 +326,11 @@ fn serve(engine: &mut Engine, shared: &Shared) {
             while acc.rd.is_empty() {
                 acc = shared.ready.wait(acc).expect("GPU accumulator");
             }
-            std::mem::swap(&mut *acc, &mut spare);
+            if acc.rd.len() <= max_reads {
+                std::mem::swap(&mut *acc, &mut spare);
+            } else {
+                take_front(&mut acc, &mut spare, max_reads);
+            }
             std::mem::take(&mut spare)
         };
         let t_start = Instant::now();
@@ -313,7 +351,7 @@ fn serve(engine: &mut Engine, shared: &Shared) {
         if profile_every > 0 {
             fast_reads += p.rd.iter().filter(|g| g.bw == 7 && g.i_dim == 51).count() as u64;
         }
-        for (reply, &(b0, len)) in p.replies.drain(..).zip(&p.ranges) {
+        for (reply, &(b0, len, _, _)) in p.replies.drain(..).zip(&p.ranges) {
             let out = match res {
                 Ok(nflag) => Ok(Reply {
                     state: state[b0..b0 + len].to_vec(),
@@ -392,7 +430,7 @@ pub fn submit(ws: &mut Workspace, jobs: &[BaqJob]) -> Pending {
             let mut acc = svc.shared.acc.lock().expect("GPU accumulator");
             let (ro, bo) = (acc.refb.len() as u32, acc.qry.len() as u32);
             acc.rd.extend(rd.iter().map(|g| GpuRead { ref_off: g.ref_off + ro, base_off: g.base_off + bo, ..*g }));
-            acc.ranges.push((bo as usize, qry.len()));
+            acc.ranges.push((bo as usize, qry.len(), rd.len(), refb.len()));
             acc.refb.extend_from_slice(refb);
             acc.qry.extend_from_slice(qry);
             acc.qual.extend_from_slice(qual);

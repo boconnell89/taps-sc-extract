@@ -460,3 +460,6 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
     - 2.21M with the prepare and buffer changes (end to end 1.27M).
   - Same host, CPU BAQ: 1.34M → 1.40M after the skip-check change alone.
   - Reference workstation, CPU default, three runs: processing 3.70–4.09M (median 3.84M, previously 3.29M), end to end 2.03–2.18M (median 2.07M, previously 1.85M).
+- B70 after the commit, before the host was shared: the depth sweep gives 2.21M (depth 4), 2.27M (2) and 2.27M (6) reads/s processing, all exact. These are the same within noise, so the default stays at 4.
+- Launch cap: with the accumulator, `taps-full` launches grew to ~250k reads (GPU saturated, idle 0.2 s). Launches now take whole submissions up to `TAPS_GPU_MAX_READS` (default 65,536); the rest waits for the next launch. Exact: chr19 `taps-full` with a 3,000-read cap equals the CPU, the GPU pytest cases pass, and the B70 full-BAM `taps-full` totals equal the CPU (22,263,588 / 31,087,846).
+- Not yet timed: from 10:22 on 2026-10-18, Battlemage also runs a vLLM server on the B70 (90% of GPU memory) with a crawler feeding it. GPU timings from then on (`taps-full` 0.84–1.13M reads/s) are not comparable. Re-time on an idle GPU.
