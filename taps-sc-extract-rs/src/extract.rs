@@ -675,14 +675,37 @@ pub fn process_window(
     // across reads), then push and drain each record in file order exactly as
     // one-at-a-time processing would. BAQ changes only the read's own
     // qualities, so running it ahead of the pushes leaves the pileup unchanged.
-    let mut pool: Vec<Record> = (0..READ_BATCH).map(|_| Record::new()).collect();
-    let mut keep = vec![false; READ_BATCH];
-    let mut jobs: Vec<BaqJob> = Vec::with_capacity(READ_BATCH);
-    let mut ws = baq_simd::Workspace::new();
+    // Batches in flight. On the CPU one: read and filter a batch, BAQ it, push
+    // it. With the GPU several: while the GPU runs BAQ on the newest batches,
+    // the oldest finished batch is pushed and called, so calling overlaps the
+    // device. Batches are pushed in file order either way.
+    let gpu = params.compute_baq && params.baq_device == crate::baq_gpu::BaqDevice::Gpu;
+    let depth = if gpu { crate::baq_gpu::depth() } else { 1 };
+    struct Slot {
+        pool: Vec<Record>,
+        keep: Vec<bool>,
+        n: usize,
+        jobs: Vec<BaqJob>,
+        // Reads whose BAQ span reaches past the padded window (rare): own
+        // fetches, alive until their batch's BAQ has run.
+        extras: Vec<Vec<u8>>,
+        ws: baq_simd::Workspace,
+        pending: Option<crate::baq_gpu::Pending>,
+    }
+    let mut slots: Vec<Slot> = (0..depth)
+        .map(|_| Slot {
+            pool: (0..READ_BATCH).map(|_| Record::new()).collect(),
+            keep: vec![false; READ_BATCH],
+            n: 0,
+            jobs: Vec::with_capacity(READ_BATCH),
+            extras: Vec::new(),
+            ws: baq_simd::Workspace::new(),
+            pending: None,
+        })
+        .collect();
+    let mut free: Vec<usize> = (0..depth).rev().collect();
+    let mut inflight: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let win_ref = RefSlice { seq: &ref_seq, lo: ref_start, hi: ref_end };
-    // Reads whose BAQ span reaches past the padded window (rare): own fetches,
-    // alive until their batch's BAQ has run.
-    let mut extras: Vec<Vec<u8>> = Vec::new();
     // Stage clock: `lap` returns seconds since the previous lap when profiling.
     let mut mark = Instant::now();
     let mut lap = |on: bool| -> f64 {
@@ -696,57 +719,77 @@ pub fn process_window(
     };
     let mut plp_s = 0.0f64;
     let mut eof = false;
-    while !eof {
-        lap(profile);
-        jobs.clear();
-        extras.clear();
-        let mut n = 0;
-        while n < READ_BATCH {
-            match bam.read(&mut pool[n]) {
-                None => {
-                    eof = true;
-                    break;
-                }
-                Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
-                Some(Ok(())) => {
-                    timing.records += 1;
-                    let acc = accept_record(&pool[n], params, whitelist);
-                    keep[n] = acc.is_some();
-                    if acc == Some(true) {
-                        let rec = &mut pool[n];
-                        let (lo, hi) = baq_need(rec, ref_len);
-                        let r = if win_ref.covers(lo, hi) {
-                            win_ref
-                        } else {
-                            extras.push(fasta.fetch(&window.contig, lo, hi).with_context(|| {
-                                format!("FASTA BAQ fetch {}:{lo}-{hi}", window.contig)
-                            })?);
-                            RefSlice { seq: extras.last().expect("pushed above"), lo, hi }
-                        };
-                        let mask = baq_mask(params.baq_mode, rec.flags());
-                        if params.baq_mode.wants(rec, &r, mask) {
-                            jobs.push(BaqJob {
-                                b: rec.inner_mut(),
-                                reference: r.seq.as_ptr() as *const c_char,
-                                ref_lo: r.lo as i64,
-                                ref_hi: r.hi as i64,
-                                mask: c_int::from(mask),
-                            });
-                        }
+    while !(eof && inflight.is_empty()) {
+        if !eof && !free.is_empty() {
+            // Read, filter and start BAQ on a new batch.
+            lap(profile);
+            let si = free.pop().expect("checked");
+            let slot = &mut slots[si];
+            slot.jobs.clear();
+            slot.extras.clear();
+            let mut n = 0;
+            while n < READ_BATCH {
+                match bam.read(&mut slot.pool[n]) {
+                    None => {
+                        eof = true;
+                        break;
                     }
-                    n += 1;
+                    Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
+                    Some(Ok(())) => {
+                        timing.records += 1;
+                        let acc = accept_record(&slot.pool[n], params, whitelist);
+                        slot.keep[n] = acc.is_some();
+                        if acc == Some(true) {
+                            let rec = &mut slot.pool[n];
+                            let (lo, hi) = baq_need(rec, ref_len);
+                            let r = if win_ref.covers(lo, hi) {
+                                win_ref
+                            } else {
+                                slot.extras.push(fasta.fetch(&window.contig, lo, hi).with_context(|| {
+                                    format!("FASTA BAQ fetch {}:{lo}-{hi}", window.contig)
+                                })?);
+                                RefSlice { seq: slot.extras.last().expect("pushed above"), lo, hi }
+                            };
+                            let mask = baq_mask(params.baq_mode, rec.flags());
+                            if params.baq_mode.wants(rec, &r, mask) {
+                                slot.jobs.push(BaqJob {
+                                    b: rec.inner_mut(),
+                                    reference: r.seq.as_ptr() as *const c_char,
+                                    ref_lo: r.lo as i64,
+                                    ref_hi: r.hi as i64,
+                                    mask: c_int::from(mask),
+                                });
+                            }
+                        }
+                        n += 1;
+                    }
                 }
             }
+            slot.n = n;
+            timing.read_s += lap(profile);
+            timing.baq_reads += slot.jobs.len() as u64;
+            if gpu {
+                slot.pending = Some(crate::baq_gpu::submit(&mut slot.ws, &slot.jobs));
+            } else {
+                slot.ws.run(&slot.jobs, params.baq_width);
+            }
+            timing.baq_s += lap(profile);
+            if n > 0 {
+                inflight.push_back(si);
+            } else {
+                free.push(si);
+            }
+            continue;
         }
-        timing.read_s += lap(profile);
-        timing.baq_reads += jobs.len() as u64;
-        if params.baq_device == crate::baq_gpu::BaqDevice::Gpu {
-            crate::baq_gpu::run_batch(&mut ws, &jobs, params.baq_width);
-        } else {
-            ws.run(&jobs, params.baq_width);
+        // Finish the oldest batch and push it into the pileup in file order.
+        let si = inflight.pop_front().expect("loop condition");
+        let slot = &mut slots[si];
+        lap(profile);
+        if let Some(p) = slot.pending.take() {
+            crate::baq_gpu::complete(p, &mut slot.ws, &slot.jobs, params.baq_width);
         }
         timing.baq_s += lap(profile);
-        for (rec, _) in pool[..n].iter().zip(&keep[..n]).filter(|(_, k)| **k) {
+        for (rec, _) in slot.pool[..slot.n].iter().zip(&slot.keep[..slot.n]).filter(|(_, k)| **k) {
             timing.pushed += 1;
             if unsafe { htslib::bam_plp_push(plp, rec.inner()) } < 0 {
                 anyhow::bail!("bam_plp_push failed");
@@ -754,6 +797,7 @@ pub fn process_window(
             drain_ready(plp, &mut consume_column)?;
         }
         plp_s += lap(profile);
+        free.push(si);
     }
     if profile {
         lap(true);

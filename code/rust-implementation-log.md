@@ -430,3 +430,9 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   - Ablation: removing the backward pass and the global f traffic together only moved 0.6 -> 0.5 s.
 - Service: packing now overlaps the device (separate packer thread); result buffers reused across launches.
 - Full test BAM on Battlemage, `-t 16 --shards 16`: default BAQ processing CPU 1.34M vs B70 1.76M reads/s (end to end 0.92M vs 1.11M); `taps-full` CPU 0.65M vs B70 1.23M (0.54M vs 0.87M). `--no-baq` 2.71M processing (calling 62% of worker time on that CPU). RTX 3060 + CUDA/OpenCL remain exact with the rewritten kernel.
+
+### Overlap of GPU BAQ with calling (2026-10-18)
+
+- `baq_gpu::submit` (prepare, export, send) and `complete` (wait, finish, CPU leftovers) replace the blocking call. `process_window` keeps `TAPS_GPU_DEPTH` batch slots (default 4) with the GPU: it reads and submits batches until the slots are full, then completes the oldest and pushes it in file order while the newer ones are on the GPU. The CPU path keeps one slot (unchanged behaviour).
+- chr19 with `--baq-device gpu` at depth 1 and 3, and the CPU path, equal the frozen default reference.
+- RTX 3060, full test BAM, `-t 32 --shards 16`, `--baq-device gpu`: processing 2.62M (depth 1), 2.93M (3), 3.14M (6) reads/s; extraction peak 11.0 / 11.5 / 12.3 GB. (CPU alone 3.3-3.6M on this host.) The B70-tuned kernel also lifted the 3060 from 1.94M to 2.62M at depth 1. B70 depth sweep pending (Battlemage unreachable at the time).

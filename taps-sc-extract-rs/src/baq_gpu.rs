@@ -382,20 +382,30 @@ fn serve(engine: &mut Engine, rx: mpsc::Receiver<Request>) {
     }
 }
 
-/// BAQ `jobs` with the HMM on the GPU (service must be started). Reads the
-/// device does not take, and every read if the device fails, run on the CPU
-/// kernel at `width`. Returns the number of reads whose HMM ran on the GPU.
-pub fn run_batch(ws: &mut Workspace, jobs: &[BaqJob], width: Width) -> usize {
+/// A batch handed to the GPU service, to be finished by `complete`.
+pub struct Pending {
+    reply: Option<mpsc::Receiver<Result<Reply, String>>>,
+    n_dev: usize,
+    cpu: Vec<c_int>,
+    n_cpu: usize,
+}
+
+/// Prepare `jobs` (CPU part of BAQ before the HMM) and send the device's
+/// share to the GPU service; returns at once. Nothing in the reads changes
+/// until `complete`, which must get the same `ws` and `jobs`.
+pub fn submit(ws: &mut Workspace, jobs: &[BaqJob]) -> Pending {
+    let mut p = Pending { reply: None, n_dev: 0, cpu: Vec::new(), n_cpu: 0 };
     if jobs.is_empty() {
-        return 0;
+        return p;
     }
     let svc = SERVICE.get().expect("GPU BAQ service not started");
     let mut sz = Sizes::default();
-    let mut cpu = vec![0 as c_int; jobs.len()];
-    unsafe { taps_baq_gpu_prepare(ws.raw(), jobs.as_ptr(), jobs.len() as c_int, &mut sz, cpu.as_mut_ptr()) };
-    let mut on_gpu = 0;
-    if sz.n_dev > 0 {
-        let mut rd = vec![GpuRead::default(); sz.n_dev as usize];
+    p.cpu = vec![0 as c_int; jobs.len()];
+    unsafe { taps_baq_gpu_prepare(ws.raw(), jobs.as_ptr(), jobs.len() as c_int, &mut sz, p.cpu.as_mut_ptr()) };
+    p.n_cpu = sz.n_cpu as usize;
+    p.n_dev = sz.n_dev as usize;
+    if p.n_dev > 0 {
+        let mut rd = vec![GpuRead::default(); p.n_dev];
         let mut refb = vec![0u8; sz.ref_bytes as usize];
         let mut qry = vec![0u8; sz.bases as usize];
         let mut qual = vec![0u8; sz.bases as usize];
@@ -408,12 +418,29 @@ pub fn run_batch(ws: &mut Workspace, jobs: &[BaqJob], width: Width) -> usize {
             .lock()
             .map_err(|_| ())
             .and_then(|tx| tx.send(Request { rd, refb, qry, qual, reply: reply_tx }).map_err(|_| ()));
-        let reply = sent.ok().and_then(|_| reply_rx.recv().ok());
+        if sent.is_ok() {
+            p.reply = Some(reply_rx);
+        }
+    }
+    p
+}
+
+/// Wait for a submitted batch and finish it: the GPU's states and qualities,
+/// then BAQ_EXTEND and the quality cap on the CPU; reads the device did not
+/// take run on the CPU kernel at `width`. If the device failed, the whole
+/// batch runs on the CPU. Returns the number of reads whose HMM ran on the GPU.
+pub fn complete(p: Pending, ws: &mut Workspace, jobs: &[BaqJob], width: Width) -> usize {
+    if jobs.is_empty() {
+        return 0;
+    }
+    let mut on_gpu = 0;
+    if p.n_dev > 0 {
+        let reply = p.reply.as_ref().and_then(|rx| rx.recv().ok());
         match reply {
             Some(Ok(r)) => {
                 let maxv = if r.maxv.is_empty() { std::ptr::null() } else { r.maxv.as_ptr() };
                 unsafe { taps_baq_gpu_finish(ws.raw(), jobs.as_ptr(), r.state.as_ptr(), r.q.as_ptr(), maxv) };
-                on_gpu = sz.n_dev as usize;
+                on_gpu = p.n_dev;
             }
             other => {
                 if !WARNED.swap(true, Ordering::Relaxed) {
@@ -428,9 +455,21 @@ pub fn run_batch(ws: &mut Workspace, jobs: &[BaqJob], width: Width) -> usize {
             }
         }
     }
-    if sz.n_cpu > 0 {
-        let sub: Vec<BaqJob> = cpu[..sz.n_cpu as usize].iter().map(|&i| jobs[i as usize]).collect();
+    if p.n_cpu > 0 {
+        let sub: Vec<BaqJob> = p.cpu[..p.n_cpu].iter().map(|&i| jobs[i as usize]).collect();
         ws.run(&sub, width);
     }
     on_gpu
+}
+
+/// `submit` then `complete` (no overlap).
+pub fn run_batch(ws: &mut Workspace, jobs: &[BaqJob], width: Width) -> usize {
+    let p = submit(ws, jobs);
+    complete(p, ws, jobs, width)
+}
+
+/// Batches each worker keeps in flight with `--baq-device gpu`, so it calls
+/// one batch while the GPU runs BAQ on the next (TAPS_GPU_DEPTH, default 4).
+pub fn depth() -> usize {
+    std::env::var("TAPS_GPU_DEPTH").ok().and_then(|v| v.parse().ok()).filter(|&d| d >= 1).unwrap_or(4)
 }
