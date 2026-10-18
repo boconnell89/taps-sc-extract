@@ -53,6 +53,27 @@ impl MethRec {
     }
 }
 
+/// Append a record whose padding bytes (6 after `chr`, which the compound
+/// type has no member for and HDF5 copies to disk as is) are zero, so
+/// identical runs write identical bytes. Fields are written through raw
+/// pointers into zeroed memory: a by-value `MethRec` may carry arbitrary
+/// padding.
+#[inline]
+pub fn push_rec(v: &mut Vec<MethRec>, chr: FixedAscii<10>, pos: u32, t: u32, c: u32) {
+    let r = MethRec::with_chr(chr, pos, t, c);
+    v.reserve(1);
+    unsafe {
+        let p = v.as_mut_ptr().add(v.len());
+        std::ptr::write_bytes(p as *mut u8, 0, std::mem::size_of::<MethRec>());
+        std::ptr::addr_of_mut!((*p).chr).write(r.chr);
+        std::ptr::addr_of_mut!((*p).pos).write(r.pos);
+        std::ptr::addr_of_mut!((*p).pct).write(r.pct);
+        std::ptr::addr_of_mut!((*p).t).write(r.t);
+        std::ptr::addr_of_mut!((*p).c).write(r.c);
+        v.set_len(v.len() + 1);
+    }
+}
+
 fn contig_s10(s: &str) -> FixedAscii<10> {
     let mut buf = [0u8; 10];
     let b = s.as_bytes();
@@ -169,7 +190,7 @@ fn write_cell_dataset_sliced(
     for &(contig, sites) in parts {
         let chr = contig_s10(contig);
         for &(pos, t, c) in sites {
-            buf.push(MethRec::with_chr(chr, pos, t, c));
+            push_rec(&mut buf, chr, pos, t, c);
             if buf.len() == WRITE_SLICE {
                 flush(&mut buf, &mut start)?;
             }
@@ -215,16 +236,13 @@ pub fn records_from_chunks(chunks: &[ChunkFile]) -> FxHashMap<String, (Vec<MethR
     for ch in chunks {
         for cell in &ch.cells {
             let e = out.entry(cell.barcode.clone()).or_default();
-            e.0.extend(
-                cell.cg
-                    .iter()
-                    .map(|&(pos, t, c)| MethRec::new(&ch.contig, pos, t, c)),
-            );
-            e.1.extend(
-                cell.ch
-                    .iter()
-                    .map(|&(pos, t, c)| MethRec::new(&ch.contig, pos, t, c)),
-            );
+            let chr = contig_s10(&ch.contig);
+            for &(pos, t, c) in &cell.cg {
+                push_rec(&mut e.0, chr, pos, t, c);
+            }
+            for &(pos, t, c) in &cell.ch {
+                push_rec(&mut e.1, chr, pos, t, c);
+            }
         }
     }
     out
@@ -935,6 +953,24 @@ pub fn assemble_hdf5_from_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_rec_zeroes_padding() {
+        assert_eq!(std::mem::size_of::<MethRec>(), 48);
+        // Dirty the spare capacity first, then reuse it.
+        let mut v: Vec<u8> = vec![0xAB; 48 * 4];
+        let mut recs: Vec<MethRec> = Vec::with_capacity(4);
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), recs.as_mut_ptr() as *mut u8, v.len()) };
+        for i in 0..4 {
+            push_rec(&mut recs, contig_s10("chr19"), 100 + i, 1, 2);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(recs.as_ptr() as *const u8, 48 * 4) };
+        for r in bytes.chunks(48) {
+            assert_eq!(&r[10..16], &[0u8; 6]);
+        }
+        v.clear();
+        assert_eq!(recs[3], MethRec::new("chr19", 103, 1, 2));
+    }
     use crate::shard_io::ChunkCell;
 
     #[test]
