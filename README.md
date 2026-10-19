@@ -479,6 +479,12 @@ The chr19 tests check the Rust engine bit for bit against a frozen reference (`t
 
 End-to-end and per-phase rates on the reference workstation and test dataset under [Performance](#performance) (53.5M mapped reads), `-t 32 --shards 16`, each release's default options. "% faster" is the rate increase over the first measured build (2026-10-14, `026c52e`).
 
+![Throughput relative to the first build: end to end 4.8x, processing 5.3x](docs/img/perf_history_throughput.svg)
+
+![Peak memory relative to the first build: 56% (16.7 GB of 29.7 GB)](docs/img/perf_history_memory.svg)
+
+The plots show the table below (regenerate with `python3 scripts/plot_performance_history.py`). The last processing point falls because processing now includes handing data to the writer processes, which shortens the HDF5 write after extraction; end to end still improves.
+
 | Release | End to end | Processing | HDF5 write | Peak memory |
 |---|---:|---:|---:|---:|
 | First measured build (2026-10-14): htslib BAQ, 100 Mb windows, in-process writers, LZF | 0.56M reads/s (34M/min) | 0.84M reads/s | 1.70M reads/s | 29.7 GB |

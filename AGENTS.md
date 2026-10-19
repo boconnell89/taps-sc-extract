@@ -25,7 +25,8 @@ taps-sc-extract/
 ├── code/nvme-profiling-*.md    # Dated workstation timing snapshots
 ├── code/rust-implementation-log.md  # Dated record of Rust engine changes and measurements
 ├── scripts/
-│   └── benchmark_ab.py         # Automated A/B performance benchmark (Python vs Rust)
+│   ├── benchmark_ab.py         # Automated A/B performance benchmark (Python vs Rust)
+│   └── plot_performance_history.py  # README history plots (docs/img/perf_history_*.svg); update its table with the README's
 ├── taps_sc_extract/            # Reference Python extraction engine
 │   ├── __init__.py             # Version definition
 │   ├── __main__.py             # Module execution entrypoint (python -m taps_sc_extract)
