@@ -16,7 +16,9 @@ It outputs base-resolution methylation datasets directly into **Amethyst** (and 
 - **One writer process per shard**: hdf5-metno serializes every HDF5 call in a process behind one lock. With more than one shard, the Rust engine writes each shard in its own child process (`--writer-mode process`, default), so shards compress and write in parallel.
 - **Machine tuning (`--test`)**: Measures this machine on a built-in synthetic workload, optionally samples your BAM, and recommends `-t`, decompression and writer settings. `--save-profile` makes them the defaults on this host.
 - **HDF5 compression options**: `blosc` (Rust default; LZ4 level 9), `lzf`, `gzip` (Python default; readable by plain `rhdf5`), `gzip-shuffle`, `gzip6`, `blosc-zstd` (smallest) and uncompressed `none`. See [Compression](#1-compression---compression).
-- **Context selection (`--context CG|CH`)**: extract only CpG (or only CH). CG-only skips the CH columns, writes no `/CH` group, and runs at 5.4M reads/s end to end on the test data, against 2.69M reads/s for both contexts.
+- **Context selection (`--context CG|CH`)**: extract only CpG (or only CH). CG-only skips CH positions, writes no `/CH` group, and runs at 5.4M reads/s end to end on the test data, against 2.69M reads/s for both contexts.
+- **Read-centric calling (`--caller reads`, default)**: calls each read once instead of walking htslib's column pileup, replaying the pileup's depth cap and mate-overlap rules exactly (identical calls per cell, 36% faster processing).
+- **Writers fed during extraction**: in memory mode the shard writer processes receive each window's results as it finishes, so only the HDF5 writing itself remains after extraction (12% faster end to end, extraction memory about halved).
 - **Process-Safe Indexed FASTA Reader**: Custom byte-seeking `.fai` reader eliminates BGZF memory collisions across dozens of multiprocessing workers.
 - **Single-Pass HDF5 Writer**: Writes each cell's dataset once, in bounded slices, without HDF5 dataset resizing.
 - **Multi-File Sharded Directories**: Partitions cell barcodes across $N$ parallel shard files (`shard_000.h5`..`shard_NNN.h5`) and creates a portable `master.h5` with relative `ExternalLink` references.
@@ -173,7 +175,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
 | `--min-baseq` | `int` | `20` | Minimum base quality for pileup. |
 | `--min-mapq` | `int` | `0` | Minimum mapping quality for alignment filtering. |
-| `--max-depth` | `int` | `250` | Maximum pileup depth. |
+| `--max-depth` | `int` | `250` | Maximum pileup depth (htslib's per-position read cap; both Rust callers apply it identically). |
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
 | `--baq` | `taps`\|`taps-full`\|`taps-partial`\|`htslib` | `taps` | BAQ mode (Rust engine). The `taps` modes realign OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `taps` skips reads that already match that reference exactly (processing 4.5M vs 2.2M reads/s for `taps-full`; 0.0007% of CG calls differ); `taps-full` runs every read; `taps-partial` only reads with an indel or clip (6.4M reads/s; 0.06% of CG calls differ). `htslib` is samtools/asTair BAQ on the plain reference and under-calls methylation. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
 | `--caller` | `reads`\|`pileup` | `reads` | How calls are made (Rust engine). `reads` calls one read at a time, replaying htslib's pileup depth cap and mate-overlap rules; `pileup` uses htslib's column pileup. Identical calls; `reads` processes 36% faster. |
@@ -182,7 +184,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--gpu-backend` | `auto`\|`opencl`\|`cuda`\|`hip` | `auto` | GPU backend: auto tries CUDA, then HIP, then OpenCL. Intel GPUs use `opencl`. |
 | `--gpu-device` | `str` | `None` | Use the first GPU whose name contains this text. |
 | `--gpu-mem-mb` | `int` | `1024` | GPU memory for HMM matrices per launch. |
-| `--context` | `both`\|`CG`\|`CH` | `both` | Contexts to extract. `CG` or `CH` skips the other context's pileup columns and leaves its HDF5 group out. See [`--context`](#10---context-cg-or-ch-only). |
+| `--context` | `both`\|`CG`\|`CH` | `both` | Contexts to extract. `CG` or `CH` skips the other context's positions and leaves its HDF5 group out. See [`--context`](#10---context-cg-or-ch-only). |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
 | `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
 | `--trim-r1` | `int` | `0` | Drop this many 5′ sequenced bases of read 1 before calling. |
