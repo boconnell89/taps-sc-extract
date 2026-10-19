@@ -72,7 +72,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated list of contigs to process (e.g. 'chr19' or 'chr1,chr2'). "
-            "Default: canonical mm10 chromosomes (chr1..chr19, chrX, chrY; chrM excluded)."
+            "Default: the primary chromosomes in the BAM header (autosomes plus X/Y, or Z/W; chrM, unplaced scaffolds, alts and decoys excluded), e.g. chr1..chr22, chrX, chrY for hg38."
         ),
     )
     parser.add_argument(

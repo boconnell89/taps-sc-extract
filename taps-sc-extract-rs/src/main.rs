@@ -78,7 +78,7 @@ use crate::parallel::{
     extract_memory_parallel, extract_stats_parallel, extract_stream_parallel, install_ctrlc,
     new_cancel_flag,
 };
-use crate::window::{plan_windows, CANONICAL_CONTIGS};
+use crate::window::plan_windows;
 
 #[derive(Parser)]
 #[command(name = "taps-sc-extract-rs", version, about = "Rust TAPS extractor (WIP)")]
@@ -95,7 +95,7 @@ enum Commands {
         bam: PathBuf,
         #[arg(short = 'f', long)]
         fasta: PathBuf,
-        /// Comma-separated contigs (default: canonical mm10).
+        /// Comma-separated contigs (default: the BAM's primary chromosomes: autosomes, X, Y).
         #[arg(short = 'c', long)]
         chroms: Option<String>,
         /// Restrict to a single 0-based window start (bp) on the first contig.
@@ -518,9 +518,18 @@ fn main() -> Result<()> {
             let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             let prepared = input::prepare(&bam, &fasta, nproc)?;
             let bam = prepared.path.clone();
+            // Default: the BAM's primary chromosomes (autosomes + sex chromosomes).
+            let primary = match &chroms {
+                Some(_) => Vec::new(),
+                None => {
+                    let v = crate::window::bam_primary_contigs(&bam)?;
+                    eprintln!("Contigs: {} from the BAM header (--chroms to choose)", crate::window::describe_primary(&v));
+                    v
+                }
+            };
             let contig_list: Vec<&str> = match &chroms {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
-                None => CANONICAL_CONTIGS.to_vec(),
+                None => primary.iter().map(|s| s.as_str()).collect(),
             };
             let mut windows = plan_windows(&fai, &contig_list, u64::from(chunk_size_mb) * 1_000_000);
             if let (Some(s), Some(e)) = (start, end) {
@@ -659,9 +668,18 @@ fn main() -> Result<()> {
             let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             let prepared = input::prepare(&bam, &fasta, nproc)?;
             let bam = prepared.path.clone();
+            // Default: the BAM's primary chromosomes (autosomes + sex chromosomes).
+            let primary = match &chroms {
+                Some(_) => Vec::new(),
+                None => {
+                    let v = crate::window::bam_primary_contigs(&bam)?;
+                    eprintln!("Contigs: {} from the BAM header (--chroms to choose)", crate::window::describe_primary(&v));
+                    v
+                }
+            };
             let contig_list: Vec<&str> = match &chroms {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
-                None => CANONICAL_CONTIGS.to_vec(),
+                None => primary.iter().map(|s| s.as_str()).collect(),
             };
             let wl = barcode::load_cell_filter(
                 whitelist.as_deref(),

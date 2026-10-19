@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 import pysam
 
+from .contigs import describe_primary, primary_contigs
 from .barcode import extract_barcode, load_cell_filter
 from .inputs import prepare_alignment
 from .calling import (
@@ -30,7 +31,8 @@ from .h5_writer import AmethystH5Writer, METH_DTYPE
 
 logger = logging.getLogger("taps_sc_extract")
 
-# Default canonical mm10 chromosomes (alt-scaffolds and chrM excluded)
+# The mm10 primary chromosomes (what `primary_contigs` picks for an mm10 BAM).
+# Defaults now come from the BAM header (`contigs.primary_contigs`).
 CANONICAL_CONTIGS = [f"chr{i}" for i in range(1, 20)] + ["chrX", "chrY"]
 
 
@@ -65,7 +67,7 @@ def extract_methylation(
         bam_path: Path to coordinate-sorted, indexed BAM file.
         fasta_path: Path to reference FASTA file (indexed with .fai).
         out_h5_path: Output HDF5 file path.
-        chroms: Iterable of chromosome names to process (defaults to CANONICAL_CONTIGS).
+        chroms: Iterable of chromosome names to process (default: the primary chromosomes in the BAM header, `contigs.primary_contigs`).
         whitelist_path: Optional path to barcode whitelist / annotation file.
         complexity_path: Optional complexity file (rank, barcode, total, unique, %).
         min_complexity / max_complexity: Keep barcodes whose unique-read count
@@ -98,7 +100,12 @@ def extract_methylation(
     # Determine contigs to process
     bam_contigs = set(bam.references)
     if chroms is None:
-        target_contigs = [c for c in CANONICAL_CONTIGS if c in bam_contigs]
+        target_contigs = primary_contigs(bam.references)
+        if not target_contigs:
+            raise ValueError(
+                "no primary chromosomes (1, 2, ..., X, Y with or without a chr prefix) in the BAM header; pass chroms"
+            )
+        logger.info(f"Contigs: {describe_primary(target_contigs)} from the BAM header")
     else:
         target_contigs = [c for c in chroms if c in bam_contigs]
 

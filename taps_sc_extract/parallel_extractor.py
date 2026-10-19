@@ -32,6 +32,7 @@ import h5py
 import numpy as np
 import pysam
 
+from .contigs import describe_primary, primary_contigs
 from .barcode import load_cell_filter
 from .inputs import AlignmentSource, prepare_alignment
 from .calling import (
@@ -54,7 +55,8 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 logger = logging.getLogger("taps_sc_extract")
 
-# Default canonical mm10 contigs
+# The mm10 primary chromosomes (what `primary_contigs` picks for an mm10 BAM).
+# Defaults now come from the BAM header (`contigs.primary_contigs`).
 CANONICAL_CONTIGS = [f"chr{i}" for i in range(1, 20)] + ["chrX", "chrY"]
 
 
@@ -592,7 +594,12 @@ def extract_methylation_parallel(
     bam = source.open()
     bam_contigs = set(bam.references)
     if chroms is None:
-        target_contigs = [c for c in CANONICAL_CONTIGS if c in bam_contigs]
+        target_contigs = primary_contigs(bam.references)
+        if not target_contigs:
+            raise ValueError(
+                "no primary chromosomes (1, 2, ..., X, Y with or without a chr prefix) in the BAM header; pass chroms"
+            )
+        logger.info(f"Contigs: {describe_primary(target_contigs)} from the BAM header")
     else:
         target_contigs = [c for c in chroms if c in bam_contigs]
 

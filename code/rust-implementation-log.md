@@ -568,3 +568,13 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   | B70, `-t 16` | `taps-full` | 1.07 / 1.06M | 0.98 / 0.97M | (0.72M) | ~49% |
 
   Figures are processing rates. Sharing on the 3060 at the default BAQ is within run-to-run spread of CPU-only.
+
+## 2026-10-19 — Default contigs detected from the BAM header (species-aware)
+
+- Bug: the default contig list was hard-coded to mm10 (`chr1`..`chr19`, `chrX`, `chrY`) in the Rust window planner and both Python extractors. A human BAM silently skipped `chr20`..`chr22`.
+- Now both engines take the primary chromosomes from the BAM header: an optional `chr` prefix, then a number or X/Y/Z/W. They sort them numerically, then X, Y, Z, W. Rust: `window::primary_contigs` / `bam_primary_contigs` (also used by `--test` dataset sampling). Python: `taps_sc_extract/contigs.py`. The run log prints e.g. `Contigs: 22 autosomes + chrX, chrY from the BAM header`. A header with none of these is an error asking for `--chroms`.
+- Tests:
+  - unit tests for mm10 (lexicographic header with scaffolds), hg38 (alts, decoys, EBV, HLA), Ensembl names without the prefix, and ZW birds;
+  - the mm10 test BAM gives the old 21 contigs in the old order;
+  - end to end, a chr19 slice reheadered with Ensembl names (`1`, `10`, ..., `MT`) gives `19 autosomes + X, Y` in natural order in both engines.
+- Full test BAM with the defaults: same 21 contigs, CpG 22,263,688 / 31,087,996, unchanged.

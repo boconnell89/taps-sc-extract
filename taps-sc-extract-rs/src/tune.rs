@@ -656,10 +656,11 @@ fn mapped_per_contig(bam_path: &Path, contigs: &[&str]) -> Result<Vec<(String, u
 }
 
 fn sample_dataset(bam_path: &Path, fasta: &Path, workers: usize, target_reads: u64) -> Result<DatasetSample> {
-    let contigs: Vec<&str> = crate::window::CANONICAL_CONTIGS.to_vec();
+    let primary = crate::window::bam_primary_contigs(bam_path)?;
+    let contigs: Vec<&str> = primary.iter().map(|s| s.as_str()).collect();
     let per = mapped_per_contig(bam_path, &contigs)?;
     let mapped: u64 = per.iter().map(|x| x.2).sum();
-    anyhow::ensure!(mapped > 0, "no mapped reads on canonical contigs");
+    anyhow::ensure!(mapped > 0, "no mapped reads on the primary chromosomes");
     // Read-weighted sample: windows spread evenly through each contig, sized so
     // the total is about `target_reads`.
     let frac = (target_reads as f64 / mapped as f64).min(1.0);

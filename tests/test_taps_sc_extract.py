@@ -278,6 +278,32 @@ def test_h5_chr_contiguous_pos_ascending(tmp_path):
         assert chrX_pos == sorted(chrX_pos)
 
 
+def test_primary_contigs_by_species():
+    """Default contigs come from the BAM header: autosomes in numeric order,
+    then sex chromosomes; chrM, scaffolds, alts and decoys excluded."""
+    from taps_sc_extract.contigs import describe_primary, primary_contigs
+
+    mm10 = sorted(f"chr{i}" for i in range(1, 20)) + ["chrM", "chrX", "chrY", "chr1_GL456210_random", "chrUn_GL456239"]
+    assert primary_contigs(mm10) == CANONICAL_CONTIGS
+    hg38 = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY", "chrM", "chr6_GL000250v2_alt", "chrEBV", "chrUn_KI270302v1"]
+    got = primary_contigs(hg38)
+    assert len(got) == 24 and got[21] == "chr22" and got[-2:] == ["chrX", "chrY"]
+    assert describe_primary(got) == "22 autosomes + chrX, chrY"
+    assert primary_contigs(["1", "10", "2", "X", "Y", "MT", "KI270728.1"]) == ["1", "2", "10", "X", "Y"]
+    assert primary_contigs(["chrZ", "chr2", "chrW", "chr1"]) == ["chr1", "chr2", "chrZ", "chrW"]
+    assert primary_contigs(["chrM", "lambda"]) == []
+
+
+def test_primary_contigs_test_bam_unchanged():
+    """The mm10 test BAM's header gives the old default set, in the same order."""
+    from taps_sc_extract.contigs import primary_contigs
+
+    if not os.path.exists(CHR19_BAM):
+        pytest.skip("test BAM not present")
+    with pysam.AlignmentFile(CHR19_BAM) as f:
+        assert primary_contigs(f.references) == CANONICAL_CONTIGS
+
+
 # 9. Canonical contig allowlist test
 def test_canonical_contig_allowlist():
     expected_21 = [f"chr{i}" for i in range(1, 20)] + ["chrX", "chrY"]
