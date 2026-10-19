@@ -547,3 +547,24 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
 
 - Calls identical: default CpG 22,263,688 / 31,087,996; `taps-full` 22,263,588 / 31,087,846.
 - The B70 is 49% faster than the CPU in processing and 31% faster end to end.
+
+## 2026-10-18 — GPU BAQ shared with the CPU
+
+- Per batch, `baq_gpu::take_batch(slack)` decides between the device and the worker's own CPU:
+  - the service tracks the device backlog (reads submitted and not yet returned) and its rate while running (moving average);
+  - the worker passes its slack: its own push-and-call seconds per batch (moving average) × the batches it already has in flight;
+  - the batch goes to the device if backlog / rate ≤ slack, so the result is back before the worker needs it; otherwise the worker runs the HMM itself.
+- A first version capped the backlog at a fixed 25–200 ms of device work.
+  - 3060: best at 25 ms (4.5–4.9M against 4.6–5.1M CPU-only). Larger caps were worse (3.8M at 200 ms): workers blocked on queued GPU batches.
+  - B70: a 25 ms cap sent 27% of batches to its CPU, the bottleneck, and lost 4%.
+  - Replaced by the slack rule.
+- Results, full test BAM, two alternating runs each. Calls are identical in every run.
+
+  | Host | BAQ | Shared GPU + CPU | GPU only | CPU only | Batches on the GPU |
+  |---|---|---|---|---|---|
+  | RTX 3060, `-t 32` | default | 4.68 / 4.88M | 2.41 / 2.35M | 4.96 / 4.75M | ~41% |
+  | RTX 3060, `-t 32` | `taps-full` | 2.60 / 2.50M | (0.75M earlier) | 2.20 / 2.33M | ~24% |
+  | B70, `-t 16` | default | 2.58 / 2.55M | 2.51 / 2.50M | (1.65M) | 88–92% |
+  | B70, `-t 16` | `taps-full` | 1.07 / 1.06M | 0.98 / 0.97M | (0.72M) | ~49% |
+
+  Figures are processing rates. Sharing on the 3060 at the default BAQ is within run-to-run spread of CPU-only.

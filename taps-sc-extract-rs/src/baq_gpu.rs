@@ -17,7 +17,7 @@
 use crate::baq_simd::{BaqJob, Width, Workspace};
 use anyhow::Result;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -228,6 +228,31 @@ pub struct Service {
 
 static SERVICE: OnceLock<Service> = OnceLock::new();
 static WARNED: AtomicBool = AtomicBool::new(false);
+/// Reads submitted to the device and not yet returned.
+static BACKLOG: AtomicU64 = AtomicU64::new(0);
+/// Device throughput while running (reads/s, moving average; 0 = unknown yet).
+static RATE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a worker should send its next batch to the device or run its
+/// BAQ on its own CPU. `slack_s` is how long the worker will be busy before
+/// it needs this batch back (calling its batches already in flight). The
+/// batch goes to the device if the device's queue (backlog / measured rate)
+/// clears by then, so waiting costs nothing; otherwise the worker would sit
+/// idle waiting, and runs the HMM itself instead. When the device keeps up,
+/// every batch goes to it; when it is the bottleneck, the CPU takes the rest.
+/// `TAPS_GPU_SHARE=0` sends every batch to the device.
+pub fn take_batch(slack_s: f64) -> bool {
+    static SHARE: OnceLock<bool> = OnceLock::new();
+    if !*SHARE.get_or_init(|| std::env::var("TAPS_GPU_SHARE").map_or(true, |v| v != "0")) {
+        return true;
+    }
+    let rate = RATE.load(Ordering::Relaxed);
+    if rate == 0 {
+        return true; // no launch measured yet
+    }
+    let wait_s = BACKLOG.load(Ordering::Relaxed) as f64 / rate as f64;
+    wait_s <= slack_s
+}
 
 /// Start the GPU service (once per process). `want`: device name substring.
 pub fn start(backend: GpuBackend, want: &str, mem_mb: usize) -> Result<&'static Service> {
@@ -350,6 +375,17 @@ fn serve(engine: &mut Engine, shared: &Shared) {
         let t_ran = Instant::now();
         launches += 1;
         reads += p.rd.len() as u64;
+        {
+            let n = p.rd.len() as u64;
+            let secs = t_ran.duration_since(t_start).as_secs_f64();
+            if secs > 0.0 && n >= 1024 {
+                let r = n as f64 / secs;
+                let old = RATE.load(Ordering::Relaxed) as f64;
+                let ema = if old == 0.0 { r } else { 0.8 * old + 0.2 * r };
+                RATE.store(ema as u64, Ordering::Relaxed);
+            }
+            BACKLOG.fetch_sub(n, Ordering::Relaxed);
+        }
         if profile_every > 0 {
             fast_reads += p.rd.iter().filter(|g| g.bw == 7 && g.i_dim == 51).count() as u64;
         }
@@ -438,6 +474,7 @@ pub fn submit(ws: &mut Workspace, jobs: &[BaqJob]) -> Pending {
             acc.qry.extend_from_slice(qry);
             acc.qual.extend_from_slice(qual);
             acc.replies.push(reply_tx);
+            BACKLOG.fetch_add(rd.len() as u64, Ordering::Relaxed);
         });
         svc.shared.ready.notify_one();
         p.reply = Some(reply_rx);

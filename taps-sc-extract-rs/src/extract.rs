@@ -135,6 +135,10 @@ pub struct WindowTiming {
     pub baq_reads: u64,
     /// Records the `--max-depth` cap dropped (read-centric calling only).
     pub depth_dropped: u64,
+    /// Read batches whose BAQ was sent to the GPU (the rest ran on the CPU).
+    pub baq_gpu_batches: u64,
+    /// Read batches that had BAQ work.
+    pub baq_batches: u64,
     pub total_s: f64,
     /// FASTA window fetch plus BAM index seek.
     pub setup_s: f64,
@@ -154,6 +158,8 @@ impl WindowTiming {
         self.pushed += o.pushed;
         self.baq_reads += o.baq_reads;
         self.depth_dropped += o.depth_dropped;
+        self.baq_gpu_batches += o.baq_gpu_batches;
+        self.baq_batches += o.baq_batches;
         self.total_s += o.total_s;
         self.setup_s += o.setup_s;
         self.read_s += o.read_s;
@@ -468,6 +474,12 @@ const FLAG_FILTER: u16 = (htslib::BAM_FUNMAP
 /// Large enough that most reads find same-shape partners for the SIMD lanes
 /// (chr19 at the default skip: ~92% of 4-lane slots filled at 8,192).
 const READ_BATCH: usize = 8192;
+
+thread_local! {
+    /// This worker's push-and-call seconds per `READ_BATCH` batch (GPU BAQ
+    /// sharing: how long it is busy before it needs a batch back).
+    static CALL_BATCH_S: Cell<f64> = const { Cell::new(0.0) };
+}
 
 struct PlpGuard(htslib::bam_plp_t);
 
@@ -825,8 +837,15 @@ pub fn process_window(
             slot.n = n;
             timing.read_s += lap(profile);
             timing.baq_reads += slot.jobs.len() as u64;
-            if gpu {
+            timing.baq_batches += u64::from(!slot.jobs.is_empty());
+            // With the GPU, a batch goes to it while it keeps up; otherwise
+            // this worker runs the batch's BAQ itself (`baq_gpu::take_batch`).
+            // Slack: this worker calls its other in-flight batches before it
+            // needs this one back.
+            let slack_s = CALL_BATCH_S.get() * inflight.len() as f64;
+            if gpu && crate::baq_gpu::take_batch(slack_s) {
                 slot.pending = Some(crate::baq_gpu::submit(&mut slot.ws, &slot.jobs));
+                timing.baq_gpu_batches += 1;
             } else {
                 slot.ws.run(&slot.jobs, params.baq_width);
             }
@@ -846,6 +865,7 @@ pub fn process_window(
             crate::baq_gpu::complete(p, &mut slot.ws, &slot.jobs, params.baq_width);
         }
         timing.baq_s += lap(profile);
+        let t_call = Instant::now();
         for (rec, _) in slot.pool[..slot.n].iter().zip(&slot.keep[..slot.n]).filter(|(_, k)| **k) {
             timing.pushed += 1;
             if read_mode {
@@ -856,6 +876,11 @@ pub fn process_window(
                 anyhow::bail!("bam_plp_push failed");
             }
             drain_ready(plp, &mut consume_column)?;
+        }
+        if gpu {
+            // Moving average of push-and-call time per full batch (for `take_batch`).
+            let t = t_call.elapsed().as_secs_f64() * READ_BATCH as f64 / slot.n.max(1) as f64;
+            CALL_BATCH_S.set(if CALL_BATCH_S.get() == 0.0 { t } else { 0.9 * CALL_BATCH_S.get() + 0.1 * t });
         }
         plp_s += lap(profile);
         free.push(si);

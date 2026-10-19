@@ -268,27 +268,32 @@ Writes per-phase wall and CPU time, utilisation, a per-stage split of worker tim
 ### 11. GPU BAQ (`--baq-device gpu`)
 - **What runs where**: the HMM at the core of BAQ (the dense double-precision part) runs on the GPU; everything TAPS-specific stays on the CPU: the C/G mask, the strand choice, skipping reads that already match, BAQ_EXTEND and the quality cap. Reads longer than 192 bp or with a very wide band (large indels) also stay on the CPU. One service thread owns the GPU and pools reads from all workers into large launches. Each worker keeps several batches in flight (4 by default, `TAPS_GPU_DEPTH`), so it runs pileup and calling on one batch while the GPU computes BAQ for the next; batches still enter the pileup in file order.
 - **Exact**: the GPU kernel is htslib's arithmetic operation for operation (no fused multiply-add, IEEE division, sums in order), with the HMM parameters computed on the CPU. A base whose quality sits within 1e-9 of a rounding point is recomputed on the CPU with glibc. `taps-sc-extract-rs baq-selftest --gpu -b BAM -f FA` checks every read: all 1,431,323 chr19 reads identical through CUDA and through OpenCL (99.98% of them on the GPU); chr19 extraction reproduces the frozen references in all BAQ modes.
-- **When it helps**: on GPUs with enough double precision relative to the host CPU. On an Intel Arc Pro B70 (Battlemage host, Ryzen 7 1700X, 16 threads) it is faster than the CPU; on the reference workstation's RTX 3060 (weak FP64, PCIe 3.0 x4) it is slower, so the default stays `cpu`. Full test dataset:
+- **Shared with the CPU**: each batch of reads goes to the GPU only if the GPU's queue will clear before the worker needs the batch back (queue length over the GPU's measured rate, against the time the worker spends calling its other batches). Otherwise the worker runs that batch's BAQ on its own CPU instead of waiting. When the GPU keeps up, nearly every batch goes to it; when it is the bottleneck, the CPU takes the rest. So `--baq-device gpu` is never much slower than the CPU alone, and it is faster where both have spare capacity. Each read still gets identical results. `TAPS_GPU_SHARE=0` sends every batch to the GPU.
+- **When it helps**: on GPUs with enough double precision relative to the host CPU. On an Intel Arc Pro B70 (Battlemage host, Ryzen 7 1700X, 16 threads) it is clearly faster than the CPU. On the reference workstation's RTX 3060 (weak FP64, PCIe 3.0 x4) the GPU alone is half as fast as the CPU; with sharing it matches the CPU at the default BAQ and is faster with `--baq taps-full`. The default stays `cpu`. Full test dataset:
 
 | Host | BAQ | Device | Processing | End to end |
 |---|---|---|---:|---:|
 | Battlemage | `taps` (default) | CPU (Ryzen 7 1700X) | 1.65M reads/s | 1.18M reads/s |
-| Battlemage | `taps` | **Arc Pro B70, OpenCL** | **2.46M reads/s (+49%)** | **1.54M reads/s (+31%)** |
+| Battlemage | `taps` | **Arc Pro B70 + CPU (shared)** | **2.57M reads/s (+56%)** | **1.58M reads/s (+34%)** |
+| Battlemage | `taps` | Arc Pro B70 only (`TAPS_GPU_SHARE=0`) | 2.51M reads/s | 1.56M reads/s |
 | Battlemage | `taps-full` | CPU | 0.72M reads/s | 0.61M reads/s |
-| Battlemage | `taps-full` | **Arc Pro B70, OpenCL** | **0.98M reads/s (+36%)** | **0.79M reads/s (+30%)** |
+| Battlemage | `taps-full` | **Arc Pro B70 + CPU (shared)** | **1.07M reads/s (+49%)** | **0.85M reads/s (+39%)** |
+| Battlemage | `taps-full` | Arc Pro B70 only | 0.98M reads/s | 0.79M reads/s |
 
-Battlemage rows: current code (read-centric calling, writers fed during extraction), `-t 16 --shards 16`, mean of two runs for `taps`, measured 2026-10-18 with a vLLM server loaded on the B70 (idle at the time). An earlier `taps-full` run on an unshared B70, with the older column pileup, reached 1.23M reads/s processing.
+Battlemage rows: current code, `-t 16 --shards 16`, mean of two runs, measured 2026-10-18 with a vLLM server loaded on the B70 (idle at the time). An earlier `taps-full` run on an unshared B70, with the older column pileup, reached 1.23M reads/s processing.
 
 On the reference workstation (32 threads, 2026-10-18):
 
 | BAQ | Device | Processing | End to end |
 |---|---|---:|---:|
-| `taps` (default) | CPU, AVX2 | 4.48M reads/s | 2.69M reads/s |
-| `taps` | RTX 3060, CUDA | 2.34M reads/s | 1.79M reads/s |
-| `taps-full` | CPU, AVX2 | 2.19M reads/s | 1.68M reads/s |
-| `taps-full` | RTX 3060, CUDA | 0.75M reads/s | 0.68M reads/s |
+| `taps` (default) | CPU, AVX2 | 4.86M reads/s | 2.97M reads/s |
+| `taps` | **RTX 3060 + CPU (shared)** | **4.78M reads/s** | **2.83M reads/s** |
+| `taps` | RTX 3060 only (`TAPS_GPU_SHARE=0`) | 2.38M reads/s | 1.84M reads/s |
+| `taps-full` | CPU, AVX2 | 2.27M reads/s | 1.77M reads/s |
+| `taps-full` | **RTX 3060 + CPU (shared)** | **2.55M reads/s (+12%)** | **1.94M reads/s (+10%)** |
+| `taps-full` | RTX 3060 only | 0.75M reads/s | 0.68M reads/s |
 
-The 3060 is 35% faster end to end than its first GPU build (1.33M reads/s) but stays well behind this CPU. OpenCL through PoCL on the 3060 was exact earlier (1.86M reads/s on the first build) and was not re-measured.
+Mean of two alternating runs each, 2026-10-18. With sharing, the 3060 takes about 41% of the batches at the default BAQ (the same as the CPU alone, within run-to-run spread) and about 24% with `taps-full`, where it adds 12%. Alone, it is half as fast as the CPU. OpenCL through PoCL on the 3060 was exact earlier (1.86M reads/s on the first build) and was not re-measured.
 
 - **Check a host**: `taps-sc-extract --test` times BAQ on the GPU against the CPU and says which is faster (reported only; `--baq-device` still defaults to `cpu`).
 - **Intel Arc Pro B70**: works through Intel's compute runtime (`--gpu-backend opencl` or `auto`); `clinfo` lists double precision (`cl_khr_fp64`). Measured double-precision rate 0.70 TFLOP/s (8x the RTX 3060). The kernel runs at about 2.1M reads/s on real reads (the `--test` probe reports it), using Intel's 256-register mode automatically. With the GPU, BAQ stops being the limit on that host: `--no-baq` processes 2.71M reads/s. Workers overlap their GPU batches with calling, and the GPU is idle part of the time. What remains is CPU work around the HMM: preparing reads, BAQ_EXTEND and the quality cap, all of which stay on the CPU because they are TAPS-specific and cheap per read.
