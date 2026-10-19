@@ -520,3 +520,4 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   | Streamed, nice 10 (default) | 2.71–3.02M, mean 2.81M (+12%) | 11.0–12.3 s | 6.7–7.5 s | 6.0–6.8 GB |
 
 - Calls identical per cell to the batch path (14,674 datasets). A SIGINT mid-extraction leaves no `write-shard` processes and no shard files.
+- README re-measured with the streamed writers (second table in [`nvme-profiling-2026-10-18.md`](nvme-profiling-2026-10-18.md)): defaults median 2.69M reads/s end to end (2.60–2.95M), processing 4.48M, write after extraction 6.71M, extraction peak 6.3 GB. `--context CG` 5.40M, `--no-baq` 3.41M.

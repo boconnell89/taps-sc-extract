@@ -34,3 +34,40 @@ Reference workstation (Ryzen 9 5900XT, 16C/32T, WSL2 ext4 on NVMe), full test BA
 - `cuda` and `cuda_full` above ran with the 64k launch cap. Uncapped (the new default), measured afterwards: `cuda` 2.65M processing / 1.74M end to end, `cuda_full` 0.76M / 0.66M. With the cap the GPU starved: 2.34–2.41M, and 1.70M at a 16k cap.
 - `shards1` writes in-process, so no writer-process peak is reported.
 - Limiting factor at the defaults: processing (5.08M reads/s) and HDF5 write (4.73M reads/s) are now about equal. Worker time is 55% BAQ, 23% calling, 13% BAM read and inflate, 7% pileup bookkeeping, 3% setup.
+
+## Second pass: writer processes fed during extraction (`4e177be`)
+
+Same machine, BAM and commands. "Write s" is now the phase after extraction ends; the transfer to the writers runs during processing.
+
+| Run | Processing s | Write s | Total s | Processing reads/s | End to end reads/s | Extraction peak GB | Writers peak GB | Output GB | CpG % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| default_1 | 11.11 | 7.00 | 18.12 | 4.81M | 2.95M | 6.5 | 10.4 | 1.44 | 71.615 |
+| default_2 | 11.95 | 7.07 | 19.02 | 4.47M | 2.81M | 6.0 | 10.4 | 1.44 | 71.615 |
+| default_3 | 11.92 | 7.97 | 19.89 | 4.49M | 2.69M | 6.3 | 10.4 | 1.44 | 71.615 |
+| default_4 | 11.93 | 8.00 | 19.93 | 4.48M | 2.68M | 5.8 | 10.4 | 1.44 | 71.615 |
+| default_5 | 12.26 | 8.28 | 20.54 | 4.36M | 2.60M | 6.3 | 10.4 | 1.44 | 71.615 |
+| stream | 10.88 | 10.48 | 21.37 | 4.91M | 2.50M | 3.4 | 10.4 | 1.44 | 71.615 |
+| taps_full | 24.50 | 7.43 | 31.93 | 2.18M | 1.67M | 5.7 | 10.4 | 1.44 | 71.615 |
+| taps_partial | 8.34 | 9.35 | 17.68 | 6.41M | 3.02M | 9.2 | 10.4 | 1.44 | 71.585 |
+| htslib | 24.37 | 7.60 | 31.97 | 2.19M | 1.67M | 5.9 | 10.3 | 1.43 | 70.859 |
+| nobaq | 6.75 | 8.92 | 15.67 | 7.92M | 3.41M | 9.1 | 10.4 | 1.45 | 71.543 |
+| simd_off | 17.15 | 7.24 | 24.39 | 3.12M | 2.19M | 5.7 | 10.4 | 1.44 | 71.615 |
+| cg | 9.51 | 0.39 | 9.89 | 5.62M | 5.40M | 1.7 | 1.4 | 0.15 | 71.615 |
+| ch | 11.62 | 6.88 | 18.50 | 4.60M | 2.89M | 6.6 | 9.9 | 1.29 | — |
+| cg_nobaq | 3.14 | 0.42 | 3.56 | 17.02M | 15.02M | 1.7 | 1.3 | 0.15 | 71.543 |
+| comp_lzf | 11.48 | 8.53 | 20.01 | 4.66M | 2.67M | 6.1 | 10.4 | 3.92 | 71.615 |
+| comp_gzip | 12.90 | 9.36 | 22.27 | 4.14M | 2.40M | 6.3 | 10.4 | 2.00 | 71.615 |
+| comp_gzip-shuffle | 11.98 | 12.30 | 24.28 | 4.46M | 2.20M | 6.2 | 10.4 | 1.19 | 71.615 |
+| comp_gzip6 | 11.68 | 17.28 | 28.96 | 4.58M | 1.85M | 6.1 | 10.4 | 1.82 | 71.615 |
+| comp_blosc-zstd | 11.80 | 20.25 | 32.05 | 4.53M | 1.67M | 6.1 | 10.4 | 1.03 | 71.615 |
+| comp_none | 12.84 | 33.02 | 45.87 | 4.16M | 1.17M | 5.7 | 10.4 | 34.40 | 71.615 |
+| t16 | 18.01 | 7.70 | 25.71 | 2.97M | 2.08M | 4.7 | 10.2 | 1.44 | 71.615 |
+| shards1 | 11.33 | 16.13 | 27.46 | 4.72M | 1.95M | 10.9 | -0.0 | 1.44 | 71.615 |
+| cuda | 22.84 | 6.97 | 29.82 | 2.34M | 1.79M | 7.1 | 10.4 | 1.44 | 71.615 |
+| cuda_full | 71.71 | 6.84 | 78.55 | 0.75M | 0.68M | 9.0 | 10.4 | 1.44 | 71.615 |
+| full_cpu2 | 24.27 | 7.47 | 31.74 | 2.20M | 1.68M | 5.8 | 10.3 | 1.44 | 71.615 |
+
+- Defaults, median of five: processing 4.48M, write after extraction 6.71M, end to end 2.69M reads/s (2.60–2.95M). Extraction process peak 6.3 GB (11.0 GB before).
+- `cuda` and `cuda_full` run uncapped GPU launches. With the streamed writers, the 3060 processes 2.34M (2.65M without them); end to end 1.79M (1.74M).
+- `taps_partial` and `nobaq` peak higher (9.1–9.2 GB): extraction outruns the niced senders and payloads queue in the parent.
+- `shards1` and `stream` are not streamed (one shard is written in-process; stream mode uses temp files).
