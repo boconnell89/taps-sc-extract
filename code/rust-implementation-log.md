@@ -521,3 +521,15 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
 
 - Calls identical per cell to the batch path (14,674 datasets). A SIGINT mid-extraction leaves no `write-shard` processes and no shard files.
 - README re-measured with the streamed writers (second table in [`nvme-profiling-2026-10-18.md`](nvme-profiling-2026-10-18.md)): defaults median 2.69M reads/s end to end (2.60–2.95M), processing 4.48M, write after extraction 6.71M, extraction peak 6.3 GB. `--context CG` 5.40M, `--no-baq` 3.41M.
+
+## 2026-10-18 — History baseline: the version before 2026-10-14
+
+- `e19e2b4` (2026-09-25), the last commit before the 2026-10-14 work, was built in a separate worktree as it was at that commit (no `install.sh`, no native flags). It ran on the same machine and BAM with the arguments its Python CLI passed (`-t 32 --chunk-size-mb 10 --shards 16 --compression gzip --decomp-threads 1 --max-depth 250`) plus `--memory-mode memory`.
+- Three runs, with `/usr/bin/time`:
+  - wall clock 2:28–2:40;
+  - its own `elapsed_s`: 139.9, 149.8 and 141.2 s;
+  - peak RSS 33.0–33.4 GB in one process (writers were threads);
+  - output 2.1 GB (gzip).
+- One run with timestamped output: extraction ended at 58.5 s, writing at 151.7 s. So processing was 0.91M reads/s, write 0.57M and end to end 0.35M reads/s.
+- Calls: CpG 21,499,669 / 30,341,601, the same as `026c52e` (htslib BAQ).
+- The README history and plots are now relative to this version. The current defaults are 7.6× end to end (663% faster) and 4.9× processing, at 50% of its peak memory.

@@ -477,31 +477,33 @@ The chr19 tests check the Rust engine bit for bit against a frozen reference (`t
 
 ## Performance History
 
-End-to-end and per-phase rates on the reference workstation and test dataset under [Performance](#performance) (53.5M mapped reads), `-t 32 --shards 16`, each release's default options. "% faster" is the rate increase over the first measured build (2026-10-14, `026c52e`).
+End-to-end and per-phase rates on the reference workstation and test dataset under [Performance](#performance) (53.5M mapped reads), `-t 32 --shards 16 --memory-mode memory`, each release's default options otherwise. "% faster" is the rate increase over the last version before the 2026-10-14 work (`e19e2b4`, 2026-09-25), run with that version's CLI defaults (10 Mb windows, `gzip`, one decompression thread per worker); it does not report phases, so its processing and write times come from timestamps on its output, and its peak memory is one process (writers were threads).
 
-![Throughput relative to the first build: end to end 4.8x, processing 5.3x](docs/img/perf_history_throughput.svg)
+![Throughput relative to the version before 2026-10-14: end to end 7.6x, processing 4.9x](docs/img/perf_history_throughput.svg)
 
-![Peak memory relative to the first build: 56% (16.7 GB of 29.7 GB)](docs/img/perf_history_memory.svg)
+![Peak memory relative to the version before 2026-10-14: 50% (16.7 GB of 33.2 GB)](docs/img/perf_history_memory.svg)
 
 The plots show the table below (regenerate with `python3 scripts/plot_performance_history.py`). The last processing point falls because processing now includes handing data to the writer processes, which shortens the HDF5 write after extraction; end to end still improves.
 
 | Release | End to end | Processing | HDF5 write | Peak memory |
 |---|---:|---:|---:|---:|
-| First measured build (2026-10-14): htslib BAQ, 100 Mb windows, in-process writers, LZF | 0.56M reads/s (34M/min) | 0.84M reads/s | 1.70M reads/s | 29.7 GB |
-| 2026-10-15: balanced windows, libdeflate, shared BAQ references, one writer process per shard, native build, per-cell sorted vectors | 0.97M reads/s (72% faster) | 1.30M (54% faster) | 3.78M (123% faster) | 21.7 GB (27% less) |
-| 2026-10-16: TAPS-aware BAQ (correctness fix; same cost) | 1.00M reads/s (77% faster) | 1.31M (56% faster) | 4.18M (146% faster) | 23.2 GB (22% less) |
-| 2026-10-16: skip BAQ for reads that already match the masked reference | 1.64M reads/s (192% faster) | 2.60M (208% faster) | 4.49M (165% faster) | 23.2 GB (22% less) |
-| 2026-10-16: SIMD BAQ (AVX2) | 1.76M reads/s (212% faster) | 3.24M (285% faster) | 4.14M (144% faster) | 24.0 GB (19% less) |
-| 2026-10-16: `blosc` default compression (output 63% smaller) | 1.95M reads/s (246% faster) | 3.41M (304% faster) | 4.55M (168% faster) | 23.9 GB (20% less) |
-| 2026-10-17: TAPS mask inside the BAQ kernel | 1.85M reads/s (229% faster) | 3.29M (291% faster) | 4.29M (153% faster) | 21.2 GB (29% less); stream mode 13.5 GB (55% less) |
-| 2026-10-18: branch-free BAQ skip check, table-driven BAQ preparation | 2.07M reads/s (270% faster) | 3.84M (357% faster) | 4.49M (164% faster) | 21.7 GB (27% less) |
-| 2026-10-18: read-centric calling (`--caller reads`; same calls as the column pileup) | 2.45M reads/s (338% faster) | 5.08M (505% faster) | 4.73M (178% faster) | 21.7 GB (27% less) |
-| 2026-10-18: writer processes fed during extraction (current) | **2.69M reads/s (380% faster)** | **4.48M (433% faster)** | **6.71M after extraction (295% faster)** | **16.7 GB (44% less)** |
+| Before 2026-10-14 (`e19e2b4`, 2026-09-25): htslib BAQ, 10 Mb windows, in-process writer threads, gzip | 0.35M reads/s (21M/min) | 0.91M reads/s | 0.57M reads/s | 33.2 GB |
+| 2026-10-14 (`026c52e`): 100 Mb windows, LZF, separate extract/HDF5 timing | 0.56M reads/s (59% faster) | 0.84M (8% slower) | 1.70M (197% faster) | 29.7 GB (11% less) |
+| 2026-10-15: balanced windows, libdeflate, shared BAQ references, one writer process per shard, native build, per-cell sorted vectors | 0.97M reads/s (175% faster) | 1.30M (42% faster) | 3.78M (559% faster) | 21.7 GB (35% less) |
+| 2026-10-16: TAPS-aware BAQ (correctness fix; same cost) | 1.00M reads/s (184% faster) | 1.31M (43% faster) | 4.18M (629% faster) | 23.2 GB (30% less) |
+| 2026-10-16: skip BAQ for reads that already match the masked reference | 1.64M reads/s (365% faster) | 2.60M (184% faster) | 4.49M (683% faster) | 23.2 GB (30% less) |
+| 2026-10-16: SIMD BAQ (AVX2) | 1.76M reads/s (400% faster) | 3.24M (254% faster) | 4.14M (622% faster) | 24.0 GB (28% less) |
+| 2026-10-16: `blosc` default compression (output 63% smaller) | 1.95M reads/s (453% faster) | 3.41M (273% faster) | 4.55M (694% faster) | 23.9 GB (28% less) |
+| 2026-10-17: TAPS mask inside the BAQ kernel | 1.85M reads/s (425% faster) | 3.29M (260% faster) | 4.29M (648% faster) | 21.2 GB (36% less); stream mode 13.5 GB |
+| 2026-10-18: branch-free BAQ skip check, table-driven BAQ preparation | 2.07M reads/s (487% faster) | 3.84M (320% faster) | 4.49M (683% faster) | 21.7 GB (35% less) |
+| 2026-10-18: read-centric calling (`--caller reads`; same calls as the column pileup) | 2.45M reads/s (595% faster) | 5.08M (456% faster) | 4.73M (725% faster) | 21.7 GB (35% less) |
+| 2026-10-18: writer processes fed during extraction (current) | **2.69M reads/s (663% faster)** | **4.48M (390% faster)** | **6.71M after extraction (1071% faster)** | **16.7 GB (50% less)** |
 
 - The 2026-10-18 rows are medians of three, five and five runs (end to end 2.03–2.18M, 2.39–2.56M and 2.60–2.95M reads/s). Since the writers are fed during extraction, processing includes that transfer (so it is lower than the row before), and HDF5 write is only the phase after extraction. Rows above the 2026-10-17 one other than the end-to-end column are unchanged.
 - The 2026-10-16 `blosc` and 2026-10-17 rows run at the same rate within run-to-run spread (today's five runs: 1.78–1.93M reads/s; the 2026-10-16 runs: 1.94–1.96M). The 2026-10-17 change removed memory, not time.
 - Peak memory counts the extraction process plus the writer processes.
-- The first build used htslib BAQ (CpG 70.86%); later builds use TAPS-aware BAQ (CpG 71.62%). Running BAQ on every read (`--baq taps-full`), the current build processes 2.19M reads/s, 161% faster than the first build.
+- The first two rows use htslib BAQ (CpG 70.86%); later builds use TAPS-aware BAQ (CpG 71.62%). Running BAQ on every read (`--baq taps-full`), the current build processes 2.19M reads/s, 140% faster than the version before 2026-10-14.
+- The 2026-10-14 row processes slower than the row above it because it used 100 Mb windows (a long tail at 32 workers); its write was faster (LZF instead of gzip).
 - Not in the table: `--context CG`, 5.40M reads/s end to end (101% faster than the current default).
 - Detailed snapshots: [`code/nvme-profiling-2026-10-14.md`](code/nvme-profiling-2026-10-14.md), [`2026-10-15`](code/nvme-profiling-2026-10-15.md), [`2026-10-16`](code/nvme-profiling-2026-10-16.md), [`2026-10-17`](code/nvme-profiling-2026-10-17.md), [`2026-10-18`](code/nvme-profiling-2026-10-18.md); change log: [`code/rust-implementation-log.md`](code/rust-implementation-log.md).
 

@@ -1,4 +1,5 @@
-"""Plot the README's Performance History: relative throughput and peak memory.
+"""Plot the README's Performance History: throughput and peak memory relative to
+the last version before the 2026-10-14 work (e19e2b4).
 
 Numbers are the README table's (reference workstation, full test BAM, each
 release's defaults). Writes docs/img/perf_history_throughput.svg and
@@ -15,7 +16,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 # (label, end to end M reads/s, processing M reads/s, peak memory GB)
 RELEASES = [
-    ("First build\n10-14", 0.56, 0.84, 29.7),
+    ("Before\n10-14\n(e19e2b4)", 0.352, 0.914, 33.2),
+    ("100 Mb\nwindows, LZF\n10-14", 0.56, 0.84, 29.7),
     ("Balanced\nwindows\n10-15", 0.97, 1.30, 21.7),
     ("TAPS-aware\nBAQ\n10-16", 1.00, 1.31, 23.2),
     ("Skip matching\nreads' BAQ\n10-16", 1.64, 2.60, 23.2),
@@ -47,7 +49,7 @@ def main():
     x = range(len(RELEASES))
     e2e0, proc0, mem0 = RELEASES[0][1], RELEASES[0][2], RELEASES[0][3]
 
-    # Throughput relative to the first build.
+    # Throughput relative to the version before 2026-10-14 (e19e2b4).
     e2e = [r[1] / e2e0 for r in RELEASES]
     proc = [r[2] / proc0 for r in RELEASES]
     fig, ax = plt.subplots(figsize=(10, 4.2), facecolor="white")
@@ -59,14 +61,14 @@ def main():
         ax.annotate(f"{proc[xi]:.1f}×", (xi, proc[xi]), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=8, color=ORANGE)
     ax.axhline(1, color="#999999", linewidth=0.8, linestyle="--")
     ax.set_xticks(list(x), labels)
-    ax.set_ylim(0, max(proc) * 1.15)
-    style(ax, "Throughput (mapped reads/s) relative to the first build", "× first build")
+    ax.set_ylim(0, max(max(proc), max(e2e)) * 1.15)
+    style(ax, "Throughput (mapped reads/s) relative to the version before 2026-10-14", "× before 10-14")
     ax.legend(frameon=False, loc="upper left")
     fig.tight_layout()
     fig.savefig(OUT / "perf_history_throughput.svg")
     plt.close(fig)
 
-    # Peak memory (extraction + writer processes) relative to the first build.
+    # Peak memory (extraction + writer processes) relative to that version.
     mem = [100 * r[3] / mem0 for r in RELEASES]
     fig, ax = plt.subplots(figsize=(10, 4.2), facecolor="white")
     bars = ax.bar(x, mem, color=[GREEN if i == len(x) - 1 else "#8cc3a0" for i in x], width=0.65)
@@ -75,7 +77,7 @@ def main():
                     textcoords="offset points", xytext=(0, 3), ha="center", fontsize=7.5)
     ax.set_xticks(list(x), labels)
     ax.set_ylim(0, 120)
-    style(ax, "Peak memory (extraction + writer processes) relative to the first build", "% of first build")
+    style(ax, "Peak memory (extraction + writer processes) relative to the version before 2026-10-14", "% of before 10-14")
     fig.tight_layout()
     fig.savefig(OUT / "perf_history_memory.svg")
     plt.close(fig)
