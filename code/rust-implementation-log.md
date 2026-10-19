@@ -533,3 +533,17 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
 - One run with timestamped output: extraction ended at 58.5 s, writing at 151.7 s. So processing was 0.91M reads/s, write 0.57M and end to end 0.35M reads/s.
 - Calls: CpG 21,499,669 / 30,341,601, the same as `026c52e` (htslib BAQ).
 - The README history and plots are now relative to this version. The current defaults are 7.6× end to end (663% faster) and 4.9× processing, at 50% of its peak memory.
+
+## 2026-10-18 — Battlemage on the current code
+
+- Current code (`0db8447`, portable x86-64-v3 build), full test BAM, `-t 16 --shards 16`, memory mode. A vLLM server was loaded on the B70 and its crawler process was running, but the host was nearly idle (load 0.4 before the runs).
+
+  | Run | Processing, reads/s | End to end, reads/s | Earlier today |
+  |---|---|---|---|
+  | CPU, default BAQ (2 runs) | 1.72M, 1.59M | 1.21M, 1.14M | 1.40M / 0.95M |
+  | B70, default BAQ (2 runs) | 2.50M, 2.42M | 1.55M, 1.52M | 2.21M / 1.27M |
+  | CPU, `taps-full` | 0.72M | 0.61M | |
+  | B70, `taps-full` | 0.98M | 0.79M | 1.23M / 0.87M, column pileup, unshared GPU |
+
+- Calls identical: default CpG 22,263,688 / 31,087,996; `taps-full` 22,263,588 / 31,087,846.
+- The B70 is 49% faster than the CPU in processing and 31% faster end to end.

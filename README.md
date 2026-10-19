@@ -272,12 +272,12 @@ Writes per-phase wall and CPU time, utilisation, a per-stage split of worker tim
 
 | Host | BAQ | Device | Processing | End to end |
 |---|---|---|---:|---:|
-| Battlemage | `taps` (default) | CPU (Ryzen 7 1700X) | 1.34M reads/s (2026-10-18: 1.40M) | 0.92M reads/s (0.95M) |
-| Battlemage | `taps` | **Arc Pro B70, OpenCL** (2026-10-18: overlapped batches, faster CPU-side preparation) | **2.21M reads/s (+58% vs 1.40M)** | **1.27M reads/s (+34% vs 0.95M)** |
-| Battlemage | `taps-full` | CPU | 0.65M reads/s | 0.54M reads/s |
-| Battlemage | `taps-full` | **Arc Pro B70, OpenCL** | **1.23M reads/s (+89%)** | **0.87M reads/s (+61%)** |
+| Battlemage | `taps` (default) | CPU (Ryzen 7 1700X) | 1.65M reads/s | 1.18M reads/s |
+| Battlemage | `taps` | **Arc Pro B70, OpenCL** | **2.46M reads/s (+49%)** | **1.54M reads/s (+31%)** |
+| Battlemage | `taps-full` | CPU | 0.72M reads/s | 0.61M reads/s |
+| Battlemage | `taps-full` | **Arc Pro B70, OpenCL** | **0.98M reads/s (+36%)** | **0.79M reads/s (+30%)** |
 
-The Battlemage rows were measured before read-centric calling (`--caller pileup` behaviour). That host is limited by its CPU, so the new caller should help it most; it has not been re-measured.
+Battlemage rows: current code (read-centric calling, writers fed during extraction), `-t 16 --shards 16`, mean of two runs for `taps`, measured 2026-10-18 with a vLLM server loaded on the B70 (idle at the time). An earlier `taps-full` run on an unshared B70, with the older column pileup, reached 1.23M reads/s processing.
 
 On the reference workstation (32 threads, 2026-10-18):
 
