@@ -62,6 +62,7 @@ taps-sc-extract/
 │       ├── h5_out.rs           # Amethyst HDF5 writer: sliced cell datasets, process-per-shard writers, shard balancing, writer reports, master.h5
 │       ├── input.rs            # BAM/CRAM/SAM input: builds a missing index, converts SAM, CRAM reference; all readers open through it
 │       ├── shard_io.rs         # TAPSCK01 chunk format (temp files and writer stdin)
+│       ├── shard_stream.rs     # Memory mode: writer children fed during extraction (overlapped transfer)
 │       ├── autotune.rs         # Worker / window / writer / memory-mode defaults
 │       ├── profile.rs          # --profile-json output
 │       └── tune.rs             # --test: machine probes on a synthetic BAM, dataset sampling, saved profile
@@ -92,6 +93,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **Disk-Streaming vs. Memory Mode**: In `stream` mode, intermediate chunks are partitioned into `temp_dir/shard_XXX/chunk_YYYYYY.bin` and purged on write. In `memory` mode, per-window payloads stay in RAM and are piped to the writers.
 - **HDF5 global lock**: hdf5-metno wraps every HDF5 call in one process-wide `ReentrantMutex` (`hdf5-metno-sys` `LOCK`), compression included. Threads in one process never write HDF5 in parallel. Parallel writing means one `write-shard` child process per shard (`--writer-mode process`, the default with >1 shard). In-process (`thread`) writers are auto-capped at 6.
 - **Shard balancing**: Rust extraction hashes barcodes into `bucket_count(n_shards)` = 4 × shards buckets (`h5_out::BUCKETS_PER_SHARD`); after extraction `pack_buckets` deals whole buckets to shards by sites (memory) or temp bytes (stream). A cell stays in one bucket, so its records keep chunk_id order. Shard placement therefore differs from Python's `md5 % N`; compare outputs per cell, never per shard file.
+- **Streamed writers (memory mode, process writers, at least one writer per shard; `TAPS_STREAM_WRITERS=0` disables)**: `shard_stream::ShardStreams` starts every `write-shard` child before extraction and pipes each window's payloads as the window finishes. Payload site vectors are moved, not cloned. Buckets are dealt to shards (`pack_buckets`) after 20% of windows, by sites so far; earlier payloads are held until then. A cell's dataset still needs every window, so HDF5 writing starts only after extraction. Senders and children run at nice 10 (`TAPS_STREAM_NICE`) so the extraction workers get the CPU first. Dropped without `finish` (error or cancel), the children are killed, never left to write partial shards. Shard placement (and so per-shard files) differs run to run; compare per cell.
 - **Bounded writer memory**: `write_shard_from_chunks` writes one cell at a time in `WRITE_SLICE` (4 × 65,536-record) slices. Never build a whole shard's or a whole cell's `MethRec` vector.
 
 ### E. Per-Read State in the Pileup Callback

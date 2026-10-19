@@ -287,6 +287,7 @@ pub fn extract_memory_parallel(
     n_shards: usize,
     n_workers: usize,
     cancel: &CancelFlag,
+    stream: Option<&crate::shard_stream::ShardStreams>,
 ) -> Result<(WindowResult, Vec<Vec<crate::shard_io::ChunkFile>>)> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
@@ -304,15 +305,18 @@ pub fn extract_memory_parallel(
     install_pool(n_workers, || {
         windows.par_iter().try_for_each(|w| -> Result<()> {
             check_cancel(cancel)?;
-            let r = process_one(
+            let mut r = process_one(
                 &bam_path,
                 fasta.as_ref(),
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
                 &params,
             )?;
-            let payloads = crate::shard_io::window_shard_payloads(w, &r.intern, &r.cells, n_shards);
-            {
+            let payloads = crate::shard_io::window_shard_payloads(w, &r.intern, &mut r.cells, n_shards, stream.is_some());
+            if let Some(st) = stream {
+                // Piped to the writer processes now (overlapped writers).
+                st.push_window(payloads);
+            } else {
                 let mut m = mem.lock().expect("mem mutex");
                 for (s, cf) in payloads {
                     m[s].push(cf);

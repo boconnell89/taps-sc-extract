@@ -21,6 +21,7 @@ mod parallel;
 mod profile;
 mod readcall;
 mod shard_io;
+mod shard_stream;
 mod tune;
 mod window;
 
@@ -459,6 +460,22 @@ fn main() -> Result<()> {
                 match (chunk_dir.is_empty(), stdin) {
                     (false, false) => read_shard_temp_chunks(&chunk_dir),
                     (true, true) => {
+                        if let Ok(f) = std::env::var("TAPS_DUMP_STDIN") {
+                            if shard == 0 {
+                                let mut buf = Vec::new();
+                                std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+                                std::fs::write(&f, &buf)?;
+                                return shard_io::read_all_chunks_from(&mut buf.as_slice());
+                            }
+                        }
+                        if let Ok(f) = std::env::var("TAPS_READ_FILE") {
+                            let t = std::time::Instant::now();
+                            let buf = std::fs::read(&f)?;
+                            let t1 = t.elapsed().as_secs_f64();
+                            let v = shard_io::read_all_chunks_from(&mut buf.as_slice());
+                            eprintln!("file read {t1:.3}s parse {:.3}s", t.elapsed().as_secs_f64() - t1);
+                            return v;
+                        }
                         let mut r = std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock());
                         shard_io::read_all_chunks_from(&mut r)
                     }
@@ -800,6 +817,28 @@ fn main() -> Result<()> {
             let n_buckets = crate::h5_out::bucket_count(n_shards);
             let cpu_start = profile::cpu_times();
             let t_process = Instant::now();
+            // Memory mode with one writer process per shard: start the writers
+            // now and pipe each window's payloads as it finishes, so the
+            // transfer overlaps extraction (TAPS_STREAM_WRITERS=0 turns it off).
+            let streams = if resolved_memory_mode == "memory"
+                && writer_mode == crate::h5_out::WriterMode::Process
+                && n_shards > 1
+                && writer_threads >= n_shards
+                && std::env::var("TAPS_STREAM_WRITERS").map_or(true, |v| v != "0")
+            {
+                match crate::h5_out::resolve_output_target(&out, n_shards)? {
+                    crate::h5_out::OutputTarget::ShardDir(dir) => Some(crate::shard_stream::ShardStreams::start(
+                        &dir,
+                        n_shards,
+                        n_buckets,
+                        windows.len(),
+                        &compression_name,
+                    )?),
+                    crate::h5_out::OutputTarget::File(_) => None,
+                }
+            } else {
+                None
+            };
             let (r, pending) = match resolved_memory_mode.as_str() {
                 "memory" => {
                     let (r, mem) = extract_memory_parallel(
@@ -811,8 +850,12 @@ fn main() -> Result<()> {
                         n_buckets,
                         n_workers,
                         &cancel,
+                        streams.as_ref(),
                     )?;
-                    (r, PendingOutput::Memory(mem))
+                    match streams {
+                        Some(st) => (r, PendingOutput::Streamed(st)),
+                        None => (r, PendingOutput::Memory(mem)),
+                    }
                 }
                 "stream" => {
                     let tmp = tempfile::Builder::new()
@@ -842,6 +885,12 @@ fn main() -> Result<()> {
             );
             let t_write = Instant::now();
             let crate::h5_out::HdfOutput { path: h5_path, reports: writer_reports, master_s } = match pending {
+                PendingOutput::Streamed(st) => {
+                    let (dir, reports) = st.finish()?;
+                    let t_master = Instant::now();
+                    let path = crate::h5_out::write_master_h5(&dir, n_shards)?;
+                    crate::h5_out::HdfOutput { path, reports, master_s: t_master.elapsed().as_secs_f64() }
+                }
                 PendingOutput::Memory(mem) => {
                     let groups = crate::h5_out::pack_buckets(&crate::h5_out::bucket_sites(&mem), n_shards);
                     assemble_hdf5_from_memory(
@@ -963,6 +1012,8 @@ fn main() -> Result<()> {
 
 enum PendingOutput {
     Memory(Vec<Vec<ChunkFile>>),
+    /// Memory mode with writers fed during extraction (`shard_stream`).
+    Streamed(crate::shard_stream::ShardStreams),
     Stream(tempfile::TempDir),
 }
 

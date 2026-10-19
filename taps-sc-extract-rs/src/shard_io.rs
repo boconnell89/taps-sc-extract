@@ -48,15 +48,24 @@ fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
 
 
 /// `n` then `n` × (pos, t, c) little-endian u32s, read in one piece.
+/// Sites are 12 bytes each (pos, t, c as little-endian u32). Moved through a
+/// small stack buffer so each list costs one allocation.
+const SITE_BLOCK: usize = 4096;
+
 fn read_sites<R: Read>(r: &mut R) -> std::io::Result<Vec<(u32, u32, u32)>> {
     let n = read_u32(r)? as usize;
-    let mut raw = vec![0u8; n * 12];
-    r.read_exact(&mut raw)?;
+    let mut out = Vec::with_capacity(n);
+    let mut buf = [0u8; 12 * SITE_BLOCK];
     let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    Ok(raw
-        .chunks_exact(12)
-        .map(|s| (le(&s[0..4]), le(&s[4..8]), le(&s[8..12])))
-        .collect())
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(SITE_BLOCK);
+        let raw = &mut buf[..k * 12];
+        r.read_exact(raw)?;
+        out.extend(raw.chunks_exact(12).map(|s| (le(&s[0..4]), le(&s[4..8]), le(&s[8..12]))));
+        left -= k;
+    }
+    Ok(out)
 }
 
 pub fn shard_dir(temp_dir: &Path, shard: usize) -> PathBuf {
@@ -93,11 +102,14 @@ pub fn list_chunk_files(shard_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Bucket this window into per-shard in-memory chunk payloads (chunk_id order later).
+/// Split a window's cells into per-bucket payloads. The cells' site vectors
+/// are moved out (`cells` is left with empty maps).
 pub fn window_shard_payloads(
     window: &Window,
     intern: &BarcodeIntern,
-    cells: &[CellMaps],
+    cells: &mut [CellMaps],
     n_shards: usize,
+    move_sites: bool,
 ) -> Vec<(usize, ChunkFile)> {
     let n_shards = n_shards.max(1);
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_shards];
@@ -120,11 +132,19 @@ pub fn window_shard_payloads(
             cells: Vec::with_capacity(ordered.len()),
         };
         for id in ordered {
-            let cell = &cells[id as usize];
+            let cell = &mut cells[id as usize];
+            // Moved when the payload is sent on at once (streamed writers);
+            // cloned (exact size, no spare capacity) when memory mode keeps
+            // it to the end of extraction.
+            let (cg, ch) = if move_sites {
+                (std::mem::take(&mut cell.cg), std::mem::take(&mut cell.ch))
+            } else {
+                (cell.cg.clone(), cell.ch.clone())
+            };
             payload.cells.push(ChunkCell {
                 barcode: intern.name(id).to_string(),
-                cg: cell.cg.clone(),
-                ch: cell.ch.clone(),
+                cg,
+                ch,
             });
         }
         out.push((s, payload));
@@ -263,13 +283,16 @@ pub fn read_all_chunks_from<R: Read>(r: &mut R) -> Result<Vec<ChunkFile>> {
 
 fn write_sorted_sites<W: Write>(w: &mut W, sites: &[(u32, u32, u32)]) -> std::io::Result<()> {
     write_u32(w, sites.len() as u32)?;
-    let mut raw = Vec::with_capacity(sites.len() * 12);
-    for &(p, t, c) in sites {
-        raw.extend_from_slice(&p.to_le_bytes());
-        raw.extend_from_slice(&t.to_le_bytes());
-        raw.extend_from_slice(&c.to_le_bytes());
+    let mut buf = [0u8; 12 * SITE_BLOCK];
+    for block in sites.chunks(SITE_BLOCK) {
+        for (o, &(p, t, c)) in buf.chunks_exact_mut(12).zip(block) {
+            o[0..4].copy_from_slice(&p.to_le_bytes());
+            o[4..8].copy_from_slice(&t.to_le_bytes());
+            o[8..12].copy_from_slice(&c.to_le_bytes());
+        }
+        w.write_all(&buf[..block.len() * 12])?;
     }
-    w.write_all(&raw)
+    Ok(())
 }
 
 /// Serialize an in-memory chunk in the same `TAPSCK01` layout as the temp files.

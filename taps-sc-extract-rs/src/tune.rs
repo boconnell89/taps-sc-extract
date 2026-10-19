@@ -313,7 +313,7 @@ fn synthetic_windows(fai: &crate::fasta::FastFaiReader, contigs: &[&str], total_
 fn run_extract(bam: &Path, fasta: &Path, windows: &[Window], params: &ExtractParams, workers: usize, shards: usize) -> Result<(WindowResult, Vec<Vec<ChunkFile>>, f64)> {
     let cancel = new_cancel_flag();
     let t = Instant::now();
-    let (r, mem) = extract_memory_parallel(bam, fasta, windows, None, params, shards, workers, &cancel)?;
+    let (r, mem) = extract_memory_parallel(bam, fasta, windows, None, params, shards, workers, &cancel, None)?;
     Ok((r, mem, t.elapsed().as_secs_f64()))
 }
 

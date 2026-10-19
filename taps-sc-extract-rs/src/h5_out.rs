@@ -519,14 +519,16 @@ fn parse_writer_line(shard: usize, stderr: &str) -> WriterReport {
     rep
 }
 
-/// Run `taps-sc-extract-rs write-shard` for one shard and wait for it.
-fn run_shard_writer_process(
+/// Start `taps-sc-extract-rs write-shard` for one shard. With `stdin_chunks`
+/// it reads `TAPSCK01` chunks from a pipe (`--stdin`); otherwise from
+/// `chunk_dirs`.
+pub(crate) fn spawn_shard_writer(
     shard: usize,
     out: &Path,
     compression_name: &str,
-    input: ShardInput,
-) -> Result<WriterReport> {
-    use std::io::Write;
+    chunk_dirs: &[PathBuf],
+    stdin_chunks: bool,
+) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().context("locate taps-sc-extract-rs for write-shard")?;
     let mut cmd = Command::new(exe);
@@ -542,35 +544,19 @@ fn run_shard_writer_process(
         .env("HDF5_USE_FILE_LOCKING", "FALSE")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let chunks = match input {
-        ShardInput::Dirs(dirs) => {
-            for d in dirs {
-                cmd.arg("--chunk-dir").arg(d);
-            }
-            cmd.stdin(Stdio::null());
-            None
+    if stdin_chunks {
+        cmd.arg("--stdin").stdin(Stdio::piped());
+    } else {
+        for d in chunk_dirs {
+            cmd.arg("--chunk-dir").arg(d);
         }
-        ShardInput::Chunks(c) => {
-            cmd.arg("--stdin").stdin(Stdio::piped());
-            Some(c)
-        }
-    };
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn write-shard for shard {shard:03}"))?;
-    if let Some(chunks) = chunks {
-        let stdin = child.stdin.take().expect("piped stdin");
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, stdin);
-        let sent: Result<()> = chunks.iter().try_for_each(|c| write_chunk_to(&mut w, c));
-        let flushed = w.flush().map_err(anyhow::Error::from);
-        drop(w);
-        drop(chunks);
-        if let Err(e) = sent.and(flushed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e.context(format!("send chunks to write-shard {shard:03}")));
-        }
+        cmd.stdin(Stdio::null());
     }
+    cmd.spawn().with_context(|| format!("spawn write-shard for shard {shard:03}"))
+}
+
+/// Wait for a `write-shard` child (its stdin already closed) and parse its report.
+pub(crate) fn finish_shard_writer(shard: usize, child: std::process::Child) -> Result<WriterReport> {
     let output = child
         .wait_with_output()
         .with_context(|| format!("wait for write-shard {shard:03}"))?;
@@ -582,6 +568,43 @@ fn run_shard_writer_process(
         anyhow::bail!("write-shard {shard:03} failed: {}", output.status);
     }
     Ok(parse_writer_line(shard, &stderr))
+}
+
+/// Buffered writer for a `write-shard` child's stdin, on a 1 MB pipe.
+pub(crate) fn chunk_pipe(child: &mut std::process::Child) -> std::io::BufWriter<std::process::ChildStdin> {
+    use std::os::unix::io::AsRawFd;
+    let stdin = child.stdin.take().expect("piped stdin");
+    // 1 MB instead of the default 64 KB pipe: fewer wake-ups on both sides.
+    unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
+    std::io::BufWriter::with_capacity(1 << 20, stdin)
+}
+
+/// Run `taps-sc-extract-rs write-shard` for one shard and wait for it.
+fn run_shard_writer_process(
+    shard: usize,
+    out: &Path,
+    compression_name: &str,
+    input: ShardInput,
+) -> Result<WriterReport> {
+    use std::io::Write;
+    let (dirs, chunks) = match input {
+        ShardInput::Dirs(d) => (d, None),
+        ShardInput::Chunks(c) => (Vec::new(), Some(c)),
+    };
+    let mut child = spawn_shard_writer(shard, out, compression_name, &dirs, chunks.is_some())?;
+    if let Some(chunks) = chunks {
+        let mut w = chunk_pipe(&mut child);
+        let sent: Result<()> = chunks.iter().try_for_each(|c| write_chunk_to(&mut w, c));
+        let flushed = w.flush().map_err(anyhow::Error::from);
+        drop(w);
+        drop(chunks);
+        if let Err(e) = sent.and(flushed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.context(format!("send chunks to write-shard {shard:03}")));
+        }
+    }
+    finish_shard_writer(shard, child)
 }
 
 /// Pool of `n_writers` threads, each driving one child process at a time.

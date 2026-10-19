@@ -494,3 +494,29 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
 
 - `MethRec` is `#[repr(C)]` with 6 padding bytes after the `S10` chr field (48-byte records; the HDF5 compound has no member there). Those bytes were uninitialised, so they went to disk with arbitrary heap contents and identical runs gave different file bytes. `h5_out::push_rec` now writes each record into zeroed memory field by field (raw pointers), in the process writers and in `records_from_chunks`.
 - chr19: two memory-mode runs, two stream-mode runs and one `--writer-mode thread` run give byte-identical datasets (11,075 cell × context datasets). Every padding byte is zero. The Python engine writes a packed 42-byte compound with no padding, so it needed no change.
+
+## 2026-10-18 — Writers fed during extraction (memory mode)
+
+- Where write time went (full test BAM, defaults): each `write-shard` child spent about 3.6 s receiving and decoding its shard, then about 7.2 s writing HDF5.
+  - Alone, the same shard decodes in 0.15 s and writes in 2.1 s. With 16 children at once, decode takes 2.2 s and write 7–9 s, even with no parent process and spare hardware threads.
+  - Eight concurrent writers take as long for 8 shards as 16 do for 16, so the write phase is bound by a shared resource (memory bandwidth and page faults), not by CPU.
+  - Allocator settings changed little: the glibc mmap/trim thresholds plus `MIMALLOC_PURGE_DELAY=-1` took 16 concurrent writers from 11.5 s to 9.9 s.
+  - A 1 MB pipe instead of the 64 KB default changed nothing. Raw pipes move about 1 GB/s each and 7 GB/s across 16.
+- Every cell spans every window, so no dataset can be written before extraction ends. The transfer can move, though, and `src/shard_stream.rs` does that:
+  - all writer children start before extraction;
+  - each window's payloads are piped as soon as the window finishes;
+  - buckets are dealt to shards after 20% of windows, by their sites so far; the shard spread was 41–52M sites, against 42–52M with final weights;
+  - senders and children run at nice 10;
+  - on drop without `finish`, the children are killed.
+- Cheaper transfer:
+  - payload site vectors are moved instead of cloned when streaming (cloned in batch memory mode, where they live to the end: moved vectors keep spare capacity, and mimalloc does not give it back on shrink, 11 → 13.9 GB);
+  - sites are encoded and decoded through a 48 KB stack block instead of a per-list temporary allocation.
+- Full test BAM, defaults (memory mode, 16 shards), three alternating runs each:
+
+  | Writers | End to end, reads/s | Processing | Write phase | Extraction process peak |
+  |---|---|---|---|---|
+  | Batch (old) | 2.42–2.56M, mean 2.51M | 10.0–11.1 s | 10.4–11.0 s | 11.0 GB |
+  | Streamed, nice 0 | 2.56–2.73M, mean 2.64M | | | |
+  | Streamed, nice 10 (default) | 2.71–3.02M, mean 2.81M (+12%) | 11.0–12.3 s | 6.7–7.5 s | 6.0–6.8 GB |
+
+- Calls identical per cell to the batch path (14,674 datasets). A SIGINT mid-extraction leaves no `write-shard` processes and no shard files.
