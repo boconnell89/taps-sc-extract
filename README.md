@@ -339,6 +339,9 @@ $$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
 - **Checks**: every read's `YS` must agree with its flag (the run stops at the first that does not; `--strand-source flag` to skip), and `-f` must be the unconverted genome (a C→T or G→A converted FASTA is refused).
 - **Output**: the usual Amethyst HDF5. `/metadata` attributes in every file record the chemistry, BSBolt version, trims and filters.
 - Design and remaining work (automatic M-bias trimming, pileup-vs-XB report): [`code/bisulfite-extraction-plan.md`](code/bisulfite-extraction-plan.md).
+- **First real dataset** (merged LER BAM, 91.6M reads, 304 cells; [`code/bisulfite-profiling-2026-10-21.md`](code/bisulfite-profiling-2026-10-21.md)):
+  - Processing runs at 5.4–7.4M reads/s, warm cache. End to end, `-t 32 --shards 16 --memory-mode memory` runs at 2.1–2.5M reads/s; HDF5 writing of 1.15 billion cell-sites is the limit.
+  - Calling straight from BSBolt's `XB` tags reads CpG methylation 3.9 points low on chr19 (77.45% against 81.34%): 2.9 points from low-quality bases and 1.0 from the 3′ end. With the same filters, `XB` and the pileup agree on all but 274 of 1.22M CpG cell-sites (`scripts/xb_audit.py`).
 
 ### BAQ for TAPS
 
