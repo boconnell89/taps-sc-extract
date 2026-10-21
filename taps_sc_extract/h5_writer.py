@@ -92,6 +92,21 @@ METH_DTYPE = np.dtype([
 ])
 
 
+# Run settings written as string attributes on /metadata of every output file
+# (chemistry, trims, filters); set once per run by the extractor.
+RUN_ATTRS: Dict[str, str] = {}
+
+
+def set_run_attrs(attrs: Dict[str, Any]) -> None:
+    RUN_ATTRS.clear()
+    RUN_ATTRS.update({k: str(v) for k, v in attrs.items()})
+
+
+def write_run_attrs(meta_group) -> None:
+    for k, v in RUN_ATTRS.items():
+        meta_group.attrs[k] = v
+
+
 class AmethystH5Writer:
     """Writer for Amethyst-compatible HDF5 files."""
 
@@ -115,6 +130,7 @@ class AmethystH5Writer:
         meta_group = self.h5.require_group('metadata')
         if 'version' not in meta_group:
             meta_group.create_dataset('version', data=version.encode('utf-8'))
+        write_run_attrs(meta_group)
 
     def create_cell_dataset(self, context: str, barcode: str, records: np.ndarray):
         """
@@ -260,6 +276,7 @@ def write_sharded_hdf5_dir(
     with h5py.File(master_path, "w") as master_h5:
         meta_group = master_h5.require_group("metadata")
         meta_group.create_dataset("version", data=version.encode("utf-8"))
+        write_run_attrs(meta_group)
         for i in range(n_shards):
             shard_bcs = shard_assignments[i]
             if not shard_bcs:

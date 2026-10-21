@@ -656,6 +656,9 @@ fn mapped_per_contig(bam_path: &Path, contigs: &[&str]) -> Result<Vec<(String, u
 }
 
 fn sample_dataset(bam_path: &Path, fasta: &Path, workers: usize, target_reads: u64) -> Result<DatasetSample> {
+    if crate::chemistry::detect(bam_path, false)?.with_ys > 0 {
+        anyhow::bail!("--test dataset sampling supports TAPS only for now; this BAM carries BSBolt bisulfite tags");
+    }
     let primary = crate::window::bam_primary_contigs(bam_path)?;
     let contigs: Vec<&str> = primary.iter().map(|s| s.as_str()).collect();
     let per = mapped_per_contig(bam_path, &contigs)?;

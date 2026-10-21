@@ -206,19 +206,20 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-baseq",
         type=int,
-        default=20,
+        default=None,
         help="Minimum base quality for pileup (default: 20).",
     )
     parser.add_argument(
         "--min-mapq",
         type=int,
-        default=0,
-        help="Minimum mapping quality (default: 0).",
+        default=None,
+        help="Minimum mapping quality (default: taps 0, bisulfite 10; BSBolt gives 0 to reads "
+        "that are not bisulfite-unique).",
     )
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=100000,
+        default=None,
         help="Maximum reads per position, all cells together (htslib pileup cap; "
         "default: 100000; 0 = unlimited). Single-cell depth at a site is about the number of "
         "cells covering it, so a low cap drops whole cells at well-covered loci.",
@@ -295,19 +296,44 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Do not ignore overlapping mate read bases.",
     )
     parser.add_argument(
+        "--chemistry",
+        choices=["auto", "taps", "bisulfite"],
+        default="auto",
+        help="Conversion chemistry. auto (default) reads the BAM: BSBolt YS strand tags mean "
+        "bisulfite (single-end, unmethylated C -> T); paired-end reads without them mean taps "
+        "(mC -> T). The two use separate strand and call rules and different defaults.",
+    )
+    parser.add_argument(
+        "--strand-source",
+        choices=["auto", "flag"],
+        default="auto",
+        help="Bisulfite strand: auto (flag, checked against every read's BSBolt YS tag; the "
+        "run stops at the first disagreement) or flag (no YS check, for aligners without YS).",
+    )
+    parser.add_argument(
         "--trim-r2",
         type=int,
-        default=10,
+        default=None,
         help=(
             "Drop this many bases from the 5' end of read 2 before calling "
-            "(default: 10). Removes Tn5/TAPS M-bias on R2."
+            "(default: taps 10; no effect on single-end reads). Removes Tn5/TAPS M-bias on R2."
         ),
     )
     parser.add_argument(
-        "--trim-r1",
+        "--trim-r1", "--trim-5p",
+        dest="trim_r1",
         type=int,
-        default=0,
-        help="Drop this many bases from the 5' end of read 1 before calling (default: 0).",
+        default=None,
+        help="Drop this many bases from the sequenced 5' end of read 1, or of every "
+        "single-end read (default: 0).",
+    )
+    parser.add_argument(
+        "--trim-3p", "--trim-3prime",
+        dest="trim_3p",
+        type=int,
+        default=None,
+        help="Drop this many bases from the sequenced 3' end of every read (default: taps 0, "
+        "bisulfite 10 for the Tn5 gap filled with unmethylated C at end repair).",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -424,10 +450,21 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         "--compression", compression,
         "--max-writer-threads", str(parsed.max_writer_threads),
         "--writer-mode", parsed.writer_mode,
-        "--min-baseq", str(parsed.min_baseq),
-        "--min-mapq", str(parsed.min_mapq),
-        "--max-depth", str(parsed.max_depth),
+        "--chemistry", parsed.chemistry,
+        "--strand-source", parsed.strand_source,
     ]
+    # Chemistry-dependent options: forwarded only when set, so the Rust engine
+    # applies the detected chemistry's defaults to the rest.
+    for flag, value in (
+        ("--min-baseq", parsed.min_baseq),
+        ("--min-mapq", parsed.min_mapq),
+        ("--max-depth", parsed.max_depth),
+        ("--trim-r1", parsed.trim_r1),
+        ("--trim-r2", parsed.trim_r2),
+        ("--trim-3p", parsed.trim_3p),
+    ):
+        if value is not None:
+            cmd.extend([flag, str(value)])
     if parsed.chroms:
         cmd.extend(["-c", parsed.chroms])
     if parsed.whitelist:
@@ -474,7 +511,6 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         cmd.extend(["--memory-mode", parsed.memory_mode])
     elif parsed.no_temp_file:
         cmd.extend(["--memory-mode", "memory"])
-    cmd.extend(["--trim-r1", str(parsed.trim_r1), "--trim-r2", str(parsed.trim_r2)])
     return cmd
 
 
@@ -511,13 +547,42 @@ def find_rust_binary() -> Optional[str]:
     return None
 
 
+def resolve_python_options(parsed):
+    """Python engine: detect the chemistry from the BAM and fill unset options
+    with its defaults (the Rust engine does the same in chemistry.rs)."""
+    import pysam
+    from .chemistry import check_reference, defaults, detect, resolve
+    from .contigs import primary_contigs
+    from .fasta import FastFaiReader
+
+    with pysam.AlignmentFile(parsed.bam, reference_filename=parsed.fasta) as bam:
+        det = detect(bam, parsed.strand_source == "auto")
+        lengths = dict(zip(bam.references, bam.lengths))
+        contigs = (
+            [c.strip() for c in parsed.chroms.split(",") if c.strip()] if parsed.chroms
+            else primary_contigs(bam.references)
+        )
+    chem = resolve(parsed.chemistry, det, parsed.strand_source)
+    check_reference(FastFaiReader(parsed.fasta), lengths, contigs)
+    if chem == "bisulfite" and parsed.baq == "htslib":
+        raise ValueError("--baq htslib treats every unmethylated C as a mismatch in bisulfite data")
+    d = defaults(chem)
+    opts = {k: (getattr(parsed, k) if getattr(parsed, k) is not None else d[k])
+            for k in ("min_mapq", "min_baseq", "max_depth", "trim_r1", "trim_r2", "trim_3p")}
+    logging.getLogger("taps_sc_extract").info(
+        f"Chemistry: {chem} ({'detected from the BAM' if parsed.chemistry == 'auto' else 'explicit'}"
+        f"{'; BSBolt ' + det['bsbolt'] if det['bsbolt'] else ''})"
+    )
+    return chem, opts
+
+
 def main(args: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if args is None else args)
     parsed = parse_args(argv)
     setup_logging(verbose=parsed.verbose, log_file=parsed.log_file)
     logger = logging.getLogger("taps_sc_extract")
-    if parsed.trim_r1 < 0 or parsed.trim_r2 < 0:
-        logger.error("--trim-r1 and --trim-r2 must be >= 0.")
+    if any(v is not None and v < 0 for v in (parsed.trim_r1, parsed.trim_r2, parsed.trim_3p)):
+        logger.error("--trim-r1/--trim-5p, --trim-r2 and --trim-3p must be >= 0.")
         return 1
 
     logger.info("=" * 70)
@@ -566,6 +631,11 @@ def main(args: Optional[List[str]] = None) -> int:
     chroms_list = None
     if parsed.chroms:
         chroms_list = [c.strip() for c in parsed.chroms.split(",") if c.strip()]
+    try:
+        chem, opts = resolve_python_options(parsed)
+    except Exception as e:
+        logger.error(str(e))
+        return 1
 
     try:
         extract_methylation_parallel(
@@ -586,15 +656,18 @@ def main(args: Optional[List[str]] = None) -> int:
             compression_threads=parsed.compression_threads,
             max_writer_threads=parsed.max_writer_threads,
             temp_dir=parsed.temp_dir,
-            min_base_quality=parsed.min_baseq,
-            min_mapq=parsed.min_mapq,
-            max_depth=parsed.max_depth,
+            min_base_quality=opts["min_baseq"],
+            min_mapq=opts["min_mapq"],
+            max_depth=opts["max_depth"],
             compute_baq=not parsed.no_baq,
             ignore_orphans=True,
             ignore_overlaps=not parsed.no_overlap_clip,
-            trim_r1=parsed.trim_r1,
-            trim_r2=parsed.trim_r2,
+            trim_r1=opts["trim_r1"],
+            trim_r2=opts["trim_r2"],
+            trim_3p=opts["trim_3p"],
             contexts=("CG", "CH") if parsed.context == "both" else (parsed.context,),
+            chemistry=chem,
+            verify_ys=parsed.strand_source == "auto",
         )
         return 0
     except Exception as e:

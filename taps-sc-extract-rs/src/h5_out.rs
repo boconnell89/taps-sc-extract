@@ -109,6 +109,24 @@ impl H5Compression {
     }
 }
 
+/// Run settings written as string attributes on `/metadata` of every output
+/// file (shards, single file, `master.h5`): chemistry, trims, filters.
+/// Kept in an environment variable so `write-shard` children inherit them.
+const RUN_ATTRS_ENV: &str = "TAPS_SC_EXTRACT_RUN_ATTRS";
+
+pub fn set_run_attrs(attrs: &[(&str, String)]) {
+    let v: Vec<String> = attrs.iter().map(|(k, v)| format!("{k}={}", v.replace([';', '='], "_"))).collect();
+    std::env::set_var(RUN_ATTRS_ENV, v.join(";"));
+}
+
+fn run_attrs() -> Vec<(String, String)> {
+    std::env::var(RUN_ATTRS_ENV)
+        .unwrap_or_default()
+        .split(';')
+        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect()
+}
+
 fn write_version(file: &File) -> Result<()> {
     let meta = file.create_group("metadata")?;
     let v = AMETHYST_VERSION.as_bytes();
@@ -117,6 +135,14 @@ fn write_version(file: &File) -> Result<()> {
         .create("version")?
         .write(v)
         .map_err(|e| anyhow::anyhow!("write metadata/version: {e}"))?;
+    for (k, v) in run_attrs() {
+        let val: hdf5_metno::types::VarLenUnicode =
+            v.parse().map_err(|e| anyhow::anyhow!("metadata attribute {k}: {e:?}"))?;
+        meta.new_attr::<hdf5_metno::types::VarLenUnicode>()
+            .create(k.as_str())?
+            .write_scalar(&val)
+            .map_err(|e| anyhow::anyhow!("write metadata attribute {k}: {e}"))?;
+    }
     Ok(())
 }
 

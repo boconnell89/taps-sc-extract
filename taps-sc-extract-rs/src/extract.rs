@@ -232,6 +232,8 @@ pub struct ExtractParams {
     pub chemistry: crate::chemistry::Chemistry,
     /// Drop this many bases from the sequenced 3' end of every read.
     pub trim_3p: u32,
+    /// Bisulfite: check every pushed read's BSBolt `YS` tag against its flag.
+    pub verify_ys: bool,
 }
 
 /// `--caller`: column pileup (htslib `bam_plp`) or read-centric calling
@@ -266,6 +268,7 @@ impl Default for ExtractParams {
             caller: Caller::Reads,
             chemistry: crate::chemistry::Chemistry::Taps,
             trim_3p: 0,
+            verify_ys: false,
         }
     }
 }
@@ -530,7 +533,14 @@ fn accept_record(
     whitelist: Option<&HashSet<String>>,
 ) -> Option<bool> {
     let flags = rec.flags();
-    if flags & FLAG_FILTER != 0 {
+    // Bisulfite also drops supplementary records before the pileup: BSBolt
+    // writes them (bwa -Y) and most are chimeras on the opposite converted
+    // strand. TAPS is unchanged (supplementary there is uncalled).
+    let filter = match params.chemistry {
+        crate::chemistry::Chemistry::Taps => FLAG_FILTER,
+        crate::chemistry::Chemistry::Bisulfite => FLAG_FILTER | htslib::BAM_FSUPPLEMENTARY as u16,
+    };
+    if flags & filter != 0 {
         return None;
     }
     // MAPQ and orphan tests only reject. A rejected read is never pushed, so
@@ -552,6 +562,28 @@ fn accept_record(
         !wl.contains(std::str::from_utf8(barcode_from_qname_bytes(rec.qname())).unwrap_or(""))
     });
     Some(params.compute_baq && !excluded)
+}
+
+/// Bisulfite reads must be single-end, and (unless `--strand-source flag`)
+/// carry a directional BSBolt `YS` that agrees with the flag. Any violation
+/// stops the run: a wrong strand would invert every call of the read.
+fn bisulfite_read_guard(rec: &Record, verify_ys: bool) -> Result<()> {
+    if rec.flags() & htslib::BAM_FPAIRED as u16 != 0 {
+        anyhow::bail!(
+            "read {} is paired: --chemistry bisulfite supports single-end reads only",
+            String::from_utf8_lossy(rec.qname())
+        );
+    }
+    if verify_ys {
+        match crate::chemistry::ys_tag(rec) {
+            Some(ys) => crate::chemistry::check_ys(rec, &ys)?,
+            None => anyhow::bail!(
+                "read {} has no BSBolt YS strand tag (use --strand-source flag to take the strand from the flag)",
+                String::from_utf8_lossy(rec.qname())
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Padding around a window's reference slice when BAQ is on. A short read's
@@ -825,6 +857,9 @@ pub fn process_window(
                         timing.records += 1;
                         let acc = accept_record(&slot.pool[n], params, whitelist);
                         slot.keep[n] = acc.is_some();
+                        if acc.is_some() && params.chemistry == crate::chemistry::Chemistry::Bisulfite {
+                            bisulfite_read_guard(&slot.pool[n], params.verify_ys)?;
+                        }
                         if acc == Some(true) {
                             let rec = &mut slot.pool[n];
                             let (lo, hi) = baq_need(rec, ref_len);

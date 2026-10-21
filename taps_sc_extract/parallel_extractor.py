@@ -41,9 +41,11 @@ from .calling import (
     DEFAULT_TRIM_R2,
     trim_window,
 )
-from .chemistry import flag_filter, tables
+from .chemistry import flag_filter, guard_window, tables
 from .fasta import FastFaiReader
 from .h5_writer import (
+    set_run_attrs,
+    write_run_attrs,
     AmethystH5Writer,
     METH_DTYPE,
     SUPPORTED_COMPRESSION,
@@ -195,6 +197,8 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     trim_3p = params.get("trim_3p", 0)
     chemistry = params.get("chemistry", "taps")
     strand_map, call_table = tables(chemistry)
+    if chemistry == "bisulfite":
+        guard_window(bam, contig, start, end, min_mapq, params.get("verify_ys", True))
     contexts = params.get("contexts", ("CG", "CH"))
 
     # Fetch reference sequence with 2bp padding on each side
@@ -571,6 +575,7 @@ def extract_methylation_parallel(
     contexts: Tuple[str, ...] = ("CG", "CH"),
     chemistry: str = "taps",
     trim_3p: int = 0,
+    verify_ys: bool = True,
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -640,6 +645,16 @@ def extract_methylation_parallel(
     )
     logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp; 3' trim: {trim_3p} bp; chemistry: {chemistry}")
 
+    set_run_attrs({
+        "chemistry": chemistry,
+        "trim_r1": trim_r1,
+        "trim_r2": trim_r2,
+        "trim_3p": trim_3p,
+        "trim_mode": "manual",
+        "min_mapq": min_mapq,
+        "min_baseq": min_base_quality,
+        "extractor": "taps-sc-extract (python)",
+    })
     worker_params = {
         "decomp_threads": decomp_threads,
         "ignore_overlaps": ignore_overlaps,
@@ -654,6 +669,7 @@ def extract_methylation_parallel(
         "trim_r2": trim_r2,
         "trim_3p": trim_3p,
         "chemistry": chemistry,
+        "verify_ys": verify_ys,
         "contexts": tuple(contexts),
     }
 
@@ -779,6 +795,7 @@ def extract_methylation_parallel(
             with h5py.File(master_path, "w") as master_h5:
                 meta_group = master_h5.require_group("metadata")
                 meta_group.create_dataset("version", data=b"amethyst2.0.0")
+                write_run_attrs(meta_group)
 
                 # Groups only for contexts some shard has (none for a skipped context).
                 for s in range(effective_shards):

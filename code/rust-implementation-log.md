@@ -599,3 +599,31 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   - The noodles stats path uses the same remap.
 - The frozen chr19 references were made at 250. Tests against them now pin `--max-depth 250` (`FROZEN_MAX_DEPTH`). The Python-parity tests run both engines at 100000.
 - New tests: on chr19 the default equals unlimited; unit tests for both remaps.
+
+## 2026-10-21 — Bisulfite chemistry (milestone 1 of `code/bisulfite-extraction-plan.md`)
+
+- Refactor first (`5425c36`): both engines take strand rules and call tables from a per-run chemistry, plus the 5′/3′ `trim_window`. TAPS output is unchanged (all frozen chr19 references and the parity tests pass).
+- Bisulfite:
+  - `--chemistry auto|taps|bisulfite`, with detection from a 10,000-read sample (`YS` tags → bisulfite);
+  - `--strand-source auto|flag`;
+  - `--trim-3p` (and `--trim-5p` as an alias of `--trim-r1`);
+  - per-chemistry defaults that fill only unset options (bisulfite: MAPQ ≥ 10, base quality ≥ 20, 3′ trim 10, no BAQ);
+  - supplementary dropped before the pileup;
+  - a per-read guard (paired → error; YS must be directional and agree with the flag);
+  - a check that the FASTA is unconverted (C and G ≥ 5% of 100 kb from the middle of the first contig; lengths must match the BAM);
+  - chemistry, trims and filters recorded as attributes on `/metadata` of every output file;
+  - `stats` and `--test` dataset sampling refuse BSBolt BAMs for now.
+- Tests on a synthetic BSBolt fixture (`tests/bsbolt_fixture.py`), generated at test time with known truth:
+  - 6,000 reads in chr19:5.0–5.3 Mb, 6 cells, CG 80% / CH 5%;
+  - forward and reverse reads, with indels, soft clips, binned qualities, MAPQ 0/5 reads and opposite-strand supplementary records;
+  - a 10 bp 3′ bias on 30% of reads;
+  - correct XB tags.
+
+  What the tests check:
+  - Rust defaults equal the truth per cell and site.
+  - Rust without filters equals both the truth and the reads' own decoded XB calls.
+  - The Python engine equals the truth.
+  - `--caller reads` equals `--caller pileup` with 5′ and 3′ trims.
+  - `--context CG` works.
+  - Guards: `--chemistry taps` is refused on a BSBolt BAM; `--baq htslib` is refused for bisulfite; a flipped YS stops the run unless `--strand-source flag` is given.
+- Not yet: `--trim auto` with M-bias plots, `scripts/xb_audit.py` (pileup vs XB report), the filter-impact report and frozen bisulfite references. Those wait for deduplicated data.

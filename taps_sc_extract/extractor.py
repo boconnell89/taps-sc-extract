@@ -25,7 +25,8 @@ from .calling import (
     DEFAULT_TRIM_R2,
     trim_window,
 )
-from .chemistry import flag_filter, tables
+from .chemistry import flag_filter, guard_window, tables
+from .h5_writer import set_run_attrs
 from .context import classify_context, classify_trinucleotide_context
 from .h5_writer import AmethystH5Writer, METH_DTYPE
 
@@ -61,6 +62,7 @@ def extract_methylation(
     contexts: Tuple[str, ...] = ("CG", "CH"),
     chemistry: str = "taps",
     trim_3p: int = 0,
+    verify_ys: bool = True,
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -118,6 +120,16 @@ def extract_methylation(
     logger.info(f"Processing {len(target_contigs)} contig(s) with {total_target_reads:,} total mapped reads.")
     logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp; 3' trim: {trim_3p} bp; chemistry: {chemistry}")
     strand_map, call_table = tables(chemistry)
+    set_run_attrs({
+        "chemistry": chemistry,
+        "trim_r1": trim_r1,
+        "trim_r2": trim_r2,
+        "trim_3p": trim_3p,
+        "trim_mode": "manual",
+        "min_mapq": min_mapq,
+        "min_baseq": min_base_quality,
+        "extractor": "taps-sc-extract (python)",
+    })
 
     total_stats = {
         "CpG": {"c": 0, "t": 0},
@@ -155,6 +167,8 @@ def extract_methylation(
 
             contig_barcodes: Set[str] = set()
 
+            if chemistry == "bisulfite":
+                guard_window(bam, contig, 0, ref_len, min_mapq, verify_ys)
             pileup_iter = bam.pileup(
                 contig,
                 ignore_overlaps=ignore_overlaps,

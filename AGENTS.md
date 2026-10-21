@@ -35,6 +35,8 @@ taps-sc-extract/
 │   ├── extractor.py            # Single-process reference extractor
 │   ├── h5_writer.py            # Amethyst HDF5 writer & sharded directory manager
 │   ├── fasta.py                # FastFaiReader: process-safe .fai indexed FASTA reader
+│   ├── chemistry.py            # Chemistry selector, detection, defaults, YS guard, reference check
+│   ├── bisulfite.py            # Bisulfite single-end strand rule and call table
 │   ├── calling.py              # TAPS mC-to-T lookup tables & SAM flag classification
 │   ├── context.py              # Sequence context classifier (CpG, CHG, CHH, CG, CH)
 │   ├── barcode.py              # Barcode extraction from QNAME/tags, whitelist & complexity-file parsing
@@ -54,6 +56,8 @@ taps-sc-extract/
 │       ├── main.rs             # Rust CLI: extract, stats, tune, baq-selftest, write-shard (hidden, spawned by extract)
 │       ├── baq_simd.rs         # FFI to csrc/baq_simd.c, --baq-simd widths, per-read self-tests
 │       ├── baq_gpu.rs          # --baq-device gpu: backend selection, GPU service thread (pools reads across workers)
+│       ├── chemistry.rs        # Chemistry selector, BAM detection, per-chemistry defaults, YS guard, reference check
+│       ├── bisulfite.rs        # Bisulfite single-end strand rule and call table (inverse of TAPS)
 │       ├── extract.rs          # Batched read/BAQ/push loop, bam_plp column callback (--caller pileup), BAQ modes/masks/reference slices, stage timing
 │       ├── readcall.rs         # Read-centric calling (--caller reads, default): replays bam_plp's depth cap and mate overlap, calls each read when htslib would free it
 │       ├── extract_noodles.rs  # Slower pure-Rust reference pileup (noodles)
@@ -117,6 +121,14 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 - **htslib version matters for calls.** Rust builds hts-sys 2.2.1 (htslib 1.19.1) patched with htslib 1.21's overlap clipping (`taps-sc-extract-rs/patches/`, applied by `install.sh` into `vendor/`, re-applied whenever the patch file's checksum changes) to match pysam 0.23 (htslib 1.21). Re-check parity whenever pysam or rust-htslib changes.
 
 - **Default contigs come from the BAM header** (`window::primary_contigs` in Rust, `contigs.primary_contigs` in Python; keep the two rules identical). Primary: optional `chr`/`Chr`/`CHR`, then 1–999 (autosomes) or X, Y, Z, W, sorted numerically then X, Y, Z, W. So hg38 gives 22 autosomes and mm10 19, never a hard-coded species list. `CANONICAL_CONTIGS` (Python) is only the mm10 example the tests check against. Output record order per cell follows this contig order.
+
+- **Chemistry is per run and never mixed** (`chemistry.rs` / `chemistry.py`). TAPS rules stay in `calling.*` (strand: exact flags 99/147/83/163); bisulfite rules in `bisulfite.*` (single-end primary flag 0 = OT, 16 = OB; read C/G = methylated, the inverse of TAPS). Calling loops get the strand map and call table from the chemistry once per run; never import the TAPS tables into a loop directly, and never widen TAPS `classify_strand` (TAPS orphans would start calling).
+  - `--chemistry auto` resolves from a 10,000-read sample: any BSBolt `YS` tag → bisulfite; paired reads without → taps; else error. Detection keys on `YS`, not `@PG` (BSBolt 1.2.1 writes `PN:bwa VN:BSB-1.2.1-...`). An explicit chemistry that contradicts the BAM is an error.
+  - Chemistry-dependent defaults (`chemistry::Defaults` / `chemistry.defaults`) fill only options the user did not set: clap `Option<T>`, argparse `default=None`, and the Python wrapper forwards only set values. Never give these options a hard default again, or the wrapper will override bisulfite defaults with TAPS ones.
+  - Bisulfite drops supplementary before the pileup (Rust `accept_record`, Python `flag_filter=0x704|0x800`); TAPS does not (it would move frozen references). Every pushed bisulfite read is checked: paired → error; `YS` must be directional and agree with the flag unless `--strand-source flag` (Rust `bisulfite_read_guard`; Python `chemistry.guard_window` pre-pass per window).
+  - Trims: one window function (`calling::trim_window`, `calling.trim_window`) on BAM SEQ coordinates (soft clips included): 5′ trim from `BAM_FREAD2` (R1/R2) and a shared `trim_3p`; with `trim_3p = 0` it equals the old 5′ rule.
+  - Run settings are written as string attributes on `/metadata` of every output file (Rust: env `TAPS_SC_EXTRACT_RUN_ATTRS`, inherited by `write-shard` children; Python: `h5_writer.set_run_attrs`).
+  - Tests use a synthetic BSBolt BAM generated at test time (`tests/bsbolt_fixture.py`) and compare per cell and site with the generator's own truth, not only engine against engine.
 
 ### F. TAPS Chemistry & Amethyst Schema
 - **TAPS Calling Logic**:

@@ -5,6 +5,7 @@ Unit and integration tests for taps_sc_extract.
 import os
 import tempfile
 import h5py
+from collections import defaultdict
 import hdf5plugin  # noqa: F401  (Blosc filter: Rust output is blosc by default)
 import numpy as np
 import pysam
@@ -145,12 +146,33 @@ def test_keep_after_5prime_trim():
 
 
 def test_cli_trim_defaults():
+    """Unset trims stay None so the detected chemistry's defaults apply
+    (taps: R1 0, R2 10, 3' 0; bisulfite: 5' 0, 3' 10)."""
+    from taps_sc_extract.chemistry import defaults
+
     ns = parse_args(["-b", "x.bam", "-f", "x.fa", "-o", "out.h5"])
-    assert ns.trim_r1 == 0
-    assert ns.trim_r2 == 10
+    assert ns.trim_r1 is None and ns.trim_r2 is None and ns.trim_3p is None
+    assert (defaults("taps")["trim_r1"], defaults("taps")["trim_r2"], defaults("taps")["trim_3p"]) == (0, 10, 0)
+    assert (defaults("bisulfite")["trim_r1"], defaults("bisulfite")["trim_3p"]) == (0, 10)
     ns = parse_args(["-b", "x.bam", "-f", "x.fa", "-o", "out.h5", "--trim-r1", "5", "--trim-r2", "0"])
     assert ns.trim_r1 == 5
     assert ns.trim_r2 == 0
+    ns = parse_args(["-b", "x.bam", "-f", "x.fa", "-o", "out.h5", "--trim-5p", "2", "--trim-3prime", "9"])
+    assert ns.trim_r1 == 2 and ns.trim_3p == 9
+
+
+def test_cli_forwards_only_set_chemistry_options():
+    from taps_sc_extract.cli import build_rust_command
+
+    argv = ["-b", "x.bam", "-f", "x.fa", "-o", "out"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    for flag in ("--min-mapq", "--min-baseq", "--max-depth", "--trim-r1", "--trim-r2", "--trim-3p"):
+        assert flag not in cmd
+    assert cmd[cmd.index("--chemistry") + 1] == "auto"
+    argv += ["--chemistry", "bisulfite", "--trim-3p", "9", "--min-mapq", "0"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    assert cmd[cmd.index("--chemistry") + 1] == "bisulfite"
+    assert cmd[cmd.index("--trim-3p") + 1] == "9" and cmd[cmd.index("--min-mapq") + 1] == "0"
 
 
 # 4. Barcode extraction tests
@@ -1101,3 +1123,145 @@ def test_bisulfite_tables_are_separate_and_inverse():
     assert classify_strand(0) is None and classify_strand(16) is None  # TAPS unchanged
     assert tables("taps")[0] is not tables("bisulfite")[0]
     assert flag_filter("taps") == 0x704 and flag_filter("bisulfite") == 0x704 | 0x800
+
+
+# --- Bisulfite (BSBolt, single-end) on a synthetic fixture with known truth ---
+
+@pytest.fixture(scope="module")
+def bsbolt_bam(tmp_path_factory):
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from bsbolt_fixture import make_bsbolt_bam
+
+    _require(CHR19_FASTA)
+    d = tmp_path_factory.mktemp("bsbolt")
+    bam, truth = make_bsbolt_bam(str(d), CHR19_FASTA)
+    return bam, truth
+
+
+def _expected(truth, **kw):
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from bsbolt_fixture import expected_calls
+    return expected_calls(truth, **kw)
+
+
+def _rust_bs(bam, out, *extra):
+    import subprocess
+    from taps_sc_extract.cli import find_rust_binary
+
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        pytest.skip("Rust binary not built.")
+    return subprocess.run(
+        [rust_bin, "extract", "-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
+         "-t", "4", "--shards", "2", *extra],
+        capture_output=True, text=True,
+    )
+
+
+def _calls_of(path):
+    return {ctx: _sites_by_cell(path, ctx)[0] for ctx in ("CG", "CH")}
+
+
+def test_bisulfite_rust_defaults_match_truth(bsbolt_bam, tmp_path):
+    """Auto-detected bisulfite with its defaults (MAPQ >= 10, base quality >= 20,
+    3' trim 10, supplementary dropped) gives exactly the generator's calls."""
+    bam, truth = bsbolt_bam
+    p = _rust_bs(bam, tmp_path / "rs")
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "Chemistry:       bisulfite (detected from the BAM; BSBolt 1.2.1)" in p.stderr
+    got = _calls_of(tmp_path / "rs" / "master.h5")
+    want = _expected(truth, min_mapq=10, min_baseq=20, trim_5p=0, trim_3p=10)
+    for ctx in ("CG", "CH"):
+        assert got[ctx] and got[ctx] == want[ctx], ctx
+    with h5py.File(str(tmp_path / "rs" / "shard_000.h5"), "r") as f:
+        attrs = dict(f["metadata"].attrs)
+    assert attrs["chemistry"] == "bisulfite" and attrs["trim_3p"] == "10" and attrs["bsbolt_version"] == "1.2.1"
+
+
+def test_bisulfite_rust_no_filters_match_truth_and_xb(bsbolt_bam, tmp_path):
+    """Without filters every informative base is called: equal to the truth and
+    to the reads' own BSBolt XB calls."""
+    bam, truth = bsbolt_bam
+    p = _rust_bs(bam, tmp_path / "rs", "--min-mapq", "0", "--min-baseq", "0", "--trim-3p", "0")
+    assert p.returncode == 0, p.stderr[-2000:]
+    got = _calls_of(tmp_path / "rs" / "master.h5")
+    want = _expected(truth, min_mapq=0, min_baseq=0, trim_5p=0, trim_3p=0)
+    # XB decoded independently (CIGAR walk; one letter = one call).
+    import re
+    xb = {"CG": defaultdict(lambda: [0, 0]), "CH": defaultdict(lambda: [0, 0])}
+    with pysam.AlignmentFile(bam) as f:
+        for r in f.fetch("chr19"):
+            if r.flag & 0x800:
+                continue
+            cell = r.query_name.split(":")[0]
+            aligned = []  # ref pos (or None for insertions) per aligned query base
+            rp = r.reference_start
+            for op, n in r.cigartuples:
+                if op in (0, 7, 8):
+                    aligned += list(range(rp, rp + n)); rp += n
+                elif op == 1:
+                    aligned += [None] * n
+                elif op in (2, 3):
+                    rp += n
+            k = 0
+            for digits, letter in re.findall(r"(\d*)([A-Za-z])", r.get_tag("XB")):
+                k += int(digits) if digits else 0
+                ctx = "CG" if letter.lower() == "x" else "CH"
+                xb[ctx][(cell, aligned[k] + 1)][1 if letter.isupper() else 0] += 1
+                k += 1
+    for ctx in ("CG", "CH"):
+        assert got[ctx] == want[ctx], ctx
+        assert got[ctx] == {k: tuple(v) for k, v in xb[ctx].items()}, ctx
+
+
+def test_bisulfite_python_matches_truth(bsbolt_bam, tmp_path):
+    from taps_sc_extract.cli import main as cli_main
+
+    bam, truth = bsbolt_bam
+    out = tmp_path / "py"
+    rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19", "-t", "2",
+                   "--shards", "2", "--engine", "python"])
+    assert rc == 0
+    got = _calls_of(out / "master.h5")
+    want = _expected(truth, min_mapq=10, min_baseq=20, trim_5p=0, trim_3p=10)
+    for ctx in ("CG", "CH"):
+        assert got[ctx] == want[ctx], ctx
+    with h5py.File(str(out / "master.h5"), "r") as f:
+        assert f["metadata"].attrs["chemistry"] == "bisulfite"
+
+
+def test_bisulfite_callers_and_contexts(bsbolt_bam, tmp_path):
+    bam, truth = bsbolt_bam
+    a = _rust_bs(bam, tmp_path / "reads", "--caller", "reads", "--trim-5p", "3", "--trim-3p", "7")
+    b = _rust_bs(bam, tmp_path / "pileup", "--caller", "pileup", "--trim-5p", "3", "--trim-3p", "7")
+    c = _rust_bs(bam, tmp_path / "cg", "--context", "CG")
+    assert a.returncode == b.returncode == c.returncode == 0, (a.stderr[-800:], b.stderr[-800:], c.stderr[-800:])
+    want = _expected(truth, min_mapq=10, min_baseq=20, trim_5p=3, trim_3p=7)
+    for ctx in ("CG", "CH"):
+        assert _calls_of(tmp_path / "reads" / "master.h5")[ctx] == want[ctx] == _calls_of(tmp_path / "pileup" / "master.h5")[ctx]
+    with h5py.File(str(tmp_path / "cg" / "master.h5"), "r") as f:
+        assert "CH" not in f
+    assert _sites_by_cell(tmp_path / "cg" / "master.h5", "CG")[0] == _expected(truth, min_mapq=10, min_baseq=20, trim_5p=0, trim_3p=10)["CG"]
+
+
+def test_bisulfite_guards(bsbolt_bam, tmp_path):
+    """TAPS rules are refused on a BSBolt BAM, plain htslib BAQ is refused for
+    bisulfite, and a YS that disagrees with the flag stops the run."""
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from bsbolt_fixture import make_bsbolt_bam
+
+    bam, _ = bsbolt_bam
+    p = _rust_bs(bam, tmp_path / "t", "--chemistry", "taps")
+    assert p.returncode != 0 and "BSBolt bisulfite tags" in p.stderr
+    p = _rust_bs(bam, tmp_path / "h", "--baq", "htslib")
+    assert p.returncode != 0 and "--baq htslib" in p.stderr
+    d = tmp_path / "flip"
+    d.mkdir()
+    bad, _ = make_bsbolt_bam(str(d), CHR19_FASTA, n_reads=400, flip_ys_of=200)
+    p = _rust_bs(bad, tmp_path / "f")
+    assert p.returncode != 0 and "disagree" in p.stderr
+    p = _rust_bs(bad, tmp_path / "g", "--strand-source", "flag")
+    assert p.returncode == 0, p.stderr[-800:]

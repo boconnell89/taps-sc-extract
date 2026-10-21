@@ -239,23 +239,37 @@ enum Commands {
         /// when there is more than one shard).
         #[arg(long, default_value = "auto")]
         writer_mode: String,
-        #[arg(long, default_value_t = 20)]
-        min_baseq: u8,
-        #[arg(long, default_value_t = 0)]
-        min_mapq: u8,
-        /// Maximum reads per position, all cells together (htslib cap); 0 = unlimited.
-        #[arg(long, default_value_t = extract::DEFAULT_MAX_DEPTH)]
-        max_depth: u32,
+        /// Conversion chemistry: auto (from the BAM: BSBolt YS tags = bisulfite,
+        /// paired-end without them = taps), taps (mC -> T, paired-end) or
+        /// bisulfite (unmethylated C -> T, single-end BSBolt). The two use
+        /// separate strand and call rules and different defaults.
+        #[arg(long, value_enum, default_value_t = chemistry::ChemistryArg::Auto)]
+        chemistry: chemistry::ChemistryArg,
+        /// Bisulfite strand: auto (flag, checked against every read's BSBolt
+        /// YS tag; stops at the first disagreement) or flag (no YS check).
+        #[arg(long, value_enum, default_value_t = chemistry::StrandSource::Auto)]
+        strand_source: chemistry::StrandSource,
+        /// Minimum base quality (default 20).
+        #[arg(long)]
+        min_baseq: Option<u8>,
+        /// Minimum mapping quality (default: taps 0, bisulfite 10).
+        #[arg(long)]
+        min_mapq: Option<u8>,
+        /// Maximum reads per position, all cells together (htslib cap; default
+        /// 100000); 0 = unlimited.
+        #[arg(long)]
+        max_depth: Option<u32>,
         #[arg(long, default_value_t = false)]
         no_overlap_clip: bool,
         #[arg(long, default_value_t = false)]
         no_ignore_orphans: bool,
-        /// Disable BAQ. Default is on (do not copy Python's current no-op).
+        /// Disable BAQ. Default: on for taps, off for bisulfite.
         #[arg(long, default_value_t = false)]
         no_baq: bool,
-        /// BAQ mode: taps (default), taps-full, taps-partial or htslib.
-        #[arg(long, value_enum, default_value_t = BaqMode::Taps)]
-        baq: BaqMode,
+        /// BAQ mode: taps (default when BAQ is on), taps-full, taps-partial or
+        /// htslib (taps only). Setting it turns BAQ on for bisulfite.
+        #[arg(long, value_enum)]
+        baq: Option<BaqMode>,
         /// BAQ kernel: auto (widest this CPU runs), avx512 (8 reads per
         /// vector), avx2 (4), or off (htslib, one read at a time). All give
         /// identical results (`baq-selftest`).
@@ -286,12 +300,18 @@ enum Commands {
         /// (htslib column pileup). Both give the same calls.
         #[arg(long, value_enum, default_value_t = extract::Caller::Reads)]
         caller: extract::Caller,
-        /// Drop this many 5' sequenced bases of read 1 before calling.
-        #[arg(long, default_value_t = 0)]
-        trim_r1: u32,
-        /// Drop this many 5' sequenced bases of read 2 before calling.
-        #[arg(long, default_value_t = 10)]
-        trim_r2: u32,
+        /// Drop this many bases from the sequenced 5' end of read 1 (or of
+        /// every single-end read; alias --trim-5p). Default 0.
+        #[arg(long, alias = "trim-5p")]
+        trim_r1: Option<u32>,
+        /// Drop this many bases from the sequenced 5' end of read 2 (default:
+        /// taps 10; no effect on single-end reads).
+        #[arg(long)]
+        trim_r2: Option<u32>,
+        /// Drop this many bases from the sequenced 3' end of every read
+        /// (default: taps 0, bisulfite 10 for the Tn5 gap fill-in).
+        #[arg(long, alias = "trim-3prime")]
+        trim_3p: Option<u32>,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
         /// Complexity file (rank, barcode, total, unique reads, %); keeps barcodes
@@ -522,6 +542,9 @@ fn main() -> Result<()> {
             let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             let prepared = input::prepare(&bam, &fasta, nproc)?;
             let bam = prepared.path.clone();
+            if chemistry::detect(&bam, false)?.with_ys > 0 {
+                anyhow::bail!("`stats` supports TAPS only; this BAM carries BSBolt bisulfite tags (use `extract`)");
+            }
             // Default: the BAM's primary chromosomes (autosomes + sex chromosomes).
             let primary = match &chroms {
                 Some(_) => Vec::new(),
@@ -578,6 +601,7 @@ fn main() -> Result<()> {
                 profile: false,
                 chemistry: crate::chemistry::Chemistry::Taps,
                 trim_3p: 0,
+                verify_ys: false,
             };
             eprintln!(
                 "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={} overlaps={ignore_overlaps} orphans={ignore_orphans} trim_r1={trim_r1} trim_r2={trim_r2} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
@@ -662,8 +686,11 @@ fn main() -> Result<()> {
             gpu_mem_mb,
             context,
             caller,
+            chemistry,
+            strand_source,
             trim_r1,
             trim_r2,
+            trim_3p,
             whitelist,
             complexity,
             min_complexity,
@@ -687,6 +714,37 @@ fn main() -> Result<()> {
                 Some(s) => s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect(),
                 None => primary.iter().map(|s| s.as_str()).collect(),
             };
+            // Chemistry from the BAM, then its defaults for every unset option.
+            let detected = chemistry::detect(&bam, strand_source == chemistry::StrandSource::Auto)?;
+            let chem = chemistry::resolve(chemistry, &detected, strand_source)?;
+            chemistry::check_reference(&fai, &bam, &contig_list)?;
+            let dflt = chem.defaults();
+            if chem == chemistry::Chemistry::Bisulfite && baq == Some(BaqMode::Htslib) {
+                anyhow::bail!("--baq htslib treats every unmethylated C as a mismatch in bisulfite data; use a taps BAQ mode or --no-baq");
+            }
+            if chem == chemistry::Chemistry::Bisulfite && trim_r2.is_some() {
+                eprintln!("warning: --trim-r2 has no effect on single-end reads; use --trim-5p / --trim-3p");
+            }
+            let min_baseq = min_baseq.unwrap_or(dflt.min_baseq);
+            let min_mapq = min_mapq.unwrap_or(dflt.min_mapq);
+            let max_depth = max_depth.unwrap_or(dflt.max_depth);
+            let trim_r1 = trim_r1.unwrap_or(dflt.trim_r1);
+            let trim_r2 = trim_r2.unwrap_or(dflt.trim_r2);
+            let trim_3p = trim_3p.unwrap_or(dflt.trim_3p);
+            let no_baq = no_baq || (baq.is_none() && !dflt.baq);
+            let baq = baq.unwrap_or(BaqMode::Taps);
+            crate::h5_out::set_run_attrs(&[
+                ("chemistry", chem.label().to_string()),
+                ("bsbolt_version", detected.bsbolt.clone().unwrap_or_default()),
+                ("trim_r1", trim_r1.to_string()),
+                ("trim_r2", trim_r2.to_string()),
+                ("trim_3p", trim_3p.to_string()),
+                ("trim_mode", "manual".to_string()),
+                ("min_mapq", min_mapq.to_string()),
+                ("min_baseq", min_baseq.to_string()),
+                ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
+                ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
+            ]);
             let wl = barcode::load_cell_filter(
                 whitelist.as_deref(),
                 complexity.as_deref(),
@@ -791,8 +849,9 @@ fn main() -> Result<()> {
                 trim_r1,
                 trim_r2,
                 profile: profile_json.is_some(),
-                chemistry: crate::chemistry::Chemistry::Taps,
-                trim_3p: 0,
+                chemistry: chem,
+                trim_3p,
+                verify_ys: chem == chemistry::Chemistry::Bisulfite && strand_source == chemistry::StrandSource::Auto,
             };
             eprintln!("======================================================================");
             eprintln!("taps-sc-extract-rs v{}", env!("CARGO_PKG_VERSION"));
@@ -836,7 +895,27 @@ fn main() -> Result<()> {
                 None => eprintln!("  BAQ:             {} (kernel: {})", baq_label(&params), baq_kernel_label(&params)),
             }
             eprintln!("  Contexts:        {}", params.context.label());
-            eprintln!("  5' trim:         R1={} bp, R2={} bp", params.trim_r1, params.trim_r2);
+            eprintln!(
+                "  Chemistry:       {} ({}{})",
+                params.chemistry.label(),
+                match (chemistry, params.chemistry) {
+                    (chemistry::ChemistryArg::Auto, _) => "detected from the BAM",
+                    _ => "explicit",
+                },
+                detected.bsbolt.as_ref().map(|v| format!("; BSBolt {v}")).unwrap_or_default()
+            );
+            eprintln!(
+                "  Read filters:    MAPQ >= {}, base quality >= {}, max depth {}{}",
+                params.min_mapq,
+                params.min_baseq,
+                if params.max_depth == 0 { "unlimited".to_string() } else { params.max_depth.to_string() },
+                if params.chemistry == chemistry::Chemistry::Bisulfite { ", supplementary dropped" } else { "" }
+            );
+            if params.chemistry == chemistry::Chemistry::Bisulfite {
+                eprintln!("  Trims:           5' {} bp, 3' {} bp (sequenced ends)", params.trim_r1, params.trim_3p);
+            } else {
+                eprintln!("  5' trim:         R1={} bp, R2={} bp; 3' {} bp", params.trim_r1, params.trim_r2, params.trim_3p);
+            }
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
             eprintln!("======================================================================");

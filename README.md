@@ -173,8 +173,10 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--no-temp-file` | `flag` | `False` | In-memory mode: keeps chunk results in RAM instead of disk (equivalent to `--memory-mode memory`). |
 | `--temp-dir` | `str` | `None` | Custom directory for temporary chunk streaming (default: `/tmp`). |
 | `--log-file` | `str` | `None` | Path to output log file for timestamps and performance tracking. |
+| `--chemistry` | `auto`\|`taps`\|`bisulfite` | `auto` | Conversion chemistry. `auto` reads the BAM: BSBolt `YS` strand tags mean bisulfite (single-end, unmethylated C reads as T); paired-end reads without them mean TAPS. The two use separate strand and call rules and different defaults (see [Bisulfite](#bisulfite-bsbolt-single-end)); a contradicting explicit choice is an error. |
+| `--strand-source` | `auto`\|`flag` | `auto` | Bisulfite: `auto` takes the strand from the flag and stops at the first read whose `YS` tag disagrees; `flag` skips the check (aligners without `YS`). |
 | `--min-baseq` | `int` | `20` | Minimum base quality for pileup. |
-| `--min-mapq` | `int` | `0` | Minimum mapping quality for alignment filtering. |
+| `--min-mapq` | `int` | taps `0`, bisulfite `10` | Minimum mapping quality (BSBolt gives 0 to reads that are not bisulfite-unique). |
 | `--max-depth` | `int` | `100000` | Maximum reads per position, all cells together (htslib's pileup cap; both engines and both Rust callers apply it identically). `0` = unlimited. Single-cell depth at a site is about the number of cells covering it, so the former default of 250 dropped reads at well-covered loci (805,351 reads on the test BAM, 3.4% of CpG calls); 100000 dropped none there. |
 | `--no-baq` | `flag` | `False` | Disable Base Alignment Quality (BAQ) computation. |
 | `--baq` | `taps`\|`taps-full`\|`taps-partial`\|`htslib` | `taps` | BAQ mode (Rust engine). The `taps` modes realign OT reads against the reference with every C masked to N and OB reads with every G masked, so methylation conversions (all contexts) are not penalised. `taps` skips reads that already match that reference exactly (processing 4.5M vs 2.2M reads/s for `taps-full`; 0.0007% of CG calls differ); `taps-full` runs every read; `taps-partial` only reads with an indel or clip (6.4M reads/s; 0.06% of CG calls differ). `htslib` is samtools/asTair BAQ on the plain reference and under-calls methylation. The Python engine never applies BAQ. See [BAQ for TAPS](#baq-for-taps). |
@@ -186,8 +188,9 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--gpu-mem-mb` | `int` | `1024` | GPU memory for HMM matrices per launch. |
 | `--context` | `both`\|`CG`\|`CH` | `both` | Contexts to extract. `CG` or `CH` skips the other context's positions and leaves its HDF5 group out. See [`--context`](#10---context-cg-or-ch-only). |
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
-| `--trim-r2` | `int` | `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). |
-| `--trim-r1` | `int` | `0` | Drop this many 5′ sequenced bases of read 1 before calling. |
+| `--trim-r2` | `int` | taps `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). No effect on single-end reads. |
+| `--trim-r1` / `--trim-5p` | `int` | `0` | Drop this many bases from the sequenced 5′ end of read 1, or of every single-end read. |
+| `--trim-3p` | `int` | taps `0`, bisulfite `10` | Drop this many bases from the sequenced 3′ end of every read (bisulfite: the Tn5 9 bp gap is filled with unmethylated C at end repair). |
 | `-v, --verbose` | `flag` | `False` | Enable verbose debug logging. |
 
 ---
@@ -317,6 +320,23 @@ $$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
 | **OB** (Original Bottom, Strand `-`) | `G` | `G` | Unmodified ($\text{C}$) | **Unmethylated** (`t += 1`) |
 
 *Note: In the Amethyst HDF5 output schema, `t` stores unmethylated counts and `c` stores methylated counts.*
+
+### Bisulfite (BSBolt, single-end)
+
+`--chemistry bisulfite` (or `auto` on a BSBolt BAM) extracts bisulfite / EM-seq libraries, where **unmethylated** C reads as T: the inverse of TAPS. It uses its own strand rule and call table (`bisulfite.py` / `bisulfite.rs`), never the TAPS ones.
+
+| Strand (single-end, BSBolt `YS`) | Reference | Read | Methylation state |
+| :--- | :---: | :---: | :---: |
+| **OT**: flag 0, `YS:Z:W_C2T` | `C` | `C` | **Methylated** (`c += 1`) |
+| **OT**: flag 0, `YS:Z:W_C2T` | `C` | `T` | **Unmethylated** (`t += 1`) |
+| **OB**: flag 16, `YS:Z:C_C2T` | `G` | `G` | **Methylated** |
+| **OB**: flag 16, `YS:Z:C_C2T` | `G` | `A` | **Unmethylated** |
+
+- **Input**: one coordinate-sorted, indexed, deduplicated BSBolt BAM (merge and deduplicate runs first). Directional libraries only (`*_G2A` strands are an error); single-end only.
+- **Defaults** (each applies only if you did not set the option): MAPQ ≥ 10, base quality ≥ 20, 3′ trim 10 bp, 5′ trim 0, no BAQ, supplementary alignments dropped (BSBolt writes them with `bwa -Y`; most are chimeras on the opposite converted strand).
+- **Checks**: every read's `YS` must agree with its flag (the run stops at the first that does not; `--strand-source flag` to skip), and `-f` must be the unconverted genome (a C→T or G→A converted FASTA is refused).
+- **Output**: the usual Amethyst HDF5. `/metadata` attributes in every file record the chemistry, BSBolt version, trims and filters.
+- Design and remaining work (automatic M-bias trimming, pileup-vs-XB report): [`code/bisulfite-extraction-plan.md`](code/bisulfite-extraction-plan.md).
 
 ### BAQ for TAPS
 
