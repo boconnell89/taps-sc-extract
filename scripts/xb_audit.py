@@ -95,26 +95,27 @@ def trim_window(length, reverse, t5, t3):
 STEPS = ["XB as is", "+ supplementary dropped", "+ MAPQ", "+ base quality", "+ trims"]
 
 
-def xb_calls(bam, contigs, args, cells=None):
-    """{step: {ctx: {(cell, pos1): [t, c]}}} for the cumulative filter steps,
-    plus the self-test counters."""
+def xb_calls(bam, fa, contig, start, end, args, st, cells=None):
+    """{step: {ctx: {(cell, pos1): [t, c]}}} for the cumulative filter steps on
+    calls in [start, end) of one contig; adds to the self-test counters `st`.
+    Reads that start before `start` were counted by the previous block."""
     out = {s: {"CG": defaultdict(lambda: [0, 0]), "CH": defaultdict(lambda: [0, 0])} for s in STEPS}
-    st = defaultdict(int)
-    fa = pysam.FastaFile(args.fasta)
-    for contig in contigs:
-        clen = fa.get_reference_length(contig)
-        for read in bam.fetch(contig, args.start, args.end):
+    clen = fa.get_reference_length(contig)
+    first = start == 0
+    if True:
+        for read in bam.fetch(contig, start, end):
             if read.flag & (0x4 | 0x100 | 0x200 | 0x400):
                 continue
+            new = first or read.reference_start >= start
             try:
                 calls = decode_xb(read)
             except ValueError:
-                st["xb length mismatch"] += 1
+                st["xb length mismatch"] += new
                 continue
             if calls is None:
-                st["no XB"] += 1
+                st["no XB"] += new
                 continue
-            st["reads"] += 1
+            st["reads"] += new
             clipped = any(op == 4 for op, _ in read.cigartuples)
             reverse = bool(read.flag & 16)
             cell = read.query_name.split(":", 1)[0]
@@ -128,7 +129,7 @@ def xb_calls(bam, contigs, args, cells=None):
                 if rpos is None:
                     st["letter on an insertion"] += 1
                     continue
-                if args.start is not None and not (args.start <= rpos < args.end):
+                if not (start <= rpos < end):
                     continue
                 # self-test against the reference
                 i = rpos - roff
@@ -155,10 +156,14 @@ def xb_calls(bam, contigs, args, cells=None):
                 for s, step in enumerate(STEPS):
                     if all(keep[: s + 1]):
                         out[step][ctx][key][meth] += 1
-    return out, st
+    return out
 
 
-def h5_calls(path, contexts=("CG", "CH")):
+def h5_contig(path, contig, contexts=("CG", "CH")):
+    """{ctx: {cell: (pos, t, c)}} numpy arrays of one contig's rows. Reads one
+    cell at a time, so memory is one cell's dataset plus the contig's rows."""
+    import numpy as np
+    want = contig.encode()
     got = {}
     with h5py.File(path, "r") as f:
         for ctx in contexts:
@@ -166,29 +171,27 @@ def h5_calls(path, contexts=("CG", "CH")):
             if ctx in f:
                 for bc in f[ctx]:
                     x = f[ctx][bc]["1"][()]
-                    for p, t, c in zip(x["pos"].tolist(), x["t"].tolist(), x["c"].tolist()):
-                        d[(bc, p)] = (t, c)
+                    m = x["chr"] == want
+                    if m.any():
+                        d[bc] = (np.ascontiguousarray(x["pos"][m]), np.ascontiguousarray(x["t"][m]), np.ascontiguousarray(x["c"][m]))
             got[ctx] = d
     return got
 
 
-_ON = {}
+def h5_cells(path):
+    with h5py.File(path, "r") as f:
+        return {bc for ctx in ("CG", "CH") if ctx in f for bc in f[ctx]}
 
 
-def pileup_on(path, contigs, ctx):
-    """(cell, pos) keys of the HDF5 that lie on `contigs` (cached)."""
-    key = (path, tuple(sorted(contigs)), ctx)
-    if key not in _ON:
-        keys = set()
-        with h5py.File(path, "r") as f:
-            if ctx in f:
-                for bc in f[ctx]:
-                    x = f[ctx][bc]["1"][()]
-                    for chrom, p in zip(x["chr"].tolist(), x["pos"].tolist()):
-                        if chrom.decode() in contigs:
-                            keys.add((bc, p))
-        _ON[key] = keys
-    return _ON[key]
+def h5_block(rows, start, end):
+    """{(cell, pos1): (t, c)} for 0-based [start, end) from h5_contig's arrays."""
+    import numpy as np
+    d = {}
+    for bc, (pos, t, c) in rows.items():
+        i, j = np.searchsorted(pos, start + 1), np.searchsorted(pos, end + 1)
+        for p, tt, cc in zip(pos[i:j].tolist(), t[i:j].tolist(), c[i:j].tolist()):
+            d[(bc, p)] = (tt, cc)
+    return d
 
 
 def diff(a, b):
@@ -206,11 +209,13 @@ def totals(d):
     return t, c
 
 
-def per_cell_rate(d):
-    agg = defaultdict(lambda: [0, 0])
+def add_per_cell(agg, d):
     for (cell, _), (t, c) in d.items():
         agg[cell][0] += t
         agg[cell][1] += c
+
+
+def per_cell_rate(agg):
     return {cell: 100.0 * c / (t + c) for cell, (t, c) in agg.items() if t + c}
 
 
@@ -228,22 +233,45 @@ def main():
     ap.add_argument("--trim-3p", type=int, default=10)
     ap.add_argument("-o", "--out-prefix", required=True)
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--block", type=int, default=5_000_000, help="bp compared at a time (bounds memory)")
     ap.add_argument("--all-cells", action="store_true", help="count XB for every barcode, not only the HDF5's cells")
     args = ap.parse_args()
 
     contigs = [c.strip() for c in args.chroms.split(",") if c.strip()]
-    pileup = h5_calls(args.h5)
     cells = None
     if not args.all_cells:
         # Only the cells the extractor kept (e.g. after a complexity cutoff).
-        cells = {bc for ctx in pileup.values() for bc, _ in ctx}
+        cells = h5_cells(args.h5)
         print(f"Restricting XB to the {len(cells):,} cells in {args.h5} (--all-cells to use every barcode)")
+
+    # Compared block by block: only one block's sites are ever held as dicts.
+    st = defaultdict(int)
+    acc = {(step, ctx): [0] * 6 for step in STEPS for ctx in ("CG", "CH")}  # t c only_xb only_pileup differ equal
+    pt = {ctx: [0, 0] for ctx in ("CG", "CH")}
+    cell_xb = {ctx: defaultdict(lambda: [0, 0]) for ctx in ("CG", "CH")}
+    cell_pl = {ctx: defaultdict(lambda: [0, 0]) for ctx in ("CG", "CH")}
+    fa = pysam.FastaFile(args.fasta)
     with pysam.AlignmentFile(args.bam) as bam:
-        steps, st = xb_calls(bam, contigs, args, cells)
-    # Compare only the audited contigs.
-    keep = set(contigs)
-    if args.start is None:
-        pileup = {ctx: {k: v for k, v in d.items() if k in pileup_on(args.h5, keep, ctx)} for ctx, d in pileup.items()}
+        for contig in contigs:
+            clen = fa.get_reference_length(contig)
+            r0 = args.start if args.start is not None else 0
+            r1 = min(args.end, clen) if args.end is not None else clen
+            rows = h5_contig(args.h5, contig)
+            for b0 in range(r0, r1, args.block):
+                b1 = min(b0 + args.block, r1)
+                steps = xb_calls(bam, fa, contig, b0, b1, args, st, cells)
+                for ctx in ("CG", "CH"):
+                    pl = h5_block(rows[ctx], b0, b1)
+                    t, c = totals(pl)
+                    pt[ctx][0] += t
+                    pt[ctx][1] += c
+                    add_per_cell(cell_pl[ctx], pl)
+                    add_per_cell(cell_xb[ctx], steps["XB as is"][ctx])
+                    for step in STEPS:
+                        d = steps[step][ctx]
+                        vals = (*totals(d), *diff(d, pl))
+                        acc[(step, ctx)] = [x + y for x, y in zip(acc[(step, ctx)], vals)]
+                print(f"  {contig}:{b0:,}-{b1:,} done", file=sys.stderr)
 
     print("XB self-test:")
     for k in sorted(st):
@@ -252,12 +280,9 @@ def main():
     rows = []
     print("\nXB calls vs pileup output (sites = cell x position):")
     print(f"  {'step':28s} {'ctx':3s} {'calls t/c':>22s} {'meth %':>7s} {'only XB':>9s} {'only pileup':>11s} {'differ':>8s} {'equal':>9s}")
-    pt = {ctx: totals(pileup[ctx]) for ctx in ("CG", "CH")}
     for step in STEPS:
         for ctx in ("CG", "CH"):
-            d = steps[step][ctx]
-            t, c = totals(d)
-            oa, ob, df, eq = diff(d, pileup[ctx])
+            t, c, oa, ob, df, eq = acc[(step, ctx)]
             rate = 100.0 * c / (t + c) if t + c else 0.0
             rows.append((step, ctx, t, c, rate, oa, ob, df, eq))
             print(f"  {step:28s} {ctx:3s} {t:>10,}/{c:<11,} {rate:7.3f} {oa:9,} {ob:11,} {df:8,} {eq:9,}")
@@ -275,10 +300,10 @@ def main():
     print(f"\nwrote {args.out_prefix}.xb_audit.tsv")
 
     if not args.no_plot:
-        plot(steps, pileup, rows, args.out_prefix)
+        plot(cell_xb, cell_pl, rows, args.out_prefix)
 
 
-def plot(steps, pileup, rows, prefix):
+def plot(cell_xb, cell_pl, rows, prefix):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -287,7 +312,7 @@ def plot(steps, pileup, rows, prefix):
     sns.set_theme(style="whitegrid", context="notebook", font_scale=0.9)
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.6))
     for ax, ctx in zip(axes[:2], ("CG", "CH")):
-        a, b = per_cell_rate(steps["XB as is"][ctx]), per_cell_rate(pileup[ctx])
+        a, b = per_cell_rate(cell_xb[ctx]), per_cell_rate(cell_pl[ctx])
         cells = sorted(set(a) & set(b))
         xs, ys = [a[c] for c in cells], [b[c] for c in cells]
         ax.scatter(xs, ys, s=10, alpha=0.6, color=sns.color_palette("crest")[3], edgecolor="none")

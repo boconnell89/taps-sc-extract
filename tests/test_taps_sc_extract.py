@@ -1279,7 +1279,7 @@ def test_xb_audit_matches_pileup_after_all_filters(bsbolt_bam, tmp_path):
     assert p.returncode == 0, p.stderr[-800:]
     script = os.path.join(os.path.dirname(__file__), "..", "scripts", "xb_audit.py")
     r = subprocess.run([sys.executable, script, "-b", bam, "-f", CHR19_FASTA, "--h5", str(tmp_path / "rs" / "master.h5"),
-                        "-c", "chr19", "-o", str(tmp_path / "audit"), "--no-plot"], capture_output=True, text=True)
+                        "-c", "chr19", "-o", str(tmp_path / "audit"), "--no-plot", "--block", "37000"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-1500:]
     assert "mismatch" not in r.stdout and "length mismatch" not in r.stdout
     rows = [l.split("\t") for l in open(tmp_path / "audit.xb_audit.tsv").read().splitlines()[1:]]
