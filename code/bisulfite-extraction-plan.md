@@ -1,6 +1,6 @@
 # Bisulfite (BSBolt, Ultima SE) extraction in taps-sc-extract — plan
 
-**Status:** final plan, not implemented. Do not test on the pilot BAMs until the other group's `sc-bam-rmdup` has produced merged, deduplicated input. Updated 2026-10-20 with the user's notes (plots as PNG + PDF with a BAM-based prefix, 60 bp plateau floor, pileup-vs-XB report as a headline deliverable, barcode and CHH answers). The TAPS depth cap was raised to 100,000 the same day (§11).
+**Status (2026-10-21):** built and tested on a synthetic BSBolt fixture: chemistry separation and detection, bisulfite strand/call rules, filters and guards, 5′/3′ trims, `--trim auto` with M-bias plots, `scripts/xb_audit.py` (`5425c36`, `7275fc7`, `81fa9ab`, `868fd26`). Waiting for deduplicated data: the filter-impact report (§9), final defaults, frozen bisulfite reference, Amethyst load and performance numbers. Original status: Do not test on the pilot BAMs until the other group's `sc-bam-rmdup` has produced merged, deduplicated input. Updated 2026-10-20 with the user's notes (plots as PNG + PDF with a BAM-based prefix, 60 bp plateau floor, pileup-vs-XB report as a headline deliverable, barcode and CHH answers). The TAPS depth cap was raised to 100,000 the same day (§11).
 **Date:** 2026-10-20.
 **Scope:** extraction only. Merge and deduplication belong to another group (`sc-bam-rmdup --multi`).
 
