@@ -128,7 +128,7 @@
 - The plot shows the curves by length bin, so a length-dependent bias is visible.
 
 **Rule** (a pure function of the integer count table; the same code is unit-tested in Python and Rust):
-1. Positions with fewer than `min_calls = max(500, plateau_n / 100)` calls are "unknown".
+1. Positions with fewer than `min_calls = 500` calls are "unknown" (fixed: scaling it with the CH-dominated plateau made it unreachable for CG on the first real library, 2026-10-21).
 2. A position is biased if |rate − plateau| > max(δ, z·SE), with δ_CG = 2 percentage points and z = 3.
 3. Walk inward from p = 0. While the position is biased, the trim is p + 1. Stop at the first run of W = 3 consecutive positions that are in band or unknown. Interior blips after recovery don't count.
 4. If any of p = 0..4 is unknown while the plateau has enough data, fall back to the chemistry candidate (3′ = 10 for bisulfite SE) and warn.

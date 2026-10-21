@@ -253,8 +253,12 @@ pub struct Chosen {
     pub notes: Vec<String>,
 }
 
-pub fn min_calls(plateau_n: u64) -> u64 {
-    std::env::var("TAPS_MBIAS_MIN_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| (plateau_n / 100).max(500))
+/// Calls a read-end position needs before it can set or stop the trim
+/// (fixed per position and context; `mbias.min_calls_default`).
+pub const MIN_CALLS: u64 = 500;
+
+pub fn min_calls(_plateau_n: u64) -> u64 {
+    std::env::var("TAPS_MBIAS_MIN_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(MIN_CALLS)
 }
 
 /// The rule: per end, the CG walk; CH only if CG lacks data (else a warning

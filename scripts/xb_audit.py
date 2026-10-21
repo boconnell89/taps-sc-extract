@@ -95,7 +95,7 @@ def trim_window(length, reverse, t5, t3):
 STEPS = ["XB as is", "+ supplementary dropped", "+ MAPQ", "+ base quality", "+ trims"]
 
 
-def xb_calls(bam, contigs, args):
+def xb_calls(bam, contigs, args, cells=None):
     """{step: {ctx: {(cell, pos1): [t, c]}}} for the cumulative filter steps,
     plus the self-test counters."""
     out = {s: {"CG": defaultdict(lambda: [0, 0]), "CH": defaultdict(lambda: [0, 0])} for s in STEPS}
@@ -118,6 +118,8 @@ def xb_calls(bam, contigs, args):
             clipped = any(op == 4 for op, _ in read.cigartuples)
             reverse = bool(read.flag & 16)
             cell = read.query_name.split(":", 1)[0]
+            if cells is not None and cell not in cells:
+                continue
             seq, quals = read.query_sequence, read.query_qualities
             lo, hi = trim_window(read.query_length, reverse, args.trim_5p, args.trim_3p)
             ref = fa.fetch(contig, max(0, read.reference_start - 2), min(clen, read.reference_end + 2)).upper()
@@ -170,6 +172,25 @@ def h5_calls(path, contexts=("CG", "CH")):
     return got
 
 
+_ON = {}
+
+
+def pileup_on(path, contigs, ctx):
+    """(cell, pos) keys of the HDF5 that lie on `contigs` (cached)."""
+    key = (path, tuple(sorted(contigs)), ctx)
+    if key not in _ON:
+        keys = set()
+        with h5py.File(path, "r") as f:
+            if ctx in f:
+                for bc in f[ctx]:
+                    x = f[ctx][bc]["1"][()]
+                    for chrom, p in zip(x["chr"].tolist(), x["pos"].tolist()):
+                        if chrom.decode() in contigs:
+                            keys.add((bc, p))
+        _ON[key] = keys
+    return _ON[key]
+
+
 def diff(a, b):
     """Counts of sites only in a, only in b, shared but different, shared equal."""
     only_a = sum(1 for k in a if k not in b)
@@ -207,12 +228,22 @@ def main():
     ap.add_argument("--trim-3p", type=int, default=10)
     ap.add_argument("-o", "--out-prefix", required=True)
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--all-cells", action="store_true", help="count XB for every barcode, not only the HDF5's cells")
     args = ap.parse_args()
 
     contigs = [c.strip() for c in args.chroms.split(",") if c.strip()]
-    with pysam.AlignmentFile(args.bam) as bam:
-        steps, st = xb_calls(bam, contigs, args)
     pileup = h5_calls(args.h5)
+    cells = None
+    if not args.all_cells:
+        # Only the cells the extractor kept (e.g. after a complexity cutoff).
+        cells = {bc for ctx in pileup.values() for bc, _ in ctx}
+        print(f"Restricting XB to the {len(cells):,} cells in {args.h5} (--all-cells to use every barcode)")
+    with pysam.AlignmentFile(args.bam) as bam:
+        steps, st = xb_calls(bam, contigs, args, cells)
+    # Compare only the audited contigs.
+    keep = set(contigs)
+    if args.start is None:
+        pileup = {ctx: {k: v for k, v in d.items() if k in pileup_on(args.h5, keep, ctx)} for ctx, d in pileup.items()}
 
     print("XB self-test:")
     for k in sorted(st):

@@ -32,11 +32,15 @@ FALLBACK_HEAD = 5
 CANDIDATE_3P = {"taps": 0, "bisulfite": 10}
 
 
-def min_calls_default(plateau_n: int) -> int:
+MIN_CALLS = 500
+
+
+def min_calls_default(plateau_n: int = 0) -> int:
+    """Calls a read-end position needs before it can set or stop the trim.
+    Fixed, per position and context: scaling it with the plateau (dominated by
+    CH) made it unreachable for CG on real data."""
     env = os.environ.get("TAPS_MBIAS_MIN_CALLS")
-    if env:
-        return int(env)
-    return max(500, plateau_n // 100)
+    return int(env) if env else MIN_CALLS
 
 
 def length_bin(n: int) -> Optional[int]:
