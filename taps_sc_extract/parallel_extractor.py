@@ -39,10 +39,9 @@ from .calling import (
     pysam_max_depth,
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
-    FLAG_STRAND_MAP,
-    MCTOT_LOOKUP,
-    keep_after_5prime_trim,
+    trim_window,
 )
+from .chemistry import flag_filter, tables
 from .fasta import FastFaiReader
 from .h5_writer import (
     AmethystH5Writer,
@@ -193,6 +192,9 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     n_shards = params.get("n_shards", 1)
     trim_r1 = params.get("trim_r1", DEFAULT_TRIM_R1)
     trim_r2 = params.get("trim_r2", DEFAULT_TRIM_R2)
+    trim_3p = params.get("trim_3p", 0)
+    chemistry = params.get("chemistry", "taps")
+    strand_map, call_table = tables(chemistry)
     contexts = params.get("contexts", ("CG", "CH"))
 
     # Fetch reference sequence with 2bp padding on each side
@@ -221,6 +223,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
         ignore_overlaps=ignore_overlaps,
         min_base_quality=min_base_quality,
         stepper="samtools",
+        flag_filter=flag_filter(chemistry),
         compute_baq=compute_baq,
         ignore_orphans=ignore_orphans,
         max_depth=pysam_max_depth(max_depth),
@@ -277,16 +280,15 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
                 continue
 
             aln = pileupread.alignment
-            strand = FLAG_STRAND_MAP.get(aln.flag)
+            strand = strand_map.get(aln.flag)
             if strand is None:
                 continue
-            if not keep_after_5prime_trim(
-                qpos, aln.query_length, aln.flag, trim_r1, trim_r2
-            ):
+            lo, hi = trim_window(aln.query_length, aln.flag, trim_r1, trim_r2, trim_3p)
+            if qpos < lo or qpos >= hi:
                 continue
 
             read_base = aln.query_sequence[qpos]
-            call = MCTOT_LOOKUP.get((strand, ref_b, read_base))
+            call = call_table.get((strand, ref_b, read_base))
             if call is None:
                 continue
 
@@ -567,6 +569,8 @@ def extract_methylation_parallel(
     trim_r1: int = DEFAULT_TRIM_R1,
     trim_r2: int = DEFAULT_TRIM_R2,
     contexts: Tuple[str, ...] = ("CG", "CH"),
+    chemistry: str = "taps",
+    trim_3p: int = 0,
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -634,7 +638,7 @@ def extract_methylation_parallel(
         f"HDF5 compression: {compression}"
         f"{f' (level {compression_level})' if compression in ('gzip', 'blosc', 'blosc-zstd') else ''}."
     )
-    logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp")
+    logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp; 3' trim: {trim_3p} bp; chemistry: {chemistry}")
 
     worker_params = {
         "decomp_threads": decomp_threads,
@@ -648,6 +652,8 @@ def extract_methylation_parallel(
         "n_shards": effective_shards,
         "trim_r1": trim_r1,
         "trim_r2": trim_r2,
+        "trim_3p": trim_3p,
+        "chemistry": chemistry,
         "contexts": tuple(contexts),
     }
 

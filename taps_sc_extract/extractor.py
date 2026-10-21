@@ -23,10 +23,9 @@ from .calling import (
     pysam_max_depth,
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
-    FLAG_STRAND_MAP,
-    MCTOT_LOOKUP,
-    keep_after_5prime_trim,
+    trim_window,
 )
+from .chemistry import flag_filter, tables
 from .context import classify_context, classify_trinucleotide_context
 from .h5_writer import AmethystH5Writer, METH_DTYPE
 
@@ -60,6 +59,8 @@ def extract_methylation(
     trim_r1: int = DEFAULT_TRIM_R1,
     trim_r2: int = DEFAULT_TRIM_R2,
     contexts: Tuple[str, ...] = ("CG", "CH"),
+    chemistry: str = "taps",
+    trim_3p: int = 0,
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -115,7 +116,8 @@ def extract_methylation(
     total_target_reads = sum(idx_stats.get(c, 0) for c in target_contigs)
 
     logger.info(f"Processing {len(target_contigs)} contig(s) with {total_target_reads:,} total mapped reads.")
-    logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp")
+    logger.info(f"5' trim: R1={trim_r1} bp, R2={trim_r2} bp; 3' trim: {trim_3p} bp; chemistry: {chemistry}")
+    strand_map, call_table = tables(chemistry)
 
     total_stats = {
         "CpG": {"c": 0, "t": 0},
@@ -158,6 +160,7 @@ def extract_methylation(
                 ignore_overlaps=ignore_overlaps,
                 min_base_quality=min_base_quality,
                 stepper="samtools",
+                flag_filter=flag_filter(chemistry),
                 compute_baq=compute_baq,
                 ignore_orphans=ignore_orphans,
                 max_depth=pysam_max_depth(max_depth),
@@ -210,16 +213,15 @@ def extract_methylation(
                         continue
 
                     aln = pileupread.alignment
-                    strand = FLAG_STRAND_MAP.get(aln.flag)
+                    strand = strand_map.get(aln.flag)
                     if strand is None:
                         continue
-                    if not keep_after_5prime_trim(
-                        qpos, aln.query_length, aln.flag, trim_r1, trim_r2
-                    ):
+                    lo, hi = trim_window(aln.query_length, aln.flag, trim_r1, trim_r2, trim_3p)
+                    if qpos < lo or qpos >= hi:
                         continue
 
                     read_base = aln.query_sequence[qpos]
-                    call = MCTOT_LOOKUP.get((strand, ref_b, read_base))
+                    call = call_table.get((strand, ref_b, read_base))
                     if call is None:
                         continue
 

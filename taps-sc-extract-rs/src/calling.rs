@@ -56,6 +56,27 @@ pub fn keep_after_5prime_trim(
     }
 }
 
+/// Kept `[lo, hi)` range of BAM SEQ positions after the sequenced-end trims.
+///
+/// `t5` drops bases from the sequenced 5' end (R2: `trim_r2`, else `trim_r1`)
+/// and `trim_3p` from the sequenced 3' end. Reverse-strand SEQ is reverse-
+/// complemented, so its sequenced 5' end is the high end of SEQ. Lengths
+/// include soft clips (the sequenced read). With `trim_3p = 0` this is exactly
+/// `keep_after_5prime_trim`.
+#[inline]
+pub fn trim_window(query_len: usize, flags: u16, trim_r1: u32, trim_r2: u32, trim_3p: u32) -> (usize, usize) {
+    let t5 = if flags & BAM_FREAD2 != 0 { trim_r2 } else { trim_r1 } as usize;
+    let t3 = trim_3p as usize;
+    if t5 + t3 >= query_len {
+        return (0, 0);
+    }
+    if flags & BAM_FREVERSE != 0 {
+        (t3, query_len - t5)
+    } else {
+        (t5, query_len - t3)
+    }
+}
+
 /// TAPS mC-to-T: 1 = methylated, 0 = unmethylated, None = non-informative.
 ///
 /// OT + ref C: read T meth, read C unmeth.
@@ -75,6 +96,30 @@ pub fn call_mctot(strand: Strand, ref_base: u8, read_base: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_window_matches_5prime_rule_and_adds_3prime() {
+        // With no 3' trim the window is exactly the old 5' rule.
+        for flags in [99u16, 147, 83, 163, 0, 16] {
+            for len in [0usize, 1, 5, 10, 11, 30] {
+                for (r1, r2) in [(0u32, 10u32), (3, 0), (0, 0), (40, 40)] {
+                    let (lo, hi) = trim_window(len, flags, r1, r2, 0);
+                    for q in 0..len {
+                        assert_eq!(q >= lo && q < hi, keep_after_5prime_trim(q, len, flags, r1, r2), "f{flags} l{len} q{q}");
+                    }
+                }
+            }
+        }
+        // SE forward: 5' = low SEQ, 3' = high SEQ. Reverse: the opposite.
+        assert_eq!(trim_window(100, 0, 2, 0, 10), (2, 90));
+        assert_eq!(trim_window(100, 16, 2, 0, 10), (10, 98));
+        // R2 takes its own 5' trim, the 3' trim is shared.
+        assert_eq!(trim_window(100, 163, 2, 7, 10), (7, 90));
+        // Trims that meet or overlap leave nothing (and never underflow).
+        assert_eq!(trim_window(12, 0, 2, 0, 10), (0, 0));
+        assert_eq!(trim_window(5, 16, 0, 0, 10), (0, 0));
+        assert_eq!(trim_window(0, 0, 0, 0, 0), (0, 0));
+    }
 
     #[test]
     fn flag_ot_ob() {

@@ -23,7 +23,7 @@ use crate::accumulate::{ensure_cell, merge_window_cells, BarcodeIntern, CellMaps
 use crate::baq_simd::{self, BaqJob};
 use crate::barcode::barcode_from_qname_bytes;
 use crate::calling::{
-    call_mctot, classify_strand, keep_after_5prime_trim, DEFAULT_TRIM_R1, DEFAULT_TRIM_R2,
+    trim_window, DEFAULT_TRIM_R1, DEFAULT_TRIM_R2,
 };
 use crate::context::{classify_trinucleotide, Context, TriContext};
 use crate::fasta::FastFaiReader;
@@ -228,6 +228,10 @@ pub struct ExtractParams {
     pub profile: bool,
     /// How calls are made (`--caller`).
     pub caller: Caller,
+    /// Conversion chemistry: strand and call rules (`chemistry.rs`).
+    pub chemistry: crate::chemistry::Chemistry,
+    /// Drop this many bases from the sequenced 3' end of every read.
+    pub trim_3p: u32,
 }
 
 /// `--caller`: column pileup (htslib `bam_plp`) or read-centric calling
@@ -260,6 +264,8 @@ impl Default for ExtractParams {
             trim_r2: DEFAULT_TRIM_R2,
             profile: false,
             caller: Caller::Reads,
+            chemistry: crate::chemistry::Chemistry::Taps,
+            trim_3p: 0,
         }
     }
 }
@@ -659,23 +665,18 @@ pub fn process_window(
             if qpos >= seq.len() {
                 continue;
             }
-            if !keep_after_5prime_trim(
-                qpos,
-                seq.len(),
-                rec.flags(),
-                params.trim_r1,
-                params.trim_r2,
-            ) {
+            let (qlo, qhi) = trim_window(seq.len(), rec.flags(), params.trim_r1, params.trim_r2, params.trim_3p);
+            if qpos < qlo || qpos >= qhi {
                 continue;
             }
             let qual = rec.qual().get(qpos).copied().unwrap_or(0);
             if qual < params.min_baseq {
                 continue;
             }
-            let Some(strand) = classify_strand(rec.flags()) else {
+            let Some(strand) = params.chemistry.strand(rec.flags()) else {
                 continue;
             };
-            let Some(call) = call_mctot(strand, ref_b, seq[qpos]) else {
+            let Some(call) = params.chemistry.call(strand, ref_b, seq[qpos]) else {
                 continue;
             };
 
@@ -1078,7 +1079,7 @@ mod tests {
     fn baq_strand_matches_calling_strand() {
         use crate::calling::Strand;
         for flag in [99u16, 147, 83, 163] {
-            let ob = matches!(classify_strand(flag), Some(Strand::Ob));
+            let ob = matches!(crate::calling::classify_strand(flag), Some(Strand::Ob));
             assert_eq!(baq_is_ob(flag), ob, "flag {flag}");
         }
         // Supplementary copies follow their primary's strand; unpaired reads use orientation.

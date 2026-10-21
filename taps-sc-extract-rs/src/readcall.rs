@@ -29,7 +29,7 @@ use rust_htslib::htslib;
 use rustc_hash::FxHashMap;
 
 use crate::accumulate::{ensure_cell, BarcodeIntern, CellMaps};
-use crate::calling::{call_mctot, classify_strand, Strand};
+use crate::calling::{trim_window, Strand};
 use crate::context::{classify_trinucleotide, Context, TriContext};
 
 extern "C" {
@@ -205,7 +205,8 @@ pub struct CallSink {
 /// column callback (`extract::process_window`), applied along the CIGAR.
 pub fn call_read(w: &CallWindow, rec: &Record, out: &mut CallSink) {
     let flags = rec.flags();
-    let Some(strand) = classify_strand(flags) else {
+    let chem = w.params.chemistry;
+    let Some(strand) = chem.strand(flags) else {
         return;
     };
     // OT reads call at reference C, OB reads at reference G.
@@ -217,17 +218,8 @@ pub fn call_read(w: &CallWindow, rec: &Record, out: &mut CallSink) {
     let seq = rec.seq();
     let seq_len = seq.len();
     let qual = rec.qual();
-    // 5' trim (`keep_after_5prime_trim`) as a qpos range.
-    let trim = if flags & htslib::BAM_FREAD2 as u16 != 0 { p.trim_r2 } else { p.trim_r1 } as usize;
-    let (qlo, qhi) = if trim == 0 {
-        (0, seq_len)
-    } else if trim >= seq_len {
-        (0, 0)
-    } else if flags & htslib::BAM_FREVERSE as u16 != 0 {
-        (0, seq_len - trim)
-    } else {
-        (trim, seq_len)
-    };
+    // Sequenced-end trims as a qpos range (`calling::trim_window`).
+    let (qlo, qhi) = trim_window(seq_len, flags, p.trim_r1, p.trim_r2, p.trim_3p);
     let (win_lo, win_hi) = (i64::from(w.win_start), i64::from(w.win_end));
     let mut cell: Option<u32> = None;
     out.cg.clear();
@@ -252,7 +244,7 @@ pub fn call_read(w: &CallWindow, rec: &Record, out: &mut CallSink) {
                     if rb != want || qp >= seq_len || qp < qlo || qp >= qhi || qual[qp] < p.min_baseq {
                         continue;
                     }
-                    let Some(call) = call_mctot(strand, rb, seq[qp]) else {
+                    let Some(call) = chem.call(strand, rb, seq[qp]) else {
                         continue;
                     };
                     let Some(tri) = classify_trinucleotide(w.ref_seq, rel) else {

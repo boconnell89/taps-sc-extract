@@ -10,7 +10,9 @@ mod autotune;
 mod baq_gpu;
 mod baq_simd;
 mod barcode;
+mod bisulfite;
 mod calling;
+mod chemistry;
 mod context;
 mod extract;
 mod extract_noodles;
@@ -574,6 +576,8 @@ fn main() -> Result<()> {
                 trim_r1,
                 trim_r2,
                 profile: false,
+                chemistry: crate::chemistry::Chemistry::Taps,
+                trim_3p: 0,
             };
             eprintln!(
                 "taps-sc-extract-rs stats: pileup={pileup} workers={n_workers} decomp={decomp} baq={} overlaps={ignore_overlaps} orphans={ignore_orphans} trim_r1={trim_r1} trim_r2={trim_r2} {} window(s), contig(s)={:?}, chunk_size_mb={chunk_size_mb}",
@@ -787,6 +791,8 @@ fn main() -> Result<()> {
                 trim_r1,
                 trim_r2,
                 profile: profile_json.is_some(),
+                chemistry: crate::chemistry::Chemistry::Taps,
+                trim_3p: 0,
             };
             eprintln!("======================================================================");
             eprintln!("taps-sc-extract-rs v{}", env!("CARGO_PKG_VERSION"));

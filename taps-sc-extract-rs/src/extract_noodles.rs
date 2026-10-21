@@ -7,7 +7,7 @@
 
 use crate::accumulate::{ensure_cell, merge_window_cells, BarcodeIntern};
 use crate::barcode::barcode_from_qname_bytes;
-use crate::calling::{call_mctot, classify_strand, keep_after_5prime_trim};
+use crate::calling::trim_window;
 use crate::context::{classify_trinucleotide, Context, TriContext};
 use crate::extract::{CallStats, ExtractParams, WindowResult};
 use crate::fasta::FastFaiReader;
@@ -67,7 +67,7 @@ pub fn process_window_noodles(
         let rec = rec.map_err(|e| anyhow::anyhow!("noodles record: {e}"))?;
         let flags = rec.flags();
         let flag_bits = flags.bits();
-        if classify_strand(flag_bits).is_none() {
+        if params.chemistry.strand(flag_bits).is_none() {
             continue;
         }
         let mapq = rec.mapping_quality().map(|m| m.get()).unwrap_or(255);
@@ -94,15 +94,9 @@ pub fn process_window_noodles(
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                     for _ in 0..len {
                         if ref_pos >= win_start && ref_pos < win_end {
-                            if qpos < seq.len()
-                                && keep_after_5prime_trim(
-                                    qpos,
-                                    seq.len(),
-                                    flag_bits,
-                                    params.trim_r1,
-                                    params.trim_r2,
-                                )
-                            {
+                            let (qlo, qhi) =
+                                trim_window(seq.len(), flag_bits, params.trim_r1, params.trim_r2, params.trim_3p);
+                            if qpos < seq.len() && qpos >= qlo && qpos < qhi {
                                 let qb = qual_slice.get(qpos).copied().unwrap_or(0);
                                 if qb >= params.min_baseq {
                                     if let Some(base) = seq.get(qpos) {
@@ -178,10 +172,10 @@ pub fn process_window_noodles(
             _ => Context::Ch,
         };
         for h in hits {
-            let Some(strand) = classify_strand(h.flag) else {
+            let Some(strand) = params.chemistry.strand(h.flag) else {
                 continue;
             };
-            let Some(call) = call_mctot(strand, ref_b, h.read_base) else {
+            let Some(call) = params.chemistry.call(strand, ref_b, h.read_base) else {
                 continue;
             };
             let bc_bytes = barcode_from_qname_bytes(&h.qname);

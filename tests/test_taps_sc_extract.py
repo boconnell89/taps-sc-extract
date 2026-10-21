@@ -1070,3 +1070,34 @@ def test_test_mode_needs_no_dataset_and_builds_tune_command():
         parse_args(["--test", "-b", "in.bam"])  # -f missing
     with pytest.raises(SystemExit):
         parse_args(["-b", "in.bam", "-f", "ref.fa"])  # -o missing outside --test
+
+
+def test_trim_window_matches_5prime_rule_and_adds_3prime():
+    from taps_sc_extract.calling import trim_window
+
+    for flag in (99, 147, 83, 163, 0, 16):
+        for length in (0, 1, 5, 10, 11, 30):
+            for r1, r2 in ((0, 10), (3, 0), (0, 0), (40, 40)):
+                lo, hi = trim_window(length, flag, r1, r2, 0)
+                for q in range(length):
+                    assert (lo <= q < hi) == keep_after_5prime_trim(q, length, flag, r1, r2)
+    assert trim_window(100, 0, 2, 0, 10) == (2, 90)    # SE forward: 3' is high SEQ
+    assert trim_window(100, 16, 2, 0, 10) == (10, 98)  # SE reverse: 3' is low SEQ
+    assert trim_window(100, 163, 2, 7, 10) == (7, 90)  # R2 keeps its own 5' trim
+    assert trim_window(12, 0, 2, 0, 10) == (0, 0)      # trims meet: nothing kept
+
+
+def test_bisulfite_tables_are_separate_and_inverse():
+    from taps_sc_extract.bisulfite import call_bisulfite, classify_strand as bs_strand
+    from taps_sc_extract.calling import call_mctot, classify_strand
+    from taps_sc_extract.chemistry import flag_filter, tables
+
+    for s, r, b in (("OT", "C", "C"), ("OT", "C", "T"), ("OB", "G", "G"), ("OB", "G", "A")):
+        assert call_bisulfite(s, r, b) == 1 - call_mctot(s, r, b)
+    assert call_bisulfite("OT", "C", "N") is None and call_bisulfite("OT", "G", "G") is None
+    assert bs_strand(0) == "OT" and bs_strand(16) == "OB"
+    for f in (99, 147, 83, 163, 2048, 2064, 256, 4):
+        assert bs_strand(f) is None
+    assert classify_strand(0) is None and classify_strand(16) is None  # TAPS unchanged
+    assert tables("taps")[0] is not tables("bisulfite")[0]
+    assert flag_filter("taps") == 0x704 and flag_filter("bisulfite") == 0x704 | 0x800

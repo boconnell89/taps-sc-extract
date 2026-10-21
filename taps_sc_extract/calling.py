@@ -89,6 +89,24 @@ def keep_after_5prime_trim(
     return qpos >= trim
 
 
+def trim_window(query_length: int, flag: int, trim_r1: int, trim_r2: int, trim_3p: int = 0):
+    """Kept ``[lo, hi)`` range of BAM SEQ positions after the sequenced-end trims.
+
+    The 5' trim is ``trim_r2`` for R2 and ``trim_r1`` otherwise; ``trim_3p``
+    drops bases from the sequenced 3' end. Reverse-strand SEQ is reverse-
+    complemented, so its sequenced 5' end is the high end of SEQ. Lengths
+    include soft clips. With ``trim_3p == 0`` this is exactly
+    ``keep_after_5prime_trim``.
+    """
+    t5 = trim_r2 if (flag & BAM_FREAD2) else trim_r1
+    t3 = trim_3p
+    if t5 + t3 >= query_length:
+        return 0, 0
+    if flag & BAM_FREVERSE:
+        return t3, query_length - t5
+    return t5, query_length - t3
+
+
 def call_mctot(strand: str, ref_base: str, read_base: str) -> Optional[int]:
     """
     Evaluate TAPS (mCtoT) methylation status for a single base call.
