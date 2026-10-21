@@ -578,3 +578,24 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   - the mm10 test BAM gives the old 21 contigs in the old order;
   - end to end, a chr19 slice reheadered with Ensembl names (`1`, `10`, ..., `MT`) gives `19 autosomes + X, Y` in natural order in both engines.
 - Full test BAM with the defaults: same 21 contigs, CpG 22,263,688 / 31,087,996, unchanged.
+
+## 2026-10-20 — `--max-depth` default 250 → 100000; 0 = unlimited
+
+- The cap counts all cells together at a position. In single-cell data that is about the number of cells covering a site, so 250 dropped reads at well-covered loci.
+- Full test BAM (`-t 32 --shards 16`, memory mode):
+
+  | | Cap 250 | Cap 100,000 | Unlimited |
+  |---|---|---|---|
+  | Reads dropped | 805,351 | 0 | 0 |
+  | CpG calls | 31.09M (71.62%) | 32.19M (+3.5%, 71.47%) | identical to 100,000, per cell |
+  | CH calls | | +1% | |
+  | Cell × context datasets | 14,674 | 14,678 | |
+  | End to end, one run each | 2.68M reads/s | 2.52M reads/s | |
+
+  The extra reads at deep loci cost about 6% end to end.
+- `--max-depth 0` = unlimited, remapped before use:
+  - Rust: `extract::effective_max_depth` maps 0 or anything above `i32::MAX` to `i32::MAX` (htslib takes a signed int; `u32::MAX` would be −1, and `ReadPileup` would drop on 0).
+  - Python: `calling.pysam_max_depth`. pysam skips `bam_mplp_set_maxcnt` for 0, which leaves htslib's own 8000.
+  - The noodles stats path uses the same remap.
+- The frozen chr19 references were made at 250. Tests against them now pin `--max-depth 250` (`FROZEN_MAX_DEPTH`). The Python-parity tests run both engines at 100000.
+- New tests: on chr19 the default equals unlimited; unit tests for both remaps.

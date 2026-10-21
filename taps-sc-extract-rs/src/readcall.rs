@@ -66,14 +66,14 @@ pub struct ReadPileup {
 }
 
 impl ReadPileup {
-    pub fn new(max_depth: u32, overlaps: bool) -> Self {
+    pub fn new(max_depth: i32, overlaps: bool) -> Self {
         ReadPileup {
             slab: Vec::new(),
             free: Vec::new(),
             live: BinaryHeap::new(),
             olap: FxHashMap::default(),
             overlaps,
-            max_depth: max_depth as usize,
+            max_depth: max_depth.max(0) as usize,
             pos: 0,
             first: true,
             dropped: 0,

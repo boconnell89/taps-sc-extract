@@ -246,7 +246,7 @@ impl Default for ExtractParams {
         Self {
             min_baseq: 20,
             min_mapq: 0,
-            max_depth: 250,
+            max_depth: DEFAULT_MAX_DEPTH,
             ignore_overlaps: true,
             ignore_orphans: true,
             compute_baq: true,
@@ -470,6 +470,22 @@ const FLAG_FILTER: u16 = (htslib::BAM_FUNMAP
     | htslib::BAM_FQCFAIL
     | htslib::BAM_FDUP) as u16;
 
+/// Default `--max-depth`: htslib's per-position read cap, counted across all
+/// cells. Single-cell depth at a site is roughly the number of cells covering
+/// it, so 250 dropped whole cells at well-covered loci (805k reads on the
+/// test BAM); 100,000 only guards against pathological repeats.
+pub const DEFAULT_MAX_DEPTH: u32 = 100_000;
+
+/// The cap passed to htslib / `ReadPileup`: 0 means unlimited. htslib takes a
+/// signed int and treats a negative cap as "drop", so never pass `u32::MAX`.
+pub fn effective_max_depth(max_depth: u32) -> i32 {
+    if max_depth == 0 || max_depth > i32::MAX as u32 {
+        i32::MAX
+    } else {
+        max_depth as i32
+    }
+}
+
 /// Records read, filtered and BAQ'd together before they are pushed in order.
 /// Large enough that most reads find same-shape partners for the SIMD lanes
 /// (chr19 at the default skip: ~92% of 4-lane slots filled at 8,192).
@@ -577,7 +593,7 @@ pub fn process_window(
     }
     let _guard = PlpGuard(plp);
     unsafe {
-        htslib::bam_plp_set_maxcnt(plp, params.max_depth as i32);
+        htslib::bam_plp_set_maxcnt(plp, effective_max_depth(params.max_depth));
         if params.ignore_overlaps && bam_plp_init_overlaps(plp) < 0 {
             anyhow::bail!("bam_plp_init_overlaps failed");
         }
@@ -588,7 +604,7 @@ pub fn process_window(
     let mut cells: Vec<CellMaps> = Vec::new();
     // Read-centric calling (`--caller reads`): same calls, no columns.
     let read_mode = params.caller == Caller::Reads;
-    let mut rp = crate::readcall::ReadPileup::new(params.max_depth, params.ignore_overlaps);
+    let mut rp = crate::readcall::ReadPileup::new(effective_max_depth(params.max_depth), params.ignore_overlaps);
     let cw = crate::readcall::CallWindow {
         ref_seq: &ref_seq,
         ref_start,
@@ -1049,6 +1065,14 @@ pub fn extract_windows_to_temp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_depth_zero_is_unlimited_and_never_negative() {
+        assert_eq!(effective_max_depth(0), i32::MAX);
+        assert_eq!(effective_max_depth(250), 250);
+        assert_eq!(effective_max_depth(u32::MAX), i32::MAX);
+        assert_eq!(DEFAULT_MAX_DEPTH, 100_000);
+    }
 
     #[test]
     fn baq_strand_matches_calling_strand() {

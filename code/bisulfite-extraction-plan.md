@@ -1,6 +1,6 @@
 # Bisulfite (BSBolt, Ultima SE) extraction in taps-sc-extract — plan
 
-**Status:** final plan, not implemented. Do not test on the pilot BAMs until the other group's `sc-bam-rmdup` has produced merged, deduplicated input.
+**Status:** final plan, not implemented. Do not test on the pilot BAMs until the other group's `sc-bam-rmdup` has produced merged, deduplicated input. Updated 2026-10-20 with the user's notes (plots as PNG + PDF with a BAM-based prefix, 60 bp plateau floor, pileup-vs-XB report as a headline deliverable, barcode and CHH answers). The TAPS depth cap was raised to 100,000 the same day (§11).
 **Date:** 2026-10-20.
 **Scope:** extraction only. Merge and deduplication belong to another group (`sc-bam-rmdup --multi`).
 
@@ -39,7 +39,7 @@
 - mm10 chr1 is N for its first 3 Mb.
 - `/mnt/e/refs/mm10/BSB_ref.fa` on this host is the unconverted genome despite its name.
 
-**Pilot M-bias** (not deduplicated). Reads ≥60 bp, SEQ coordinates, Q≥20:
+**Pilot M-bias** (not deduplicated). The samples are developing mouse brain, so real non-CpG methylation is plausible and CH is treated as signal, not a conversion failure. Reads ≥60 bp, SEQ coordinates, Q≥20:
 - The 5′ end is flat.
 - At the 3′ end, CG falls to 55–70% over the last ~5 bases and is back at the 82% plateau by 5 bp.
 - CH is 4.85–5.6% overall, with a 3′ dip extending to ~11 bp.
@@ -80,10 +80,9 @@
   - TAPS is unchanged: there, supplementary reads are uncalled but occupy cap slots, and changing that would move the frozen references.
 - **[candidate] `--min-mapq 10`.** Drops MAPQ 0 (bisulfite-ambiguous) and 1–9 (2.3%).
 - **[candidate] `--min-baseq 20`.** Ultima bins mean 20 ≡ 21–24: it keeps Q25 and Q35 (88%).
-- **[candidate] `--max-depth 100000`** for bisulfite: a safety cap for satellite repeats. With `--expected-cells N`, the default is `max(100000, 2N)`.
+- **`--max-depth 100000`** (the default for both chemistries since 2026-10-20; see §11): a safety cap for satellite repeats. With `--expected-cells N`, the default is `max(100000, 2N)`.
   - `--max-depth 0` = unlimited: remapped to `i32::MAX` before `bam_plp_set_maxcnt`, `ReadPileup::new` and `pysam.pileup(max_depth=…)`. Values above `i32::MAX` are clamped. Never pass 0 to pysam or `u32::MAX` to htslib.
   - Reads dropped by the cap are printed. Rust `--caller reads` counts them already. The column caller and Python gain the same count (the same-start/live test before push) or are documented as not counting.
-  - TAPS keeps 250 (§11).
 - **Chemistry-dependent defaults fill in only flags the user didn't set.**
   - The Python wrapper omits unset flags from the Rust command (`option_was_set`, extended to `--max-depth`, `--min-mapq`, `--min-baseq`, the trims and BAQ). Today it always forwards the TAPS argparse defaults.
   - Rust fills bisulfite defaults when clap's value source isn't the command line.
@@ -120,7 +119,7 @@
 
 **Variable read lengths (the normalization):**
 - End curves count a position only on reads with `len ≥ 2P` (≥ 40 bp). That way a short read's 3′ artifact can't appear in the 5′ curve, or the reverse.
-- The plateau comes from positions ≥P from both ends of reads ≥ 80 bp, kept separate for CG and CH (never pooled).
+- The plateau comes from positions ≥P from both ends of reads ≥ 60 bp, so short trimmed Illumina libraries still have a plateau. It is kept separate for CG and CH (never pooled). If fewer than `min_calls` plateau calls exist, auto falls back to the chemistry candidate trims with a warning.
 - The trim is a fixed base count applied to every read, short reads included, because end-repair artifacts sit at fixed distances from the read end.
 - The plot shows the curves by length bin, so a length-dependent bias is visible.
 
@@ -136,8 +135,10 @@
 
 **Outputs**
 - **Log:** the chosen trims, the reason (biased positions, plateau, n), and any warnings.
-- **`mbias.tsv`:** the full count table. It goes inside the shard directory, or beside a single-file output as `<file>.mbias.tsv`. Python and Rust must write identical tables for the same BAM.
-- **`mbias.svg`:** CG and CH methylation by position from each end, by length bin, with the plateau band (±δ), unknown positions greyed, and the chosen trims marked. Written by a dependency-free SVG writer in each engine (Rust hand-writes the SVG; Python the same, not matplotlib, so the plot never depends on optional packages). A static PNG isn't required.
+- **Files**, named `<prefix>.mbias.tsv`, `<prefix>.mbias.png` and `<prefix>.mbias.pdf`, where `<prefix>` is the BAM file name without `.bam`/`.cram`/`.sam` (e.g. `sample.dedup.mbias.png`). They go in the shard directory, or beside a single-file output.
+  - **`.tsv`:** the full count table. Python and Rust must write identical tables for the same BAM.
+  - **`.png` / `.pdf`** (same figure): CG and CH methylation by position from the 5′ and 3′ ends, one line per read-length bin plus all reads ≥ 40 bp. The plateau and its ±δ band are shown, unknown positions greyed, the chosen trims marked as vertical lines, and the trims and sample size in the title.
+  - **Rendering:** `taps_sc_extract/mbias_plot.py` (matplotlib, added as a dependency) draws the figure from the `.tsv`. The CLI calls it after either engine. The Rust binary, run directly, writes the `.tsv` and calls `python3 -m taps_sc_extract.mbias_plot <tsv>` if that module is importable; otherwise it prints the command to run.
 - **HDF5 root attributes:** `trim_5p`, `trim_3p`, `trim_mode=auto|manual`.
 
 **Tests**
@@ -169,7 +170,7 @@
   - abort if `min(C, G) / ACGT < 0.05`. Unconverted ≈ 0.19; a C→T or G→A converted FASTA ≈ 0.
   - Filenames are not judged: this host's `BSB_ref.fa` is unconverted and passes.
 - **Contigs:** header-based primary detection (done): chr1..19, X, Y; chrM only via `--chroms`.
-- **Barcode:** QNAME prefix before the first `:` (`Z0007-ACGAGCCGAA-TTGGACTC`). Complexity file: column 2 = barcode, column 4 = unique reads. Both pending user confirmation (§12).
+- **Barcode:** QNAME prefix before the first `:` (`Z0007-ACGAGCCGAA-TTGGACTC`), the same string the complexity file uses (confirmed: column 2 = barcode, column 4 = unique reads).
 
 ## 8. XB audit (`scripts/xb_audit.py`, Python; not part of the engines)
 
@@ -180,7 +181,14 @@
   - Pileup settings: `--min-mapq 0 --min-baseq 0`, no trims, `--no-baq`, `--max-depth 0`, supplementary excluded on both sides.
   - Comparison: `(barcode, chr, 1-based pos, t, c)` in `/CG` and `/CH`, which must be identical. CNG with an N in the middle is CHG in XB and CHH here, but both are `/CH`.
   - Whole-contig runs keep one residual class: reads at contig edges that BSBolt couldn't pad.
-- **(c) Delta to the current pipeline:** compare per cell and per site against the user's current extractor's output on the same region (or against Claude's correct XB decoder until that's found). Split differences by cause: positioning, supplementary, MAPQ, base quality, trims, soft-clip bug.
+- **(c) Pileup vs XB calling: a headline deliverable.** The user needs to see how much the reference pileup at production settings changes results compared with XB calling. Compare against Claude's correct XB decoder; the user's own XB extractor can be added later.
+  - **Inputs:** a deduplicated chromosome (or the whole BAM) run both ways, cells matched by barcode.
+  - **Report:**
+    - totals and per-cell CG and CH calls, and CG %/CH % (scatter and correlation per cell);
+    - the fraction of sites present in only one method;
+    - at shared sites, the fraction with different (t, c);
+    - every difference attributed to a cause: trims, base quality, MAPQ, supplementary, soft-clip bug, context classification, other. Attribution works by toggling one setting at a time from the no-filter oracle setting.
+  - **Outputs:** a TSV and a PNG/PDF summary with the same naming prefix.
 
 ## 9. Filter-impact report (`scripts/bs_filter_report.py`) and freeze gate
 
@@ -198,7 +206,7 @@
 1. Chemistry modules and separation, bisulfite SE strand with YS verification, bisulfite flag filter, trim window, depth remap, chemistry-dependent defaults (wrapper and engines), chemistry detection and HDF5 attributes. Python first, then Rust, at `--no-baq`, with unit tests (each item in §2–§5).
 2. `scripts/xb_audit.py` (a, b) on a deduplicated slice.
 3. Reference and library guards; drop counters.
-4. `--trim auto`: sampler, count table, pure rule, `mbias.tsv`, `mbias.svg`, attributes. Python and Rust; table and trim parity tests.
+4. `--trim auto`: sampler, count table, pure rule, `<prefix>.mbias.tsv`, PNG and PDF plots, attributes. Python and Rust; table and trim parity tests.
 5. Filter-impact report on deduplicated data → finalize defaults → freeze the bisulfite reference.
 6. Parity:
    - Python vs Rust per cell (`--no-baq`);
@@ -209,15 +217,19 @@
 ## 11. Non-goals and separate TAPS questions
 
 - **Non-goals (v1):** production XB engine; multi-BAM input; PE or non-directional bisulfite; `XG`; XC/YC read filters; custom bisulfite BAQ.
-- **TAPS questions to raise separately:**
-  - TAPS `--max-depth 250` (across cells; drops 805k reads on the TAPS test BAM);
-  - TAPS supplementary reads occupying cap slots;
+- **Done for TAPS (2026-10-20):** `--max-depth` default raised from 250 to 100,000 in both engines, and `--max-depth 0` = unlimited, remapped safely. The cap is counted across all cells at a position.
+  - On the TAPS test BAM the old cap dropped 805,351 reads. At 100,000 none are dropped, and the output is identical to unlimited.
+  - CpG calls +3.5% (31.09M → 32.19M), CH +1%, 2 more cell × context datasets; CpG 71.62% → 71.47%.
+  - About 6% slower end to end.
+- **Still open for TAPS:**
+  - supplementary reads occupying cap slots (irrelevant at 100,000);
   - making `--trim auto` the TAPS default, which would check its fixed R2 5′ trim of 10 but changes TAPS output.
 
 ## 12. Open questions for the user
+1. The user's current XB extractor: later. The pileup-vs-XB report (§8c) uses Claude's XB decoder meanwhile.
 
-1. The current XB extractor (the 2022 sciMETv2 script can't parse these files), for the audit's delta report.
-2. Is `Z####` part of the cell identity?
-3. Is 4.85% CHH expected (EM-seq vs bisulfite, tissue)? This also decides how much weight CH M-bias gets.
-4. Will rmdup's complexity file use the same barcode string and columns (2 = barcode, 4 = unique reads)?
-5. FYI for the rmdup group: the SE molecule key `(barcode, chrom, pos, TLEN)` has TLEN = 0, and for reverse-strand reads `pos` is the leftmost aligned base, not the molecule's 5′ end.
+Answered 2026-10-20:
+- the barcode is the full QNAME prefix, the same as the complexity file;
+- the complexity file is unchanged;
+- CHH: developing mouse brain, so non-CpG methylation is plausible;
+- the rmdup SE key issue is already handled by that group.

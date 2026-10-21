@@ -117,7 +117,8 @@ enum Commands {
         min_baseq: u8,
         #[arg(long, default_value_t = 0)]
         min_mapq: u8,
-        #[arg(long, default_value_t = 250)]
+        /// Maximum reads per position, all cells together (htslib cap); 0 = unlimited.
+        #[arg(long, default_value_t = extract::DEFAULT_MAX_DEPTH)]
         max_depth: u32,
         /// Do not clip overlapping mate bases (`bam_mplp_init_overlaps`).
         #[arg(long, default_value_t = false)]
@@ -240,7 +241,8 @@ enum Commands {
         min_baseq: u8,
         #[arg(long, default_value_t = 0)]
         min_mapq: u8,
-        #[arg(long, default_value_t = 250)]
+        /// Maximum reads per position, all cells together (htslib cap); 0 = unlimited.
+        #[arg(long, default_value_t = extract::DEFAULT_MAX_DEPTH)]
         max_depth: u32,
         #[arg(long, default_value_t = false)]
         no_overlap_clip: bool,

@@ -396,6 +396,9 @@ CHR19_FASTA = "/mnt/e/refs/mm10/mm10.fa"
 CHR19_RUST_REFERENCE = "/mnt/e/sciMET_TAPS/test_chr19_rust_tapsskip_2026-10-16/chr19.h5"
 CHR19_RUST_REFERENCE_TAPS_FULL = "/mnt/e/sciMET_TAPS/test_chr19_rust_tapsbaq_2026-10-16/chr19.h5"
 CHR19_RUST_REFERENCE_HTSLIB = "/mnt/e/sciMET_TAPS/test_chr19_rust_overlapfix_2026-10-15/chr19.h5"
+# The frozen references were made with the old --max-depth default of 250; the
+# default is now 100000 (0 = unlimited). Runs compared against them pin 250.
+FROZEN_MAX_DEPTH = "250"
 
 
 def _require(*paths):
@@ -419,7 +422,11 @@ def chr19_python_run(tmp_path_factory):
 
 
 def _run_rust_chr19(out_h5, *extra):
+    """Rust on chr19. Unless `extra` sets --max-depth, pins the frozen references' 250."""
     import subprocess
+
+    if "--max-depth" not in extra:
+        extra = (*extra, "--max-depth", FROZEN_MAX_DEPTH)
     from taps_sc_extract.cli import find_rust_binary
 
     rust_bin = find_rust_binary()
@@ -498,6 +505,24 @@ def test_chr19_real_bam_smoke_rust(tmp_path):
     _assert_same_sites(CHR19_RUST_REFERENCE, out_h5)
 
 
+def test_chr19_rust_default_depth_cap_is_unlimited_here(tmp_path):
+    """The default --max-depth (100000) never binds on chr19: it equals --max-depth 0
+    (unlimited), and 0 is not passed to htslib as a cap of 0."""
+    _require(CHR19_BAM, CHR19_FASTA)
+    a, b = tmp_path / "default.h5", tmp_path / "unlimited.h5"
+    _run_rust_chr19(a, "--no-baq", "--max-depth", "100000")
+    _run_rust_chr19(b, "--no-baq", "--max-depth", "0")
+    _assert_same_sites(a, b)
+
+
+def test_pysam_max_depth_remap():
+    from taps_sc_extract.calling import pysam_max_depth
+
+    assert pysam_max_depth(0) == 2**31 - 1
+    assert pysam_max_depth(250) == 250
+    assert pysam_max_depth(2**40) == 2**31 - 1
+
+
 def test_chr19_rust_taps_full_baq_unchanged(tmp_path):
     """--baq taps-full (HMM on every read) gives its frozen reference."""
     _require(CHR19_BAM, CHR19_FASTA, CHR19_RUST_REFERENCE_TAPS_FULL)
@@ -562,7 +587,7 @@ def test_chr19_rust_matches_python_per_cell(chr19_python_run, tmp_path):
     """
     py_h5, _ = chr19_python_run
     rs_h5 = tmp_path / "chr19_rust_nobaq.h5"
-    _run_rust_chr19(rs_h5, "--no-baq")
+    _run_rust_chr19(rs_h5, "--no-baq", "--max-depth", "100000")
 
     for ctx in ("CG", "CH"):
         py_cells, py_tot = _sites_by_cell(py_h5, ctx)
@@ -794,7 +819,7 @@ def test_chr19_rust_complexity_filter_matches_python(chr19_python_run, tmp_path)
     cutoff = _complexity_from_reference(CHR19_RUST_REFERENCE, cx)
     keep, _ = parse_complexity(str(cx), cutoff, None)
     rs_h5 = tmp_path / "chr19_filtered_nobaq.h5"
-    _run_rust_chr19(rs_h5, "--no-baq", "--complexity", str(cx), "--min-complexity", str(cutoff))
+    _run_rust_chr19(rs_h5, "--no-baq", "--max-depth", "100000", "--complexity", str(cx), "--min-complexity", str(cutoff))
     for ctx in ("CG", "CH"):
         py_cells, _ = _sites_by_cell(py_h5, ctx)
         rs_cells, _ = _sites_by_cell(rs_h5, ctx)

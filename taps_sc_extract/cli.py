@@ -218,8 +218,10 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=250,
-        help="Maximum pileup depth (default: 250).",
+        default=100000,
+        help="Maximum reads per position, all cells together (htslib pileup cap; "
+        "default: 100000; 0 = unlimited). Single-cell depth at a site is about the number of "
+        "cells covering it, so a low cap drops whole cells at well-covered loci.",
     )
     parser.add_argument(
         "--no-baq",

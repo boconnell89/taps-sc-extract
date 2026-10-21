@@ -45,6 +45,15 @@ MCTOT_LOOKUP = {
 }
 
 
+def pysam_max_depth(max_depth: int) -> int:
+    """`--max-depth` for pysam's pileup: 0 (or anything out of int range) means
+    unlimited. pysam skips `bam_mplp_set_maxcnt` when max_depth is 0, which
+    silently leaves htslib's own cap of 8000, so pass INT_MAX instead."""
+    if max_depth <= 0 or max_depth > 2**31 - 1:
+        return 2**31 - 1
+    return max_depth
+
+
 def classify_strand(flag: int) -> Optional[str]:
     """
     Classify a SAM alignment flag into Original Top ('OT'), Original Bottom ('OB'), or None.

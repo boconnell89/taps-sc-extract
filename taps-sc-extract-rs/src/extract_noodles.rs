@@ -139,8 +139,9 @@ pub fn process_window_noodles(
     positions.sort_unstable();
     for pos in positions {
         let mut hits = columns.remove(&pos).unwrap_or_default();
-        if hits.len() > params.max_depth as usize {
-            hits.truncate(params.max_depth as usize);
+        let cap = crate::extract::effective_max_depth(params.max_depth) as usize;
+        if hits.len() > cap {
+            hits.truncate(cap);
         }
         if params.ignore_overlaps && hits.len() > 1 {
             let mut best: HashMap<Vec<u8>, usize> = HashMap::new();

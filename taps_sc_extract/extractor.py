@@ -20,6 +20,7 @@ from .contigs import describe_primary, primary_contigs
 from .barcode import extract_barcode, load_cell_filter
 from .inputs import prepare_alignment
 from .calling import (
+    pysam_max_depth,
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
     FLAG_STRAND_MAP,
@@ -52,7 +53,7 @@ def extract_methylation(
     max_complexity: Optional[float] = None,
     min_base_quality: int = 20,
     min_mapq: int = 0,
-    max_depth: int = 250,
+    max_depth: int = 100000,
     compute_baq: bool = True,
     ignore_orphans: bool = True,
     ignore_overlaps: bool = True,
@@ -74,7 +75,7 @@ def extract_methylation(
             (column 4) is within these bounds (inclusive).
         min_base_quality: Minimum base quality for pileup (default 20).
         min_mapq: Minimum mapping quality (default 0).
-        max_depth: Maximum pileup depth (default 250).
+        max_depth: Maximum reads per position, all cells together (default 100000; 0 = unlimited).
         compute_baq: Whether to compute Base Alignment Quality (default True).
         ignore_orphans: Whether to ignore unpaired reads (default True).
         ignore_overlaps: Whether to skip overlapping mate bases (default True).
@@ -159,7 +160,7 @@ def extract_methylation(
                 stepper="samtools",
                 compute_baq=compute_baq,
                 ignore_orphans=ignore_orphans,
-                max_depth=max_depth,
+                max_depth=pysam_max_depth(max_depth),
                 min_mapping_quality=min_mapq,
             )
 

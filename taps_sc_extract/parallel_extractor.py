@@ -36,6 +36,7 @@ from .contigs import describe_primary, primary_contigs
 from .barcode import load_cell_filter
 from .inputs import AlignmentSource, prepare_alignment
 from .calling import (
+    pysam_max_depth,
     DEFAULT_TRIM_R1,
     DEFAULT_TRIM_R2,
     FLAG_STRAND_MAP,
@@ -222,7 +223,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
         stepper="samtools",
         compute_baq=compute_baq,
         ignore_orphans=ignore_orphans,
-        max_depth=max_depth,
+        max_depth=pysam_max_depth(max_depth),
         min_mapping_quality=min_mapq,
     )
 
@@ -559,7 +560,7 @@ def extract_methylation_parallel(
     max_writer_threads: Optional[int] = 6,
     min_base_quality: int = 20,
     min_mapq: int = 0,
-    max_depth: int = 250,
+    max_depth: int = 100000,
     compute_baq: bool = True,
     ignore_orphans: bool = True,
     ignore_overlaps: bool = True,
