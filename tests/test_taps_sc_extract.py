@@ -1265,3 +1265,25 @@ def test_bisulfite_guards(bsbolt_bam, tmp_path):
     assert p.returncode != 0 and "disagree" in p.stderr
     p = _rust_bs(bad, tmp_path / "g", "--strand-source", "flag")
     assert p.returncode == 0, p.stderr[-800:]
+
+
+def test_xb_audit_matches_pileup_after_all_filters(bsbolt_bam, tmp_path):
+    """scripts/xb_audit.py: XB decodes cleanly and, with the extractor's
+    filters added, equals the pileup output exactly (the fixture's XB has no
+    soft-clip bug)."""
+    import subprocess
+    import sys
+
+    bam, _ = bsbolt_bam
+    p = _rust_bs(bam, tmp_path / "rs")
+    assert p.returncode == 0, p.stderr[-800:]
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "xb_audit.py")
+    r = subprocess.run([sys.executable, script, "-b", bam, "-f", CHR19_FASTA, "--h5", str(tmp_path / "rs" / "master.h5"),
+                        "-c", "chr19", "-o", str(tmp_path / "audit"), "--no-plot"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-1500:]
+    assert "mismatch" not in r.stdout and "length mismatch" not in r.stdout
+    rows = [l.split("\t") for l in open(tmp_path / "audit.xb_audit.tsv").read().splitlines()[1:]]
+    final = [row for row in rows if row[0] == "+ trims"]
+    assert len(final) == 2 and all(row[5:9] == ["0", "0", "0", row[8]] and int(row[8]) > 0 for row in final)
+    first = [row for row in rows if row[0] == "XB as is"]
+    assert any(int(row[5]) > 0 for row in first)  # unfiltered XB really differs
