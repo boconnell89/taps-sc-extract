@@ -1168,7 +1168,7 @@ def test_bisulfite_rust_defaults_match_truth(bsbolt_bam, tmp_path):
     """Auto-detected bisulfite with its defaults (MAPQ >= 10, base quality >= 20,
     3' trim 10, supplementary dropped) gives exactly the generator's calls."""
     bam, truth = bsbolt_bam
-    p = _rust_bs(bam, tmp_path / "rs")
+    p = _rust_bs(bam, tmp_path / "rs", "--trim", "manual")
     assert p.returncode == 0, p.stderr[-2000:]
     assert "Chemistry:       bisulfite (detected from the BAM; BSBolt 1.2.1)" in p.stderr
     got = _calls_of(tmp_path / "rs" / "master.h5")
@@ -1222,7 +1222,7 @@ def test_bisulfite_python_matches_truth(bsbolt_bam, tmp_path):
     bam, truth = bsbolt_bam
     out = tmp_path / "py"
     rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19", "-t", "2",
-                   "--shards", "2", "--engine", "python"])
+                   "--shards", "2", "--engine", "python", "--trim", "manual"])
     assert rc == 0
     got = _calls_of(out / "master.h5")
     want = _expected(truth, min_mapq=10, min_baseq=20, trim_5p=0, trim_3p=10)
@@ -1236,7 +1236,7 @@ def test_bisulfite_callers_and_contexts(bsbolt_bam, tmp_path):
     bam, truth = bsbolt_bam
     a = _rust_bs(bam, tmp_path / "reads", "--caller", "reads", "--trim-5p", "3", "--trim-3p", "7")
     b = _rust_bs(bam, tmp_path / "pileup", "--caller", "pileup", "--trim-5p", "3", "--trim-3p", "7")
-    c = _rust_bs(bam, tmp_path / "cg", "--context", "CG")
+    c = _rust_bs(bam, tmp_path / "cg", "--context", "CG", "--trim", "manual")
     assert a.returncode == b.returncode == c.returncode == 0, (a.stderr[-800:], b.stderr[-800:], c.stderr[-800:])
     want = _expected(truth, min_mapq=10, min_baseq=20, trim_5p=3, trim_3p=7)
     for ctx in ("CG", "CH"):
@@ -1275,7 +1275,7 @@ def test_xb_audit_matches_pileup_after_all_filters(bsbolt_bam, tmp_path):
     import sys
 
     bam, _ = bsbolt_bam
-    p = _rust_bs(bam, tmp_path / "rs")
+    p = _rust_bs(bam, tmp_path / "rs", "--trim", "manual")
     assert p.returncode == 0, p.stderr[-800:]
     script = os.path.join(os.path.dirname(__file__), "..", "scripts", "xb_audit.py")
     r = subprocess.run([sys.executable, script, "-b", bam, "-f", CHR19_FASTA, "--h5", str(tmp_path / "rs" / "master.h5"),
@@ -1287,3 +1287,73 @@ def test_xb_audit_matches_pileup_after_all_filters(bsbolt_bam, tmp_path):
     assert len(final) == 2 and all(row[5:9] == ["0", "0", "0", row[8]] and int(row[8]) > 0 for row in final)
     first = [row for row in rows if row[0] == "XB as is"]
     assert any(int(row[5]) > 0 for row in first)  # unfiltered XB really differs
+
+
+def test_mbias_rule_python():
+    """Same cases as the Rust unit test (mbias.rs): the rule is a pure function
+    of the count table and must agree between engines."""
+    from taps_sc_extract import mbias
+
+    def table(cg_ov, ch_ov, n):
+        t = {}
+        for ctx, base, ov in (("CG", 0.8, cg_ov), ("CH", 0.05, ch_ov)):
+            for end in (5, 3):
+                for p in range(mbias.P):
+                    rate = next((o[2] for o in ov if o[0] == end and o[1] == p), base)
+                    m = int(round(rate * n))
+                    t[(ctx, 1, end, 1, p)] = [m, n - m]
+        return t, {"CG": [80_000, 20_000], "CH": [5_000, 95_000]}
+
+    c = mbias.choose_trims(*table([], [], 5000), "bisulfite")
+    assert (c["trim_r1"], c["trim_3p"]) == (0, 0)
+    step = [(3, p, 0.55) for p in range(10)]
+    assert mbias.choose_trims(*table(step, [], 5000), "bisulfite")["trim_3p"] == 10
+    assert mbias.choose_trims(*table(step + [(3, 16, 0.6)], [], 5000), "bisulfite")["trim_3p"] == 10
+    c = mbias.choose_trims(*table(step, [(3, p, 0.02) for p in range(12)], 5000), "bisulfite")
+    assert c["trim_3p"] == 10 and any("CH suggests 12" in n for n in c["notes"])
+    assert mbias.choose_trims(*table([], [], 10), "bisulfite")["trim_3p"] == 10
+    assert mbias.choose_trims(*table([(5, p, 0.5) for p in range(mbias.P)], [], 5000), "bisulfite")["trim_r1"] == mbias.MAX_AUTO_TRIM
+    big = [("chr1", 200_000_000, 3_000_000), ("chr2", 100_000_000, 1_000_000)]
+    w = mbias.sample_windows(big)
+    assert len(w) == mbias.N_WINDOWS and sum(1 for x in w if x[0] == "chr1") == 48
+
+
+@pytest.fixture(scope="module")
+def bsbolt_bam_large(tmp_path_factory):
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from bsbolt_fixture import make_bsbolt_bam
+
+    _require(CHR19_FASTA)
+    d = tmp_path_factory.mktemp("bsbolt_large")
+    return make_bsbolt_bam(str(d), CHR19_FASTA, n_reads=40000, seed=11)
+
+
+def test_trim_auto_rust_python_agree_and_find_the_bias(bsbolt_bam_large, tmp_path, monkeypatch):
+    """--trim auto (bisulfite default) finds the fixture's injected 10 bp 3' bias;
+    Rust and Python write identical M-bias tables and the same trims; plots and
+    HDF5 attributes are written."""
+    from taps_sc_extract.cli import main as cli_main
+
+    monkeypatch.setenv("TAPS_MBIAS_MIN_CALLS", "300")
+    bam, truth = bsbolt_bam_large
+    p = _rust_bs(bam, tmp_path / "rs")
+    assert p.returncode == 0, p.stderr[-1500:]
+    assert "Auto trim: 5' 0 bp, 3' 10 bp" in p.stderr
+    rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(tmp_path / "py"), "-c", "chr19", "-t", "2",
+                   "--shards", "2", "--engine", "python"])
+    assert rc == 0
+    rs_tsv = (tmp_path / "rs" / "bsbolt_fixture.mbias.tsv").read_text()
+    assert rs_tsv == (tmp_path / "py" / "bsbolt_fixture.mbias.tsv").read_text()
+    for ext in ("png", "pdf"):
+        assert (tmp_path / "rs" / f"bsbolt_fixture.mbias.{ext}").stat().st_size > 1000
+    want = _expected(truth, min_mapq=10, min_baseq=20, trim_5p=0, trim_3p=10)
+    for out in ("rs", "py"):
+        got = _calls_of(tmp_path / out / "master.h5")
+        for ctx in ("CG", "CH"):
+            assert got[ctx] == want[ctx], (out, ctx)
+        with h5py.File(str(tmp_path / out / "master.h5"), "r") as f:
+            assert f["metadata"].attrs["trim_mode"] == "auto" and f["metadata"].attrs["trim_3p"] == "10"
+    # An explicit end wins over auto.
+    p = _rust_bs(bam, tmp_path / "rs5", "--trim-3p", "4")
+    assert "Auto trim: 5' 0 bp, 3' 4 bp" in p.stderr

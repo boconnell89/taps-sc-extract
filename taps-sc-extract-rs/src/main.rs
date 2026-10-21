@@ -19,6 +19,7 @@ mod extract_noodles;
 mod fasta;
 mod h5_out;
 mod input;
+mod mbias;
 mod parallel;
 mod profile;
 mod readcall;
@@ -312,6 +313,12 @@ enum Commands {
         /// (default: taps 0, bisulfite 10 for the Tn5 gap fill-in).
         #[arg(long, alias = "trim-3prime")]
         trim_3p: Option<u32>,
+        /// auto: measure M-bias on a sample of reads and pick the trims for
+        /// ends not set explicitly (writes <bam>.mbias.tsv/.png/.pdf next to
+        /// the output); manual: explicit values or chemistry defaults.
+        /// Default: auto for bisulfite, manual for taps.
+        #[arg(long, value_enum)]
+        trim: Option<TrimMode>,
         #[arg(short = 'w', long)]
         whitelist: Option<PathBuf>,
         /// Complexity file (rank, barcode, total, unique reads, %); keeps barcodes
@@ -396,6 +403,13 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         stdin: bool,
     },
+}
+
+/// `--trim`: automatic (M-bias) or manual trims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TrimMode {
+    Auto,
+    Manual,
 }
 
 fn main() -> Result<()> {
@@ -691,6 +705,7 @@ fn main() -> Result<()> {
             trim_r1,
             trim_r2,
             trim_3p,
+            trim,
             whitelist,
             complexity,
             min_complexity,
@@ -728,9 +743,11 @@ fn main() -> Result<()> {
             let min_baseq = min_baseq.unwrap_or(dflt.min_baseq);
             let min_mapq = min_mapq.unwrap_or(dflt.min_mapq);
             let max_depth = max_depth.unwrap_or(dflt.max_depth);
-            let trim_r1 = trim_r1.unwrap_or(dflt.trim_r1);
-            let trim_r2 = trim_r2.unwrap_or(dflt.trim_r2);
-            let trim_3p = trim_3p.unwrap_or(dflt.trim_3p);
+            let trim_mode = trim.unwrap_or(if chem == chemistry::Chemistry::Bisulfite { TrimMode::Auto } else { TrimMode::Manual });
+            let (set_r1, set_r2, set_3p) = (trim_r1, trim_r2, trim_3p);
+            let mut trim_r1 = trim_r1.unwrap_or(dflt.trim_r1);
+            let mut trim_r2 = trim_r2.unwrap_or(dflt.trim_r2);
+            let mut trim_3p = trim_3p.unwrap_or(dflt.trim_3p);
             let no_baq = no_baq || (baq.is_none() && !dflt.baq);
             let baq = baq.unwrap_or(BaqMode::Taps);
             crate::h5_out::set_run_attrs(&[
@@ -791,6 +808,64 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| autotune::default_decomp_threads(n_workers));
             let (n_shards, shards_src) = autotune::resolve_shards(shards, cell_source.count());
             let writer_mode = WriterMode::parse(&writer_mode, n_shards)?;
+            if trim_mode == TrimMode::Auto {
+                // --trim auto: M-bias on a fixed sample, trims for ends not set.
+                let t0 = std::time::Instant::now();
+                use rust_htslib::bam::Read as _;
+                let mut rd = crate::input::open_indexed(&bam)?;
+                let stats = rd.index_stats().map_err(|e| anyhow::anyhow!("index stats: {e}"))?;
+                let names: Vec<String> =
+                    rd.header().target_names().iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+                let sel: Vec<(String, u64, u64)> = contig_list
+                    .iter()
+                    .filter_map(|c| {
+                        let tid = names.iter().position(|n| n == c)?;
+                        let (_, len, mapped, _) = stats.iter().find(|s| s.0 == tid as i64)?;
+                        Some((c.to_string(), *len, *mapped))
+                    })
+                    .collect();
+                let windows = mbias::sample_windows(&sel, start, end);
+                let counts = mbias::count(&bam, &fai, &windows, chem, min_mapq, min_baseq)?;
+                let mates: &[u8] = if chem == chemistry::Chemistry::Bisulfite { &[1] } else { &[1, 2] };
+                let chosen = mbias::choose(&counts, chem, mates);
+                if set_r1.is_none() {
+                    trim_r1 = chosen.trim_r1;
+                }
+                if set_r2.is_none() && chem == chemistry::Chemistry::Taps {
+                    trim_r2 = chosen.trim_r2;
+                }
+                if set_3p.is_none() {
+                    trim_3p = chosen.trim_3p;
+                }
+                let prefix = mbias::output_prefix(&out, n_shards, &bam);
+                if let Some(dir) = prefix.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let tsv = PathBuf::from(format!("{}.mbias.tsv", prefix.display()));
+                mbias::write_tsv(&tsv, &counts, trim_r1, trim_r2, trim_3p)?;
+                eprintln!(
+                    "Auto trim: 5' {trim_r1} bp, 3' {trim_3p} bp from {} sampled reads in {:.1}s (M-bias: {}.mbias.tsv/.png/.pdf)",
+                    counts.reads,
+                    t0.elapsed().as_secs_f64(),
+                    prefix.display()
+                );
+                for n in &chosen.notes {
+                    eprintln!("warning: auto trim: {n}");
+                }
+                mbias::plot(&tsv, &prefix.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                crate::h5_out::set_run_attrs(&[
+                    ("chemistry", chem.label().to_string()),
+                    ("bsbolt_version", detected.bsbolt.clone().unwrap_or_default()),
+                    ("trim_r1", trim_r1.to_string()),
+                    ("trim_r2", trim_r2.to_string()),
+                    ("trim_3p", trim_3p.to_string()),
+                    ("trim_mode", "auto".to_string()),
+                    ("min_mapq", min_mapq.to_string()),
+                    ("min_baseq", min_baseq.to_string()),
+                    ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
+                    ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
+                ]);
+            }
             let traffic = match estimate_bam_traffic(&bam, &contig_list) {
                 Ok(t) => t,
                 Err(e) => {

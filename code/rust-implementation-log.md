@@ -627,3 +627,20 @@ Plan: [`gpu-acceleration-plan.md`](gpu-acceleration-plan.md). Two review rounds 
   - `--context CG` works.
   - Guards: `--chemistry taps` is refused on a BSBolt BAM; `--baq htslib` is refused for bisulfite; a flipped YS stops the run unless `--strand-source flag` is given.
 - Not yet: `--trim auto` with M-bias plots, `scripts/xb_audit.py` (pileup vs XB report), the filter-impact report and frozen bisulfite references. Those wait for deduplicated data.
+
+## 2026-10-21 — `--trim auto` (M-bias) and the pileup-vs-XB audit
+
+- `scripts/xb_audit.py` (`81fa9ab`):
+  - decodes XB with a CIGAR walk and self-tests every letter against the reference;
+  - compares XB calls with the extractor's HDF5, adding the extractor's filters one at a time (supplementary, MAPQ, base quality, trims), so each difference is attributed to a cause;
+  - writes a TSV and a PNG/PDF summary.
+
+  On the synthetic fixture, XB with all filters equals the pileup output exactly.
+- `--trim auto|manual`, default auto for bisulfite and manual for taps (`mbias.rs`, `mbias.py`):
+  - **Sampling:** fixed windows, dealt by mapped reads, aiming at 300k reads; every read when the input is smaller.
+  - **Counts:** methylation by distance from each sequenced end, in BAM SEQ coordinates, on reads ≥ 40 bp, by length bin. The plateau comes from bases ≥ 20 from both ends of reads ≥ 60 bp.
+  - **Rule:** walk inward until 3 consecutive positions are within max(2 pp, 3 SE) of the CG plateau; CH is used only without CG data and otherwise only warns; too few calls near the end → the chemistry default; cap 15.
+  - **Outputs:** `<bam>.mbias.tsv/.png/.pdf` (seaborn) next to the output; trims in the HDF5 attributes. Explicit ends win.
+- **Results:**
+  - Rust and Python write byte-identical tables. On a 40,000-read fixture with a 10 bp 3′ bias on 30% of reads, both choose 5′ 0 / 3′ 10, and the output then equals the generator's truth.
+  - The Rust pass takes 0.5 s for 37k reads; the reference sequence is fetched once per window.

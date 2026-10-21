@@ -328,6 +328,15 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "single-end read (default: 0).",
     )
     parser.add_argument(
+        "--trim",
+        choices=["auto", "manual"],
+        default=None,
+        help="auto: measure M-bias on a sample of reads and pick the 5' and 3' trims "
+        "(writes <bam>.mbias.tsv/.png/.pdf next to the output); manual: use --trim-5p / "
+        "--trim-3p / --trim-r2 or the chemistry defaults. Default: auto for bisulfite, "
+        "manual for taps. Explicit trim values always win for their end.",
+    )
+    parser.add_argument(
         "--trim-3p", "--trim-3prime",
         dest="trim_3p",
         type=int,
@@ -462,6 +471,7 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         ("--trim-r1", parsed.trim_r1),
         ("--trim-r2", parsed.trim_r2),
         ("--trim-3p", parsed.trim_3p),
+        ("--trim", parsed.trim),
     ):
         if value is not None:
             cmd.extend([flag, str(value)])
@@ -547,6 +557,47 @@ def find_rust_binary() -> Optional[str]:
     return None
 
 
+def auto_trims(parsed, chem, opts, contigs):
+    """--trim auto (Python engine): count M-bias on a fixed sample of reads,
+    choose trims for the ends the user did not set, and write
+    <bam>.mbias.tsv/.png/.pdf beside the output."""
+    import pysam
+    from . import mbias
+    from .fasta import FastFaiReader
+
+    log = logging.getLogger("taps_sc_extract")
+    fasta = FastFaiReader(parsed.fasta)
+    with pysam.AlignmentFile(parsed.bam, reference_filename=parsed.fasta) as bam:
+        mapped = {s.contig: s.mapped for s in bam.get_index_statistics()}
+        sel = [(c, bam.get_reference_length(c), mapped.get(c, 0)) for c in contigs if c in bam.references]
+        windows = mbias.sample_windows(sel)
+        table, plateau, nreads = mbias.count_table(bam, fasta, windows, chem, opts["min_mapq"], opts["min_baseq"])
+    mates = (1,) if chem == "bisulfite" else (1, 2)
+    chosen = mbias.choose_trims(table, plateau, chem, mates)
+    out = {}
+    for key in ("trim_r1", "trim_r2", "trim_3p"):
+        if getattr(parsed, key) is None:
+            out[key] = chosen.get(key, opts[key])
+    applied = {**opts, **out}
+    shards = parsed.shards if parsed.shards and parsed.shards > 0 else 1
+    odir = mbias.output_dir(parsed.out, shards)
+    os.makedirs(odir, exist_ok=True)
+    prefix = os.path.join(odir, mbias.bam_prefix(parsed.bam))
+    trims = {"trim_r1": applied["trim_r1"], "trim_r2": applied["trim_r2"], "trim_3p": applied["trim_3p"]}
+    mbias.write_tsv(prefix + ".mbias.tsv", table, plateau, nreads, trims)
+    try:
+        mbias.plot(prefix + ".mbias.tsv", prefix, mbias.bam_prefix(parsed.bam))
+    except Exception as e:  # plotting is a report, never a reason to fail the run
+        log.warning(f"M-bias plot not written: {e}")
+    log.info(
+        f"Auto trim: 5' {applied['trim_r1']} bp, 3' {applied['trim_3p']} bp from {nreads:,} sampled reads "
+        f"(M-bias: {prefix}.mbias.tsv/.png/.pdf)"
+    )
+    for n in chosen["notes"]:
+        log.warning(f"Auto trim: {n}")
+    return out
+
+
 def resolve_python_options(parsed):
     """Python engine: detect the chemistry from the BAM and fill unset options
     with its defaults (the Rust engine does the same in chemistry.rs)."""
@@ -569,6 +620,9 @@ def resolve_python_options(parsed):
     d = defaults(chem)
     opts = {k: (getattr(parsed, k) if getattr(parsed, k) is not None else d[k])
             for k in ("min_mapq", "min_baseq", "max_depth", "trim_r1", "trim_r2", "trim_3p")}
+    opts["trim_mode"] = parsed.trim or ("auto" if chem == "bisulfite" else "manual")
+    if opts["trim_mode"] == "auto":
+        opts.update(auto_trims(parsed, chem, opts, contigs))
     logging.getLogger("taps_sc_extract").info(
         f"Chemistry: {chem} ({'detected from the BAM' if parsed.chemistry == 'auto' else 'explicit'}"
         f"{'; BSBolt ' + det['bsbolt'] if det['bsbolt'] else ''})"
@@ -665,6 +719,7 @@ def main(args: Optional[List[str]] = None) -> int:
             trim_r1=opts["trim_r1"],
             trim_r2=opts["trim_r2"],
             trim_3p=opts["trim_3p"],
+            trim_mode=opts["trim_mode"],
             contexts=("CG", "CH") if parsed.context == "both" else (parsed.context,),
             chemistry=chem,
             verify_ys=parsed.strand_source == "auto",

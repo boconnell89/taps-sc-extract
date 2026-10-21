@@ -128,6 +128,7 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
   - Bisulfite drops supplementary before the pileup (Rust `accept_record`, Python `flag_filter=0x704|0x800`); TAPS does not (it would move frozen references). Every pushed bisulfite read is checked: paired → error; `YS` must be directional and agree with the flag unless `--strand-source flag` (Rust `bisulfite_read_guard`; Python `chemistry.guard_window` pre-pass per window).
   - Trims: one window function (`calling::trim_window`, `calling.trim_window`) on BAM SEQ coordinates (soft clips included): 5′ trim from `BAM_FREAD2` (R1/R2) and a shared `trim_3p`; with `trim_3p = 0` it equals the old 5′ rule.
   - Run settings are written as string attributes on `/metadata` of every output file (Rust: env `TAPS_SC_EXTRACT_RUN_ATTRS`, inherited by `write-shard` children; Python: `h5_writer.set_run_attrs`).
+  - `--trim auto` (`mbias.rs` / `mbias.py`): the sampler (fixed windows by mapped reads, or every read when ≤ 300k), the count table and its TSV, and the rule (`choose` / `choose_trims`, a pure function of the table) must stay identical in both engines; `test_trim_auto_rust_python_agree_and_find_the_bias` compares the TSVs byte for byte. Plots are drawn only by `python -m taps_sc_extract.mbias` (seaborn), which the Rust binary calls.
   - Tests use a synthetic BSBolt BAM generated at test time (`tests/bsbolt_fixture.py`) and compare per cell and site with the generator's own truth, not only engine against engine.
 
 ### F. TAPS Chemistry & Amethyst Schema

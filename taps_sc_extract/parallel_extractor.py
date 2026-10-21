@@ -576,6 +576,7 @@ def extract_methylation_parallel(
     chemistry: str = "taps",
     trim_3p: int = 0,
     verify_ys: bool = True,
+    trim_mode: str = "manual",
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -650,7 +651,7 @@ def extract_methylation_parallel(
         "trim_r1": trim_r1,
         "trim_r2": trim_r2,
         "trim_3p": trim_3p,
-        "trim_mode": "manual",
+        "trim_mode": trim_mode,
         "min_mapq": min_mapq,
         "min_baseq": min_base_quality,
         "extractor": "taps-sc-extract (python)",

@@ -63,6 +63,7 @@ def extract_methylation(
     chemistry: str = "taps",
     trim_3p: int = 0,
     verify_ys: bool = True,
+    trim_mode: str = "manual",
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -125,7 +126,7 @@ def extract_methylation(
         "trim_r1": trim_r1,
         "trim_r2": trim_r2,
         "trim_3p": trim_3p,
-        "trim_mode": "manual",
+        "trim_mode": trim_mode,
         "min_mapq": min_mapq,
         "min_baseq": min_base_quality,
         "extractor": "taps-sc-extract (python)",

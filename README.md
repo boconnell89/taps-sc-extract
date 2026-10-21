@@ -190,7 +190,8 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 | `--no-overlap-clip` | `flag` | `False` | Do not ignore overlapping mate read bases. |
 | `--trim-r2` | `int` | taps `10` | Drop this many 5′ sequenced bases of read 2 before calling (Tn5/TAPS M-bias). No effect on single-end reads. |
 | `--trim-r1` / `--trim-5p` | `int` | `0` | Drop this many bases from the sequenced 5′ end of read 1, or of every single-end read. |
-| `--trim-3p` | `int` | taps `0`, bisulfite `10` | Drop this many bases from the sequenced 3′ end of every read (bisulfite: the Tn5 9 bp gap is filled with unmethylated C at end repair). |
+| `--trim-3p` | `int` | taps `0`, bisulfite `10` (manual) | Drop this many bases from the sequenced 3′ end of every read (bisulfite: the Tn5 9 bp gap is filled with unmethylated C at end repair). |
+| `--trim` | `auto`\|`manual` | bisulfite `auto`, taps `manual` | `auto` measures M-bias on a sample of reads and picks the trims of ends not set explicitly; writes `<bam>.mbias.tsv/.png/.pdf`. See [Bisulfite](#bisulfite-bsbolt-single-end). |
 | `-v, --verbose` | `flag` | `False` | Enable verbose debug logging. |
 
 ---
@@ -333,7 +334,8 @@ $$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
 | **OB**: flag 16, `YS:Z:C_C2T` | `G` | `A` | **Unmethylated** |
 
 - **Input**: one coordinate-sorted, indexed, deduplicated BSBolt BAM (merge and deduplicate runs first). Directional libraries only (`*_G2A` strands are an error); single-end only.
-- **Defaults** (each applies only if you did not set the option): MAPQ ≥ 10, base quality ≥ 20, 3′ trim 10 bp, 5′ trim 0, no BAQ, supplementary alignments dropped (BSBolt writes them with `bwa -Y`; most are chimeras on the opposite converted strand).
+- **Defaults** (each applies only if you did not set the option): MAPQ ≥ 10, base quality ≥ 20, `--trim auto`, no BAQ, supplementary alignments dropped (BSBolt writes them with `bwa -Y`; most are chimeras on the opposite converted strand).
+- **`--trim auto`** (bisulfite default; `--trim manual` for fixed values, default 5′ 0 / 3′ 10 bp for the Tn5 gap filled with unmethylated C): a quick pass over about 300,000 sampled reads measures CpG and CH methylation by distance from each sequenced end, counting only reads at least 40 bp long so the two ends do not mix, and trims each end up to where CpG methylation returns to the mid-read level (within 2 percentage points or 3 standard errors, for 3 positions in a row; CH only warns). It writes `<bam>.mbias.tsv`, `.png` and `.pdf` next to the output and records the trims in the HDF5 attributes. An explicit `--trim-5p` / `--trim-3p` wins for its end.
 - **Checks**: every read's `YS` must agree with its flag (the run stops at the first that does not; `--strand-source flag` to skip), and `-f` must be the unconverted genome (a C→T or G→A converted FASTA is refused).
 - **Output**: the usual Amethyst HDF5. `/metadata` attributes in every file record the chemistry, BSBolt version, trims and filters.
 - Design and remaining work (automatic M-bias trimming, pileup-vs-XB report): [`code/bisulfite-extraction-plan.md`](code/bisulfite-extraction-plan.md).
