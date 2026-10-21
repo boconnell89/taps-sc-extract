@@ -96,6 +96,10 @@
   - `--trim-5p N`. For SE it is the 5′ trim (`--trim-r1` is accepted as an alias). For TAPS PE the 5′ trim still comes from `--trim-r1`/`--trim-r2` by `BAM_FREAD2`. `--trim-r2` on SE warns only if the user set it.
   - `--trim-3p N` (new).
   - `--trim auto`, the **bisulfite default** (§5.1). Explicitly set ends always win.
+  - **Bisulfite SE manual defaults** (used when auto falls back, or when auto is turned off): `--trim-5p 0`, `--trim-3p 10`.
+    - The 3′ value matches Tn5: tagmentation leaves a 9 bp gap that end repair fills with unmethylated C, so the sequenced 3′ end reads as unmethylated over ~9–10 bp.
+    - On the pilot, the sharp CpG drop ends by ~5 bp, but CG and CH only regain the plateau by ~9–11 bp. The auto rule picked 11 there.
+    - Recheck on deduplicated data.
 - **One window function** (and `readcall::call_read`'s `[qlo, qhi)`):
   ```
   t5 = trim_r2 if flag & BAM_FREAD2 else trim_r1     # SE: --trim-5p
@@ -127,7 +131,7 @@
 1. Positions with fewer than `min_calls = max(500, plateau_n / 100)` calls are "unknown".
 2. A position is biased if |rate − plateau| > max(δ, z·SE), with δ_CG = 2 percentage points and z = 3.
 3. Walk inward from p = 0. While the position is biased, the trim is p + 1. Stop at the first run of W = 3 consecutive positions that are in band or unknown. Interior blips after recovery don't count.
-4. If any of p = 0..4 is unknown while the plateau has enough data, fall back to the chemistry candidate (3′ = 5 for bisulfite SE) and warn.
+4. If any of p = 0..4 is unknown while the plateau has enough data, fall back to the chemistry candidate (3′ = 10 for bisulfite SE) and warn.
 5. Cap at `max_auto_trim = 15`, with a warning.
 6. The trim applied per end comes from **CG**. CH is computed with δ_CH = 1 point. It is used only when no CG position reaches `min_calls`, and otherwise reported. If CH suggests more than CG, warn (e.g. "CH 3′ suggests 11; using CG 5") without raising the trim.
 
@@ -138,7 +142,7 @@
 - **Files**, named `<prefix>.mbias.tsv`, `<prefix>.mbias.png` and `<prefix>.mbias.pdf`, where `<prefix>` is the BAM file name without `.bam`/`.cram`/`.sam` (e.g. `sample.dedup.mbias.png`). They go in the shard directory, or beside a single-file output.
   - **`.tsv`:** the full count table. Python and Rust must write identical tables for the same BAM.
   - **`.png` / `.pdf`** (same figure): CG and CH methylation by position from the 5′ and 3′ ends, one line per read-length bin plus all reads ≥ 40 bp. The plateau and its ±δ band are shown, unknown positions greyed, the chosen trims marked as vertical lines, and the trims and sample size in the title.
-  - **Rendering:** `taps_sc_extract/mbias_plot.py` (matplotlib, added as a dependency) draws the figure from the `.tsv`. The CLI calls it after either engine. The Rust binary, run directly, writes the `.tsv` and calls `python3 -m taps_sc_extract.mbias_plot <tsv>` if that module is importable; otherwise it prints the command to run.
+  - **Rendering:** `taps_sc_extract/mbias_plot.py` (seaborn on matplotlib, both added as dependencies) draws the figure from the `.tsv`: a 2×2 grid (CG and CH × 5′ and 3′); x axes in whole bases (major ticks every 2, minor every 1); a shared legend. The prototype is `scratch/bs-plan/mbias-prototype/proto.py`. The CLI calls it after either engine. The Rust binary, run directly, writes the `.tsv` and calls `python3 -m taps_sc_extract.mbias_plot <tsv>` if that module is importable; otherwise it prints the command to run.
 - **HDF5 root attributes:** `trim_5p`, `trim_3p`, `trim_mode=auto|manual`.
 
 **Tests**
