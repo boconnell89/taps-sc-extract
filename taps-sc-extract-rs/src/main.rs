@@ -218,6 +218,9 @@ enum Commands {
         /// Keep stream-mode temp chunk directory.
         #[arg(long, default_value_t = false)]
         keep_temp: bool,
+        /// Directory for stream-mode temp chunk files (default: $TMPDIR, else /tmp).
+        #[arg(long)]
+        temp_dir: Option<PathBuf>,
         /// stream = temp chunks then HDF5; memory = keep in RAM; auto = heuristic from budget & cells.
         #[arg(long, default_value = "auto")]
         memory_mode: String,
@@ -712,6 +715,7 @@ fn main() -> Result<()> {
             workers,
             decomp_threads,
             keep_temp,
+            temp_dir,
             memory_mode,
             max_memory_gb,
             max_memory_fraction,
@@ -1192,10 +1196,16 @@ fn main() -> Result<()> {
                     }
                 }
                 "stream" => {
-                    let tmp = tempfile::Builder::new()
-                        .prefix("taps-rs-")
-                        .tempdir()
-                        .map_err(|e| anyhow::anyhow!("tempdir: {e}"))?;
+                    let mut builder = tempfile::Builder::new();
+                    builder.prefix("taps-rs-");
+                    let tmp = match &temp_dir {
+                        Some(d) => {
+                            std::fs::create_dir_all(d).map_err(|e| anyhow::anyhow!("--temp-dir {}: {e}", d.display()))?;
+                            builder.tempdir_in(d)
+                        }
+                        None => builder.tempdir(),
+                    }
+                    .map_err(|e| anyhow::anyhow!("tempdir: {e}"))?;
                     let r = extract_stream_parallel(
                         &bams,
                         &fasta,

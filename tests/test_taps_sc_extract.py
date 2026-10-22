@@ -1613,3 +1613,36 @@ def test_multi_bam_rejections(bsbolt_split, tmp_path):
     rc = cli_main(["-b", "@" + str(d / "list.txt"), "-f", CHR19_FASTA, "-o", str(tmp_path / "pd"), "-c", "chr19",
                    "--engine", "python", "--trim", "manual", "--max-depth", "50"])
     assert rc != 0
+
+
+def test_temp_dir_and_log_file_reach_the_rust_engine(bsbolt_bam, tmp_path):
+    """--temp-dir is forwarded and used by Rust stream mode; --log-file captures
+    the Rust engine's own output (config block and summary line)."""
+    from taps_sc_extract.cli import build_rust_command, main as cli_main, parse_args
+
+    bam, _ = bsbolt_bam
+    argv = ["-b", bam, "-f", CHR19_FASTA, "-o", "o", "--temp-dir", str(tmp_path / "scratch")]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(argv), argv)
+    assert cmd[cmd.index("--temp-dir") + 1] == str(tmp_path / "scratch")
+
+    scratch = tmp_path / "scratch"
+    p = _rust_bs(bam, tmp_path / "rs", "--trim", "manual", "--memory-mode", "stream",
+                 "--temp-dir", str(scratch), "--keep-temp")
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert any(d.name.startswith("taps-rs-") for d in scratch.iterdir())
+
+    log = tmp_path / "run.log"
+    rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(tmp_path / "wr"), "-c", "chr19", "-t", "2",
+                   "--shards", "2", "--trim", "manual", "--engine", "rust", "--log-file", str(log)])
+    assert rc == 0
+    text = log.read_text()
+    assert "Delegating extraction to Rust" in text          # the wrapper's own log
+    assert "Configuration:" in text and "cells=" in text    # the Rust engine's stderr and stdout
+
+
+def test_python_writer_threads_zero_means_auto():
+    from taps_sc_extract.parallel_extractor import _shard_writer_concurrency
+
+    auto = _shard_writer_concurrency(8, use_temp_files=True, max_writer_threads=None)
+    assert _shard_writer_concurrency(8, use_temp_files=True, max_writer_threads=0) == auto
+    assert _shard_writer_concurrency(8, use_temp_files=True, max_writer_threads=1) == 1

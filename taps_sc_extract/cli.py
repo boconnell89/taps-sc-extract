@@ -483,6 +483,32 @@ def _depth_arg(value: str):
     return n
 
 
+def run_tee(cmd: List[str], log_path: str) -> int:
+    """Run the Rust engine, copying its stdout and stderr (progress, config,
+    summary) into the --log-file while still printing them."""
+    import threading
+
+    for h in logging.getLogger().handlers:  # the wrapper's own log lines first
+        h.flush()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lock = threading.Lock()
+    with open(log_path, "ab") as log:
+        def pump(src, dst):
+            for line in iter(src.readline, b""):
+                dst.write(line)
+                dst.flush()
+                with lock:
+                    log.write(line)
+                    log.flush()
+        threads = [threading.Thread(target=pump, args=(proc.stdout, sys.stdout.buffer)),
+                   threading.Thread(target=pump, args=(proc.stderr, sys.stderr.buffer))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    return proc.wait()
+
+
 def option_was_set(argv: List[str], option: str) -> bool:
     """True when the user passed `option` or `option=value` on this argv."""
     return any(a == option or a.startswith(option + "=") for a in argv)
@@ -525,6 +551,7 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         ("--cell-site-cap", parsed.cell_site_cap),
         ("--molecules-per-cell", parsed.molecules_per_cell),
         ("--blacklist", parsed.blacklist),
+        ("--temp-dir", parsed.temp_dir),
         ("--trim-r1", parsed.trim_r1),
         ("--trim-r2", parsed.trim_r2),
         ("--trim-3p", parsed.trim_3p),
@@ -783,6 +810,8 @@ def main(args: Optional[List[str]] = None) -> int:
         cmd = build_rust_command(rust_bin, parsed, argv)
 
         try:
+            if parsed.log_file:
+                return run_tee(cmd, parsed.log_file)
             res = subprocess.run(cmd)
             return res.returncode
         except Exception as e:

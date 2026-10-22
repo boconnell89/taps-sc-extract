@@ -473,7 +473,8 @@ def _shard_writer_concurrency(
 
     A shard writer holds one shard's merged arrays (heavier than one pileup
     worker, much lighter than the full extract pool). Scale from MemAvailable,
-    capped by max_writer_threads (default: 6) to prevent disk I/O congestion.
+    capped by max_writer_threads (None or 0 = auto: at most 6) to prevent disk
+    I/O congestion.
     """
     n_shards = max(1, int(n_shards))
     _total_mb, avail_mb = _meminfo_mb()
@@ -482,7 +483,7 @@ def _shard_writer_concurrency(
     budget_mb = max(0.0, avail_mb - headroom_mb)
     n = int(budget_mb // per_writer_mb) if per_writer_mb > 0 else 1
     n = max(1, n)
-    cap = 6 if max_writer_threads is None else max(1, int(max_writer_threads))
+    cap = 6 if not max_writer_threads else max(1, int(max_writer_threads))
     return min(n, n_shards, cap)
 
 

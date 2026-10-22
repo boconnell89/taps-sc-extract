@@ -188,13 +188,12 @@ Solutions to common errors, validation failures, and runtime bottlenecks. [Back 
 - **Solutions**:
   1. Switch to disk-streaming mode:
      ```bash
-     TMPDIR=/scratch/tmp taps-sc-extract ... --memory-mode stream
+     taps-sc-extract ... --memory-mode stream --temp-dir /scratch/tmp
      ```
   2. Set an explicit memory ceiling:
      ```bash
      taps-sc-extract ... --max-memory-gb 32
      ```
-  Stream mode writes its temporary files under `$TMPDIR` (default `/tmp`) with the Rust engine; `--temp-dir` applies only to the Python engine.
   3. Restrict concurrent writer processes:
      ```bash
      taps-sc-extract ... --max-writer-threads 4

@@ -230,7 +230,7 @@ taps-sc-extract \
   -o output_shards/ \
   --memory-mode stream
 ```
-Chunk payloads spill to temporary files and are removed as shards complete. The Rust engine writes them under `$TMPDIR` (default `/tmp`); set it to fast local storage, not a network mount, e.g. `TMPDIR=/scratch/tmp taps-sc-extract ...`. `--temp-dir` is honoured only by the Python engine.
+Chunk payloads spill to temporary files and are removed as shards complete. Add `--temp-dir /scratch/tmp` to put them on fast local storage rather than a network mount (default `$TMPDIR`, else `/tmp`).
 
 ---
 

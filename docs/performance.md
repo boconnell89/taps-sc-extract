@@ -116,7 +116,7 @@ htslib threads per worker that inflate BGZF blocks ahead of the reader. Leave it
 ### Memory mode (`--memory-mode`, `--temp-dir`)
 
 - **`memory`:** window results are piped to the writer processes. With one writer process per shard, the writers start with extraction and take each window's results as it finishes, at low CPU priority, so only the HDF5 writing itself is left afterwards. That was 12% faster end to end than handing the data over after extraction, with about half the extraction memory.
-- **`stream`:** window results go to compact temp files under `--temp-dir` (default `/tmp`), and each writer reads its own shard's files. Extraction memory is lowest: 3.4 GB against 6.3 GB on the test BAM, at 2.50M against 2.69M reads/s.
+- **`stream`:** window results go to compact temp files under `--temp-dir` (default `$TMPDIR`, else `/tmp`), and each writer reads its own shard's files. Extraction memory is lowest: 3.4 GB against 6.3 GB on the test BAM, at 2.50M against 2.69M reads/s.
 - **`auto`** (default): Rust estimates the output sites from the BAM index, at about 14 per mapped read.
   - It prefers memory mode with one streamed writer per shard when the whole process tree fits the memory budget.
   - Otherwise it chooses between memory and stream mode, with as many writers as fit.

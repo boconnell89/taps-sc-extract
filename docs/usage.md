@@ -203,7 +203,7 @@ Rust hashes barcodes into 4 × shards buckets and packs buckets into shards by s
 | `--no-temp-file` | flag | off | Same as `--memory-mode memory`. Wrapper only; forwarded as `--memory-mode memory`. |
 | `--max-memory-gb` | float | unset | Memory budget in GB for the whole process tree (extraction plus writer children). Overrides `--max-memory-fraction`. Minimum 1 GB. |
 | `--max-memory-fraction` | float | 0.6 | Share of `MemAvailable` the run may use, clamped to 0.05–1.0. The budget is at least 2 GB. |
-| `--temp-dir` | path | system temp | Directory for stream-mode chunk files. **Python engine only.** The wrapper does not forward this to Rust extract; Rust stream mode uses the process temp directory (`TMPDIR`, else `/tmp`). For `--test`, see `--temp-dir-test`. |
+| `--temp-dir` | path | `$TMPDIR`, else `/tmp` | Directory for stream-mode temp chunk files, in both engines. Point it at fast local storage, not a network mount. |
 
 The run summary reports the extraction process's peak RSS and the writer children's combined peak. Count both when sizing memory.
 
@@ -211,7 +211,7 @@ The run summary reports the extraction process's peak RSS and the writer childre
 
 | Variable | Default | Effect |
 |---|---|---|
-| `TMPDIR` | `/tmp` | Where stream-mode temporary chunk files go. Point it at fast local storage. |
+| `TMPDIR` | `/tmp` | Where stream-mode temporary chunk files go when `--temp-dir` is not given. |
 | `TAPS_STREAM_WRITERS` | on | `0` stops feeding writers during extraction (memory mode hands data over afterwards). |
 | `TAPS_STREAM_NICE` | 10 | CPU nice level of streamed writer processes, so extraction gets the CPU first. |
 | `TAPS_GPU_SHARE` | on | `0` sends every BAQ batch to the GPU instead of sharing with the CPU. |
@@ -232,8 +232,8 @@ The run summary reports the extraction process's peak RSS and the writer childre
 | `blosc-zstd` | Zstd level 5 + shuffle | Same plugins. Smallest files. |
 | `lzf` | HDF5 LZF | R: `rhdf5filters`. Built into h5py. |
 | `gzip` | deflate level 1 (Python default) | Plain `rhdf5` / h5py. |
-| `gzip-shuffle` | byte shuffle + deflate 1 | Plain `rhdf5`. Rust engine. |
-| `gzip6` | deflate level 6 | Plain `rhdf5`. Rust engine. |
+| `gzip-shuffle` | byte shuffle + deflate 1 | Plain `rhdf5`. **Rust engine only**: the Python engine accepts the name but fails when writing. |
+| `gzip6` | deflate level 6 | Plain `rhdf5`. **Rust engine only**, as above. |
 | `none` | uncompressed | Plain `rhdf5` / h5py. |
 
 The wrapper argparse default is `gzip`; when the user does not pass `--compression`, the wrapper sends `blosc` to Rust. Rates and sizes: [performance.md](performance.md). Schema: [output.md](output.md).
@@ -250,7 +250,7 @@ The wrapper argparse default is `gzip`; when the user does not pass `--compressi
 | `--test-report` | path | none | Also write the profile and report to this file. |
 | `--temp-dir-test` | path | `--temp-dir` or `.` | Directory for the synthetic BAM and the temp-filesystem probe. |
 | `--profile-json` | path | none | Rust: write per-phase CPU use, per-stage and per-window timings, and per-shard writer reports to JSON. Adds a small amount of processing time. |
-| `--log-file` | path | none | Wrapper log file (Python logging). Rust extract writes to stderr; that stream is not redirected into this file. |
+| `--log-file` | path | none | Log file. It gets the wrapper's log and, with the Rust engine, everything the engine prints (configuration, progress, summary), which still appears on the terminal too. |
 | `-v`, `--verbose` | flag | off | Wrapper debug logging. |
 
 ```bash
@@ -279,10 +279,10 @@ taps-sc-extract --test -b sample.bam -f ref.fa -o out/
 | `--decomp-threads` | 1 if unset. |
 | `--chunk-size-mb` | 10. |
 | `--shards` | 1 if unset. |
-| `--compression` | `gzip` (level 1). Codecs: `gzip`, `lzf`, `none`, `blosc`, `blosc-zstd`. `gzip-shuffle` and `gzip6` are accepted by the parser and fail in the writer. `blosc` uses hdf5plugin LZ4 at level 1. |
+| `--compression` | `gzip` (level 1). Codecs: `gzip`, `lzf`, `none`, `blosc`, `blosc-zstd`. `gzip-shuffle` and `gzip6` are Rust-only: the parser accepts them, but the Python writer fails. `blosc` uses hdf5plugin LZ4 at level 1. |
 | `--memory-mode` | `memory` (or `--no-temp-file`) keeps results in RAM; any other value, including `auto`, streams to `--temp-dir`. No budget heuristic. |
 | `--temp-dir` | Honoured. Stream chunks go under a `taps_extract_*` directory there (system temp if unset). |
-| `--max-writer-threads` | CLI default `0` becomes a cap of 1. Pass a positive count (the in-process pool is still capped by available memory). Writers are threads in the extraction process. |
+| `--max-writer-threads` | `0` (default) = auto: as many as fit available memory, at most 6. A positive count caps it. Writers are threads in the extraction process. |
 | `--max-memory-gb`, `--max-memory-fraction`, `--expected-cells`, `--writer-mode`, `--profile-json`, `--caller`, `--baq*`, `--gpu-*` | Parsed, then ignored. |
 | `--test` | Always needs the Rust engine. |
 | BAQ | Off. `compute_baq` is passed to pysam without a FASTA, so the HMM never runs. Calls match Rust `--no-baq`. |
@@ -305,8 +305,8 @@ The wrapper builds `taps-sc-extract-rs extract ...` and forwards a flag only whe
 | Whitelist aliases | `-w` / `--whitelist` / `-a` / `--annot` | `-w` / `--whitelist` |
 | `--compression` if unset | Sends `blosc` | clap default `blosc` |
 | `--chunk-size-mb` if unset | Sends `0` (auto) | clap default `0` |
-| `--temp-dir` | Python engine only | No such flag; stream mode uses `TMPDIR` |
-| `--log-file`, `-v` | Wrapper logging | No such flags |
+| `--temp-dir` | Forwarded when set | `--temp-dir` (default `$TMPDIR`, else `/tmp`) |
+| `--log-file`, `-v` | Wrapper logging; `--log-file` also captures the engine's output | No such flags (redirect stderr/stdout) |
 | `--no-temp-file` | Becomes `--memory-mode memory` | Use `--memory-mode memory` |
 | `--engine`, `--test*` | Wrapper | Use `tune` for `--test` |
 | `.xlsx` sheet | Converted to a TSV first | Refused |
