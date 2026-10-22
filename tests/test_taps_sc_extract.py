@@ -1158,14 +1158,16 @@ def _expected(truth, cap=2, **kw):
 
 
 def _rust_bs(bam, out, *extra):
+    """Rust extract on chr19; `bam` is a path, a list of paths or an @list/@sheet."""
     import subprocess
     from taps_sc_extract.cli import find_rust_binary
 
     rust_bin = find_rust_binary()
     if not rust_bin:
         pytest.skip("Rust binary not built.")
+    bams = list(bam) if isinstance(bam, (list, tuple)) else [bam]
     return subprocess.run(
-        [rust_bin, "extract", "-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
+        [rust_bin, "extract", "-b", *bams, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
          "-t", "4", "--shards", "2", *extra],
         capture_output=True, text=True,
     )
@@ -1458,3 +1460,156 @@ def test_trim_auto_rust_python_agree_and_find_the_bias(bsbolt_bam_large, tmp_pat
     # An explicit end wins over auto.
     p = _rust_bs(bam, tmp_path / "rs5", "--trim-3p", "4")
     assert "Auto trim: 5' 0 bp, 3' 4 bp" in p.stderr
+
+
+# ---------------------------------------------------------------------------
+# Several input BAMs (-b a.bam b.bam, -b @list.txt, -b @sheet.tsv/.xlsx)
+
+@pytest.fixture(scope="module")
+def bsbolt_split(bsbolt_bam, tmp_path_factory):
+    """The bisulfite fixture split by cell into 3 BAMs (2 cells each), with a
+    complexity file per part (unique reads = the cell's primary reads)."""
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from bsbolt_fixture import CELLS
+
+    bam, truth = bsbolt_bam
+    d = tmp_path_factory.mktemp("bsbolt_split")
+    groups = [CELLS[0:2], CELLS[2:4], CELLS[4:6]]
+    counts = defaultdict(int)
+    with pysam.AlignmentFile(bam) as f:
+        outs = [pysam.AlignmentFile(str(d / f"part{i}.bam"), "wb", template=f) for i in range(3)]
+        for r in f:
+            bc = r.query_name.split(":")[0]
+            outs[next(i for i, g in enumerate(groups) if bc in g)].write(r)
+            counts[bc] += not (r.flag & 0x900)
+        for o in outs:
+            o.close()
+    for i, g in enumerate(groups):
+        pysam.index(str(d / f"part{i}.bam"))
+        (d / f"part{i}.complexity.txt").write_text(
+            "".join(f"{k + 1}\t{bc}\t{counts[bc]}\t{counts[bc]}\t100\n" for k, bc in enumerate(g)))
+    (d / "list.txt").write_text("# three parts\npart0.bam\npart1.bam\npart2.bam\n")
+    return bam, d, groups, counts
+
+
+def _raw_cells(path):
+    """{(ctx, barcode): raw dataset bytes} of a master.h5 (exact comparison)."""
+    import hdf5plugin  # noqa: F401
+    out = {}
+    with h5py.File(str(path), "r") as f:
+        for ctx in ("CG", "CH"):
+            for bc in f.get(ctx, {}):
+                out[(ctx, bc)] = f[ctx][bc]["1"][()].tobytes()
+    return out
+
+
+def test_multi_bam_equals_single_bam_both_engines(bsbolt_split, tmp_path):
+    """Three BAMs (a barcode in one each), merged per window, give exactly the
+    single-BAM output per cell: Rust with paths and @list, Python with @list;
+    with the default per-cell cap and site-depth auto via per-file cutoffs."""
+    from taps_sc_extract.cli import main as cli_main
+
+    bam, d, groups, counts = bsbolt_split
+    parts = [str(d / f"part{i}.bam") for i in range(3)]
+    base = ["--trim", "manual"]
+    p = _rust_bs(bam, tmp_path / "single", *base)
+    assert p.returncode == 0, p.stderr[-2000:]
+    single = _raw_cells(tmp_path / "single" / "master.h5")
+    assert len(single) == 12
+    for name, b in (("paths", parts), ("list", ["@" + str(d / "list.txt")])):
+        p = _rust_bs(b, tmp_path / name, *base)
+        assert p.returncode == 0, p.stderr[-2000:]
+        assert "Inputs:          3 BAMs, merged per window" in p.stderr
+        assert _raw_cells(tmp_path / name / "master.h5") == single, name
+    with h5py.File(str(tmp_path / "list" / "shard_000.h5"), "r") as f:
+        assert f["metadata"].attrs["inputs"].count(",") == 2
+    # The column pileup caller sees the same merged stream.
+    p = _rust_bs(["@" + str(d / "list.txt")], tmp_path / "plp", *base, "--caller", "pileup")
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert _raw_cells(tmp_path / "plp" / "master.h5") == single
+
+    # Python engine: @list equals its own single-BAM run per cell.
+    for name, b in (("py_single", [bam]), ("py_list", ["@" + str(d / "list.txt")])):
+        rc = cli_main(["-b", *b, "-f", CHR19_FASTA, "-o", str(tmp_path / name), "-c", "chr19", "-t", "2",
+                       "--shards", "2", "--engine", "python", *base])
+        assert rc == 0, name
+    assert _calls_of(tmp_path / "py_list" / "master.h5") == _calls_of(tmp_path / "py_single" / "master.h5")
+    assert _calls_of(tmp_path / "py_list" / "master.h5") == _calls_of(tmp_path / "list" / "master.h5")
+
+
+def test_multi_bam_sheet_per_file_cutoffs(bsbolt_split, tmp_path):
+    """A sample sheet gives each BAM its own complexity file and cutoff; the kept
+    cells are their union, in both engines, and an .xlsx sheet works the same."""
+    from taps_sc_extract.cli import main as cli_main
+
+    bam, d, groups, counts = bsbolt_split
+    # Cutoffs that keep the larger cell of part0 and part2, and both cells of part1.
+    cut = [max(counts[bc] for bc in g) for g in groups]
+    rows = [("part0.bam", "part0.complexity.txt", cut[0]), ("part1.bam", "part1.complexity.txt", 0),
+            ("part2.bam", "part2.complexity.txt", cut[2])]
+    sheet = d / "sheet.tsv"
+    sheet.write_text("bam\tcomplexity\tmin_complexity\n" + "".join(f"{b}\t{c}\t{m}\n" for b, c, m in rows))
+    want_cells = {bc for g, m in zip(groups, (cut[0], 0, cut[2])) for bc in g if counts[bc] >= m}
+    assert 2 < len(want_cells) < 6
+
+    p = _rust_bs("@" + str(sheet), tmp_path / "rs", "--trim", "manual")
+    assert p.returncode == 0, p.stderr[-2000:]
+    rs = _calls_of(tmp_path / "rs" / "master.h5")
+    assert {bc for ctx in rs.values() for bc, _ in ctx} == want_cells
+    # Site-depth auto counts the union of kept cells.
+    with h5py.File(str(tmp_path / "rs" / "shard_000.h5"), "r") as f:
+        assert f["metadata"].attrs["site_depth_limit"] == str(4 * len(want_cells))
+
+    rc = cli_main(["-b", "@" + str(sheet), "-f", CHR19_FASTA, "-o", str(tmp_path / "py"), "-c", "chr19", "-t", "2",
+                   "--shards", "2", "--engine", "python", "--trim", "manual"])
+    assert rc == 0
+    assert _calls_of(tmp_path / "py" / "master.h5") == rs
+
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["bam", "complexity", "min_complexity"])
+    for b, c, m in rows:
+        ws.append([b, c, m])
+    xlsx = d / "sheet.xlsx"
+    wb.save(str(xlsx))
+    rc = cli_main(["-b", "@" + str(xlsx), "-f", CHR19_FASTA, "-o", str(tmp_path / "xl"), "-c", "chr19", "-t", "2",
+                   "--shards", "2", "--trim", "manual"])
+    assert rc == 0
+    assert _calls_of(tmp_path / "xl" / "master.h5") == rs
+
+
+def test_multi_bam_rejections(bsbolt_split, tmp_path):
+    """Overlapping barcodes, a swapped complexity file, different references and
+    a finite pileup cap in the Python engine are refused."""
+    from taps_sc_extract.cli import main as cli_main
+
+    bam, d, groups, counts = bsbolt_split
+    # The same barcode listed for two inputs.
+    (d / "overlap.tsv").write_text("bam\tcomplexity\npart0.bam\tpart0.complexity.txt\npart1.bam\tpart0.complexity.txt\n")
+    p = _rust_bs("@" + str(d / "overlap.tsv"), tmp_path / "o")
+    assert p.returncode != 0 and "a barcode must belong to one input" in p.stderr
+    # Rows pointing at each other's complexity files.
+    (d / "swap.tsv").write_text("bam\tcomplexity\npart0.bam\tpart1.complexity.txt\npart1.bam\tpart0.complexity.txt\n")
+    p = _rust_bs("@" + str(d / "swap.tsv"), tmp_path / "s")
+    assert p.returncode != 0 and "pointing at the right file" in p.stderr
+    rc = cli_main(["-b", "@" + str(d / "swap.tsv"), "-f", CHR19_FASTA, "-o", str(tmp_path / "ps"), "-c", "chr19",
+                   "--engine", "python", "--trim", "manual"])
+    assert rc != 0
+    # A BAM whose header has a different chr19 length.
+    with pysam.AlignmentFile(str(d / "part2.bam")) as f:
+        h = f.header.to_dict()
+        for sq in h["SQ"]:
+            if sq["SN"] == "chr1":
+                sq["LN"] += 1
+        with pysam.AlignmentFile(str(d / "other_ref.bam"), "wb", header=h) as o:
+            for r in f:
+                o.write(pysam.AlignedSegment.fromstring(r.to_string(), o.header))
+    pysam.index(str(d / "other_ref.bam"))
+    p = _rust_bs([str(d / "part0.bam"), str(d / "other_ref.bam")], tmp_path / "h")
+    assert p.returncode != 0 and "different @SQ contigs or lengths" in p.stderr
+    # Python engine: a finite --max-depth needs one merged pileup, which it cannot build.
+    rc = cli_main(["-b", "@" + str(d / "list.txt"), "-f", CHR19_FASTA, "-o", str(tmp_path / "pd"), "-c", "chr19",
+                   "--engine", "python", "--trim", "manual", "--max-depth", "50"])
+    assert rc != 0

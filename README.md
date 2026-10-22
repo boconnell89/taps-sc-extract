@@ -148,7 +148,7 @@ usage: taps-sc-extract [-h] -b BAM -f FASTA -o OUT [-c CHROMS] [-w WHITELIST]
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-b, --bam` | `str` | *Required* | Coordinate-sorted alignments: BAM, CRAM (decoded against `-f`) or SAM (copied to a temporary BAM first). A missing index (`.bai`, `.csi` for contigs over 512 Mb, `.crai`) is built next to the file, or in the temp directory if that directory is read-only; the time is logged separately. CRAM decoding costs extra CPU per read. |
+| `-b, --bam` | `str` | *Required* | Coordinate-sorted alignments: BAM, CRAM (decoded against `-f`) or SAM (copied to a temporary BAM first). A missing index (`.bai`, `.csi` for contigs over 512 Mb, `.crai`) is built next to the file, or in the temp directory if that directory is read-only; the time is logged separately. CRAM decoding costs extra CPU per read. Several inputs: list them, or `-b @FILE` (see [Several input BAMs](#several-input-bams)). |
 | `-f, --fasta` | `str` | *Required* | Path to reference FASTA (`.fa` + `.fai`). |
 | `-o, --out` | `str` | *Required* | Output `.h5` file path or output directory (when `--shards > 1`). |
 | `-c, --chroms` | `str` | `None` | Comma-separated contigs (e.g. `chr1,chr2` or `chr19`). Default: the primary chromosomes in the BAM header, detected per species: names that are a number or X, Y, Z, W, with or without a `chr` prefix (hg38: `chr1`..`chr22`, `chrX`, `chrY`; mm10: `chr1`..`chr19`, `chrX`, `chrY`; Ensembl: `1`..`22`, `X`, `Y`). chrM/MT, unplaced scaffolds, alts, decoys and spike-ins are left out. The run log prints what was found, e.g. `22 autosomes + chrX, chrY`. |
@@ -325,6 +325,41 @@ $$\text{Unmethylated } \text{C} \xrightarrow{\text{TAPS}} \text{C}$$
 | **OB** (Original Bottom, Strand `-`) | `G` | `G` | Unmodified ($\text{C}$) | **Unmethylated** (`t += 1`) |
 
 *Note: In the Amethyst HDF5 output schema, `t` stores unmethylated counts and `c` stores methylated counts.*
+
+### Several input BAMs
+
+One run can read several coordinate-sorted, indexed BAMs and write one output (single file or shards + `master.h5`). Every barcode must belong to exactly one input, e.g. one BAM per Tn5 index.
+
+```bash
+taps-sc-extract -b a.bam b.bam c.bam -f ref.fa -o out/      # paths
+taps-sc-extract -b @inputs.txt -f ref.fa -o out/            # one path per line ('#' comments)
+taps-sc-extract -b @samples.tsv -f ref.fa -o out/           # sample sheet, per-file filters
+taps-sc-extract -b @samples.xlsx -f ref.fa -o out/          # same, as Excel (needs openpyxl: pip install .[xlsx])
+```
+
+**Sample sheet:** a header row with a `bam` column. Optional columns, all per file: `complexity`, `min_complexity`, `max_complexity` and `whitelist`.
+- Relative paths are read against the sheet's own directory.
+- A blank cell falls back to the matching global flag (`--complexity`, `--min-complexity`, ...).
+- The cells kept are the union of every file's own filter. `--site-depth-limit auto` counts all of them.
+
+| bam | complexity | min_complexity |
+|---|---|---|
+| lib-ATTGTGAA.bam | lib-ATTGTGAA.complexity.txt | 10000 |
+| lib-CCTTCACC.bam | lib-CCTTCACC.complexity.txt | 5000 |
+
+**How it reads:**
+- Each window reads every input and merges the reads by position into one pileup.
+- With the default unlimited pileup (`--max-depth 0`), calls equal a `samtools merge` followed by a single-BAM run. A finite `--max-depth` applies to the merged pileup, as after `samtools merge`. The Python engine runs one pileup per file and refuses a finite `--max-depth` with several inputs.
+- Each input's index is loaded once and shared by all worker threads. Each worker opens its own handle on every file, so a run keeps workers × inputs files open, and the open-file limit is raised as needed.
+- With several inputs, per-file decompression threads default to 0.
+
+**Checks before extracting:** the run stops with an error if
+- the inputs' `@SQ` contigs or lengths differ;
+- their chemistries differ;
+- a barcode is in two inputs' complexity files;
+- fewer than half of an input's first 5,000 reads have a barcode in its own complexity file (a sheet row pointing at the wrong file).
+
+**Output:** the `inputs` attribute in `/metadata` lists the files.
 
 ### Bisulfite (BSBolt, single-end)
 

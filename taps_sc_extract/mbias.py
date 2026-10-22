@@ -94,6 +94,19 @@ def sample_windows(contigs: List[Tuple[str, int, int]], start: Optional[int] = N
 # Counting (Python engine)
 # --------------------------------------------------------------------------
 
+def add_counts(a, b):
+    """Add another input's (table, plateau, reads) over the same windows (Rust ``Counts::add``)."""
+    table, plateau, n = a
+    for k, v in b[0].items():
+        e = table.setdefault(k, [0, 0])
+        e[0] += v[0]
+        e[1] += v[1]
+    for ctx in plateau:
+        plateau[ctx][0] += b[1][ctx][0]
+        plateau[ctx][1] += b[1][ctx][1]
+    return table, plateau, n + b[2]
+
+
 def count_table(bam, fasta, windows, chemistry: str, min_mapq: int, min_baseq: int):
     """Count methylation by position from each sequenced end. Returns
     (table dict, plateau dict, reads used)."""
@@ -369,7 +382,7 @@ def plot(tsv_path: str, out_prefix: str, title: str) -> None:
 
 def bam_prefix(bam_path: str) -> str:
     base = os.path.basename(bam_path)
-    for ext in (".bam", ".cram", ".sam"):
+    for ext in (".bam", ".cram", ".sam", ".tsv", ".txt"):
         if base.endswith(ext):
             return base[: -len(ext)]
     return base

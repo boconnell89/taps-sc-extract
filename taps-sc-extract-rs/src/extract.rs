@@ -680,7 +680,7 @@ const BAQ_PAD: u64 = 16_384;
 /// context calls and BAQ; `sam_prob_realn`'s contig-coordinate contract is
 /// kept by passing slice bounds (`BaqJob::ref_lo`/`ref_hi`).
 pub fn process_window(
-    bam: &mut IndexedReader,
+    bam: &mut dyn crate::multibam::WindowSource,
     fasta: &FastFaiReader,
     window: &Window,
     whitelist: Option<&HashSet<String>>,
@@ -699,8 +699,7 @@ pub fn process_window(
         .fetch(&window.contig, ref_start, ref_end)
         .with_context(|| format!("FASTA fetch {}:{ref_start}-{ref_end}", window.contig))?;
 
-    bam.fetch((window.contig.as_str(), window.start, window.end))
-        .map_err(|e| anyhow::anyhow!("BAM fetch: {e}"))?;
+    bam.fetch(&window.contig, window.start, window.end)?;
 
     if profile {
         timing.setup_s = t_window.elapsed().as_secs_f64();
@@ -937,7 +936,7 @@ pub fn process_window(
                         eof = true;
                         break;
                     }
-                    Some(Err(e)) => anyhow::bail!("BAM read: {e}"),
+                    Some(Err(e)) => anyhow::bail!("{e}"),
                     Some(Ok(())) => {
                         timing.records += 1;
                         let acc = accept_record(&slot.pool[n], params, whitelist);

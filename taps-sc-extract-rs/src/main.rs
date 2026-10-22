@@ -19,7 +19,9 @@ mod extract_noodles;
 mod fasta;
 mod h5_out;
 mod input;
+mod inputs;
 mod mbias;
+mod multibam;
 mod parallel;
 mod profile;
 mod readcall;
@@ -183,8 +185,12 @@ enum Commands {
     },
     /// Single-thread window extract to compact shard temp files (PR3/PR4).
     Extract {
-        #[arg(short = 'b', long)]
-        bam: PathBuf,
+        /// Input BAM(s): one or more paths, or @FILE naming a list (one path
+        /// per line) or a sample sheet (TSV with a `bam` header column and
+        /// optional complexity, min_complexity, max_complexity, whitelist).
+        /// A barcode must belong to one input; reads are merged per window.
+        #[arg(short = 'b', long, num_args = 1.., required = true)]
+        bam: Vec<PathBuf>,
         #[arg(short = 'f', long)]
         fasta: PathBuf,
         /// Output `.h5` file (`--shards 1`) or directory of shards + `master.h5`.
@@ -655,7 +661,7 @@ fn main() -> Result<()> {
             let r = match pileup.as_str() {
                 "noodles" => extract_regions_stats_noodles(&bam, &fasta, &windows, wl.as_ref(), &params)?,
                 "htslib" | "rust-htslib" => extract_stats_parallel(
-                    &bam,
+                    std::slice::from_ref(&bam),
                     &fasta,
                     &windows,
                     wl.as_ref(),
@@ -746,8 +752,18 @@ fn main() -> Result<()> {
         } => {
             let fai = FastFaiReader::open(&fasta)?;
             let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-            let prepared = input::prepare(&bam, &fasta, nproc)?;
-            let bam = prepared.path.clone();
+            let spec = crate::inputs::parse_bam_args(&bam)?;
+            let prepared = spec
+                .bams
+                .iter()
+                .map(|b| input::prepare(b, &fasta, nproc))
+                .collect::<Result<Vec<_>>>()?;
+            let bams: Vec<PathBuf> = prepared.iter().map(|p| p.path.clone()).collect();
+            let bam = bams[0].clone();
+            if bams.len() > 1 {
+                crate::inputs::check_same_contigs(&bams)?;
+                eprintln!("Inputs:          {} BAMs, merged per window", bams.len());
+            }
             // Default: the BAM's primary chromosomes (autosomes + sex chromosomes).
             let primary = match &chroms {
                 Some(_) => Vec::new(),
@@ -764,6 +780,21 @@ fn main() -> Result<()> {
             // Chemistry from the BAM, then its defaults for every unset option.
             let detected = chemistry::detect(&bam, strand_source == chemistry::StrandSource::Auto)?;
             let chem = chemistry::resolve(chemistry, &detected, strand_source)?;
+            // Every input must resolve to the same chemistry: runs never mix them.
+            for b in &bams[1..] {
+                let d = chemistry::detect(b, strand_source == chemistry::StrandSource::Auto)?;
+                let c = chemistry::resolve(chemistry, &d, strand_source)
+                    .map_err(|e| anyhow::anyhow!("chemistry of {}: {e}", b.display()))?;
+                if c != chem {
+                    anyhow::bail!(
+                        "{} is {} but {} is {}: one run takes one chemistry",
+                        bam.display(),
+                        chem.label(),
+                        b.display(),
+                        c.label()
+                    );
+                }
+            }
             chemistry::check_reference(&fai, &bam, &contig_list)?;
             let dflt = chem.defaults();
             if chem == chemistry::Chemistry::Bisulfite && baq == Some(BaqMode::Htslib) {
@@ -775,13 +806,23 @@ fn main() -> Result<()> {
             let min_baseq = min_baseq.unwrap_or(dflt.min_baseq);
             let min_mapq = min_mapq.unwrap_or(dflt.min_mapq);
             // Cells kept by --complexity (with its cutoff; every barcode in
-            // the file without one) and/or --whitelist.
-            let wl = barcode::load_cell_filter(
+            // the file without one) and/or --whitelist; with several inputs,
+            // the union of each input's own filter.
+            let cell_filter = crate::inputs::load_cell_filters(
+                &spec,
                 whitelist.as_deref(),
                 complexity.as_deref(),
                 min_complexity,
                 max_complexity,
             )?;
+            crate::inputs::check_barcodes_match(&bams, &cell_filter.listed)?;
+            if bams.len() > 1 {
+                for (b, (kept, listed)) in bams.iter().zip(&cell_filter.per_file) {
+                    let f = |v: &Option<usize>| v.map_or_else(|| "all".to_string(), |n| n.to_string());
+                    eprintln!("  {}: {} cells kept of {} listed", b.display(), f(kept), f(listed));
+                }
+            }
+            let wl = cell_filter.keep.clone();
             let max_depth = max_depth.unwrap_or(dflt.max_depth);
             if molecules_per_cell == 0 {
                 anyhow::bail!("--molecules-per-cell must be at least 1");
@@ -831,6 +872,7 @@ fn main() -> Result<()> {
                 ("max_depth", max_depth.to_string()),
                 ("site_depth_limit", site_depth_limit.to_string()),
                 ("cell_site_cap", cell_site_cap.to_string()),
+                ("inputs", bams.iter().map(|b| b.display().to_string()).collect::<Vec<_>>().join(",")),
                 ("blacklist", blacklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
                 ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                 ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
@@ -870,20 +912,25 @@ fn main() -> Result<()> {
                     end: e,
                 }];
             }
+            // Several inputs: every worker reads every file, so per-file
+            // decompression threads would multiply; inflate on the worker.
             let decomp = decomp_threads
                 .or_else(|| saved.as_ref().and_then(|(p, _)| p.decomp_threads))
-                .unwrap_or_else(|| autotune::default_decomp_threads(n_workers));
-            let traffic = match estimate_bam_traffic(&bam, &contig_list) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("warning: BAM read estimate unavailable: {e}");
-                    let bytes = std::fs::metadata(&bam).map(|m| m.len()).unwrap_or(0);
-                    BamTraffic {
-                        mapped_reads: 0,
-                        estimated_bytes: bytes,
+                .unwrap_or_else(|| if bams.len() > 1 { 0 } else { autotune::default_decomp_threads(n_workers) });
+            // Summed over every input.
+            let mut traffic = BamTraffic { mapped_reads: 0, estimated_bytes: 0 };
+            for b in &bams {
+                match estimate_bam_traffic(b, &contig_list) {
+                    Ok(t) => {
+                        traffic.mapped_reads += t.mapped_reads;
+                        traffic.estimated_bytes += t.estimated_bytes;
+                    }
+                    Err(e) => {
+                        eprintln!("warning: BAM read estimate unavailable for {}: {e}", b.display());
+                        traffic.estimated_bytes += std::fs::metadata(b).map(|m| m.len()).unwrap_or(0);
                     }
                 }
-            };
+            }
             let est_sites = autotune::estimate_sites(
                 traffic.mapped_reads,
                 context.site_share(),
@@ -903,20 +950,28 @@ fn main() -> Result<()> {
                 // --trim auto: M-bias on a fixed sample, trims for ends not set.
                 let t0 = std::time::Instant::now();
                 use rust_htslib::bam::Read as _;
-                let mut rd = crate::input::open_indexed(&bam)?;
-                let stats = rd.index_stats().map_err(|e| anyhow::anyhow!("index stats: {e}"))?;
-                let names: Vec<String> =
-                    rd.header().target_names().iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
-                let sel: Vec<(String, u64, u64)> = contig_list
-                    .iter()
-                    .filter_map(|c| {
-                        let tid = names.iter().position(|n| n == c)?;
-                        let (_, len, mapped, _) = stats.iter().find(|s| s.0 == tid as i64)?;
-                        Some((c.to_string(), *len, *mapped))
-                    })
-                    .collect();
+                // Windows from every input's mapped reads together; each input
+                // is counted over the same windows and the tables added.
+                let mut sel: Vec<(String, u64, u64)> = Vec::new();
+                for b in &bams {
+                    let mut rd = crate::input::open_indexed(b)?;
+                    let stats = rd.index_stats().map_err(|e| anyhow::anyhow!("index stats {}: {e}", b.display()))?;
+                    let names: Vec<String> =
+                        rd.header().target_names().iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+                    for c in &contig_list {
+                        let Some(tid) = names.iter().position(|n| n == c) else { continue };
+                        let Some((_, len, mapped, _)) = stats.iter().find(|s| s.0 == tid as i64) else { continue };
+                        match sel.iter_mut().find(|e| e.0 == *c) {
+                            Some(e) => e.2 += *mapped,
+                            None => sel.push((c.to_string(), *len, *mapped)),
+                        }
+                    }
+                }
                 let windows = mbias::sample_windows(&sel, start, end);
-                let counts = mbias::count(&bam, &fai, &windows, chem, min_mapq, min_baseq)?;
+                let mut counts = mbias::count(&bam, &fai, &windows, chem, min_mapq, min_baseq)?;
+                for b in &bams[1..] {
+                    counts.add(&mbias::count(b, &fai, &windows, chem, min_mapq, min_baseq)?);
+                }
                 let mates: &[u8] = if chem == chemistry::Chemistry::Bisulfite { &[1] } else { &[1, 2] };
                 let chosen = mbias::choose(&counts, chem, mates);
                 if set_r1.is_none() {
@@ -928,7 +983,7 @@ fn main() -> Result<()> {
                 if set_3p.is_none() {
                     trim_3p = chosen.trim_3p;
                 }
-                let prefix = mbias::output_prefix(&out, n_shards, &bam);
+                let prefix = mbias::output_prefix(&out, n_shards, spec.name_path());
                 if let Some(dir) = prefix.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
@@ -956,6 +1011,7 @@ fn main() -> Result<()> {
                     ("max_depth", max_depth.to_string()),
                     ("site_depth_limit", site_depth_limit.to_string()),
                 ("cell_site_cap", cell_site_cap.to_string()),
+                ("inputs", bams.iter().map(|b| b.display().to_string()).collect::<Vec<_>>().join(",")),
                     ("blacklist", blacklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
                     ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                     ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
@@ -1120,7 +1176,7 @@ fn main() -> Result<()> {
             let (r, pending) = match resolved_memory_mode.as_str() {
                 "memory" => {
                     let (r, mem) = extract_memory_parallel(
-                        &bam,
+                        &bams,
                         &fasta,
                         &windows,
                         wl.as_ref(),
@@ -1141,7 +1197,7 @@ fn main() -> Result<()> {
                         .tempdir()
                         .map_err(|e| anyhow::anyhow!("tempdir: {e}"))?;
                     let r = extract_stream_parallel(
-                        &bam,
+                        &bams,
                         &fasta,
                         &windows,
                         wl.as_ref(),

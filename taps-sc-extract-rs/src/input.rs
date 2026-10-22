@@ -13,10 +13,10 @@
 use anyhow::{Context, Result};
 use rust_htslib::bam::{self, index, IndexedReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Instant;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct OpenOptions {
     /// The prepared file these options belong to.
     path: PathBuf,
@@ -26,7 +26,22 @@ struct OpenOptions {
     reference: Option<PathBuf>,
 }
 
-static OPEN: OnceLock<OpenOptions> = OnceLock::new();
+/// Open options per prepared file (one entry per input; several with multi-BAM runs).
+static OPEN: Mutex<Vec<OpenOptions>> = Mutex::new(Vec::new());
+
+fn options(path: &Path) -> Option<OpenOptions> {
+    OPEN.lock().ok()?.iter().find(|o| o.path == path).cloned()
+}
+
+/// Index file chosen by `prepare` for `path` (None: htslib's default lookup).
+pub fn index_path(path: &Path) -> Option<PathBuf> {
+    options(path).and_then(|o| o.index)
+}
+
+/// True for CRAM input (its index is tied to the open file, so it cannot be shared).
+pub fn is_cram_path(path: &Path) -> bool {
+    is_cram(path)
+}
 
 /// The alignment file to read, plus anything that must live as long as it.
 pub struct PreparedInput {
@@ -51,7 +66,8 @@ fn is_sam(p: &Path) -> bool {
 
 /// Open an indexed BAM/CRAM with the index and reference chosen by `prepare`.
 pub fn open_indexed(path: &Path) -> Result<IndexedReader> {
-    let opts = OPEN.get().filter(|o| o.path == path);
+    let opts = options(path);
+    let opts = opts.as_ref();
     let mut r = match opts.and_then(|o| o.index.as_ref()) {
         Some(idx) => IndexedReader::from_path_and_index(path, idx),
         None => IndexedReader::from_path(path),
@@ -160,7 +176,10 @@ pub fn prepare(path: &Path, fasta: &Path, threads: usize) -> Result<PreparedInpu
         }
         eprintln!("Index built in {:.1}s", t.elapsed().as_secs_f64());
     }
-    let _ = OPEN.set(opts);
+    if let Ok(mut v) = OPEN.lock() {
+        v.retain(|o| o.path != path);
+        v.push(opts);
+    }
     // Fail here, with the real error, if the file still cannot be opened.
     open_indexed(&path)?;
     Ok(PreparedInput {

@@ -36,6 +36,10 @@ classifiers = [
 test = [
     "pytest>=7.0.0",
 ]
+# .xlsx sample sheets for -b @sheet.xlsx (TSV sheets need nothing extra)
+xlsx = [
+    "openpyxl>=3.0",
+]
 
 [project.scripts]
 taps-sc-extract = "taps_sc_extract.cli:main"

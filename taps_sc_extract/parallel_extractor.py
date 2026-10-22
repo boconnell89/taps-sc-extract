@@ -145,6 +145,7 @@ def _barcode_to_shard(bc: str, n_shards: int) -> int:
 
 # Module-level worker globals
 _worker_bam: Optional[pysam.AlignmentFile] = None
+_worker_bams: List[pysam.AlignmentFile] = []
 _worker_fai: Optional[FastFaiReader] = None
 _worker_whitelist: Optional[Set[str]] = None
 _worker_temp_dir: Optional[str] = None
@@ -152,16 +153,17 @@ _worker_params: Optional[Dict[str, Any]] = None
 
 
 def _init_worker(
-    source: AlignmentSource,
+    sources: List[AlignmentSource],
     fasta_path: str,
     whitelist: Optional[Set[str]],
     temp_dir: Optional[str],
     params: Dict[str, Any],
 ):
     """Initialize worker process with clean private file handles."""
-    global _worker_bam, _worker_fai, _worker_whitelist, _worker_temp_dir, _worker_params
+    global _worker_bam, _worker_bams, _worker_fai, _worker_whitelist, _worker_temp_dir, _worker_params
     decomp_threads = params.get("decomp_threads", 1)
-    _worker_bam = source.open(threads=decomp_threads)
+    _worker_bams = [src.open(threads=decomp_threads) for src in sources]
+    _worker_bam = _worker_bams[0]
     _worker_fai = FastFaiReader(fasta_path)
     _worker_whitelist = whitelist
     _worker_temp_dir = temp_dir
@@ -179,7 +181,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     chunk_id, contig, start, end = chunk_info
     t0 = time.time()
 
-    bam = _worker_bam
+    bams = _worker_bams
     fai = _worker_fai
     whitelist = _worker_whitelist
     temp_dir = _worker_temp_dir
@@ -199,7 +201,8 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     chemistry = params.get("chemistry", "taps")
     strand_map, call_table = tables(chemistry)
     if chemistry == "bisulfite":
-        guard_window(bam, contig, start, end, min_mapq, params.get("verify_ys", True))
+        for bam in bams:
+            guard_window(bam, contig, start, end, min_mapq, params.get("verify_ys", True))
     contexts = params.get("contexts", ("CG", "CH"))
 
     # Fetch reference sequence with 2bp padding on each side
@@ -225,110 +228,116 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     # than --site-depth-limit lose their calls in every cell.
     masked = overlapping(params.get("blacklist", {}).get(contig, []), start, end)
     if params.get("site_depth_limit", 0) > 0:
-        masked += window_depth_mask(bam, contig, start, end, params["site_depth_limit"], flag_filter(chemistry),
+        masked += window_depth_mask(bams, contig, start, end, params["site_depth_limit"], flag_filter(chemistry),
                                     min_mapq, ignore_orphans, whitelist)
     mask = Cursor(merge(masked))
     cell_site_cap = params.get("cell_site_cap", 0)
 
-    pileup_iter = bam.pileup(
-        contig,
-        start=start,
-        stop=end,
-        ignore_overlaps=ignore_overlaps,
-        min_base_quality=min_base_quality,
-        stepper="samtools",
-        flag_filter=flag_filter(chemistry),
-        compute_baq=compute_baq,
-        ignore_orphans=ignore_orphans,
-        max_depth=pysam_max_depth(max_depth),
-        min_mapping_quality=min_mapq,
-    )
+    # One pileup per input file: cells never cross files, so per-cell calls
+    # (and each column's per-cell cap) equal a merged pileup's when depth is
+    # unlimited. The site-depth mask above already counts every file.
+    mask_all = mask
+    for bam in bams:
+        mask = Cursor(mask_all.iv)
+        pileup_iter = bam.pileup(
+            contig,
+            start=start,
+            stop=end,
+            ignore_overlaps=ignore_overlaps,
+            min_base_quality=min_base_quality,
+            stepper="samtools",
+            flag_filter=flag_filter(chemistry),
+            compute_baq=compute_baq,
+            ignore_orphans=ignore_orphans,
+            max_depth=pysam_max_depth(max_depth),
+            min_mapping_quality=min_mapq,
+        )
 
-    for col in pileup_iter:
-        pos = col.reference_pos  # 0-based
-        if pos < start or pos >= end:
-            continue
-        if mask.hit(pos):
-            continue
+        for col in pileup_iter:
+            pos = col.reference_pos  # 0-based
+            if pos < start or pos >= end:
+                continue
+            if mask.hit(pos):
+                continue
 
-        rel_pos = pos - ref_start
-        if rel_pos >= len(ref_seq):
-            continue
+            rel_pos = pos - ref_start
+            if rel_pos >= len(ref_seq):
+                continue
 
-        ref_b = ref_seq[rel_pos]
-        if ref_b == "C":
-            n1 = ref_seq[rel_pos + 1] if rel_pos + 1 < len(ref_seq) else "N"
-            if n1 == "G":
-                ctx_tri = "CpG"
-                ctx = "CG"
-            else:
-                n2 = ref_seq[rel_pos + 2] if rel_pos + 2 < len(ref_seq) else "N"
-                if n2 == "G" and n1 in ("A", "C", "T"):
-                    ctx_tri = "CHG"
+            ref_b = ref_seq[rel_pos]
+            if ref_b == "C":
+                n1 = ref_seq[rel_pos + 1] if rel_pos + 1 < len(ref_seq) else "N"
+                if n1 == "G":
+                    ctx_tri = "CpG"
+                    ctx = "CG"
                 else:
-                    ctx_tri = "CHH"
-                ctx = "CH"
-        elif ref_b == "G":
-            p1 = ref_seq[rel_pos - 1] if rel_pos > 0 else "N"
-            if p1 == "C":
-                ctx_tri = "CpG"
-                ctx = "CG"
-            else:
-                p2 = ref_seq[rel_pos - 2] if rel_pos > 1 else "N"
-                if p2 == "C" and p1 in ("A", "G", "T"):
-                    ctx_tri = "CHG"
+                    n2 = ref_seq[rel_pos + 2] if rel_pos + 2 < len(ref_seq) else "N"
+                    if n2 == "G" and n1 in ("A", "C", "T"):
+                        ctx_tri = "CHG"
+                    else:
+                        ctx_tri = "CHH"
+                    ctx = "CH"
+            elif ref_b == "G":
+                p1 = ref_seq[rel_pos - 1] if rel_pos > 0 else "N"
+                if p1 == "C":
+                    ctx_tri = "CpG"
+                    ctx = "CG"
                 else:
-                    ctx_tri = "CHH"
-                ctx = "CH"
-        else:
-            continue
-        if ctx not in contexts:
-            continue
-
-        target_accum = accum_cg if ctx == "CG" else accum_ch
-        pos_1based = pos + 1
-
-        touched = set()
-        for pileupread in col.pileups:
-            if pileupread.is_del or pileupread.is_refskip:
-                continue
-            qpos = pileupread.query_position
-            if qpos is None:
-                continue
-
-            aln = pileupread.alignment
-            strand = strand_map.get(aln.flag)
-            if strand is None:
-                continue
-            lo, hi = trim_window(aln.query_length, aln.flag, trim_r1, trim_r2, trim_3p)
-            if qpos < lo or qpos >= hi:
-                continue
-
-            read_base = aln.query_sequence[qpos]
-            call = call_table.get((strand, ref_b, read_base))
-            if call is None:
-                continue
-
-            qname = aln.query_name
-            sep_idx = qname.find(":")
-            bc = qname[:sep_idx] if sep_idx != -1 else qname
-
-            if whitelist is not None and bc not in whitelist:
-                continue
-
-            barcodes_seen.add(bc)
-            touched.add(bc)
-            counts = target_accum[bc][pos_1based]
-            if call == 1:
-                counts[1] += 1
-                stats[ctx_tri]["c"] += 1
-                stats[ctx]["c"] += 1
+                    p2 = ref_seq[rel_pos - 2] if rel_pos > 1 else "N"
+                    if p2 == "C" and p1 in ("A", "G", "T"):
+                        ctx_tri = "CHG"
+                    else:
+                        ctx_tri = "CHH"
+                    ctx = "CH"
             else:
-                counts[0] += 1
-                stats[ctx_tri]["t"] += 1
-                stats[ctx]["t"] += 1
-        if cell_site_cap and touched:
-            apply_cap(target_accum, touched, pos_1based, cell_site_cap, stats, ctx, ctx_tri)
+                continue
+            if ctx not in contexts:
+                continue
+
+            target_accum = accum_cg if ctx == "CG" else accum_ch
+            pos_1based = pos + 1
+
+            touched = set()
+            for pileupread in col.pileups:
+                if pileupread.is_del or pileupread.is_refskip:
+                    continue
+                qpos = pileupread.query_position
+                if qpos is None:
+                    continue
+
+                aln = pileupread.alignment
+                strand = strand_map.get(aln.flag)
+                if strand is None:
+                    continue
+                lo, hi = trim_window(aln.query_length, aln.flag, trim_r1, trim_r2, trim_3p)
+                if qpos < lo or qpos >= hi:
+                    continue
+
+                read_base = aln.query_sequence[qpos]
+                call = call_table.get((strand, ref_b, read_base))
+                if call is None:
+                    continue
+
+                qname = aln.query_name
+                sep_idx = qname.find(":")
+                bc = qname[:sep_idx] if sep_idx != -1 else qname
+
+                if whitelist is not None and bc not in whitelist:
+                    continue
+
+                barcodes_seen.add(bc)
+                touched.add(bc)
+                counts = target_accum[bc][pos_1based]
+                if call == 1:
+                    counts[1] += 1
+                    stats[ctx_tri]["c"] += 1
+                    stats[ctx]["c"] += 1
+                else:
+                    counts[0] += 1
+                    stats[ctx_tri]["t"] += 1
+                    stats[ctx]["t"] += 1
+            if cell_site_cap and touched:
+                apply_cap(target_accum, touched, pos_1based, cell_site_cap, stats, ctx, ctx_tri)
 
     # Convert accumulator dicts to compact NumPy structured arrays partitioned by shard
     contig_bytes = contig.encode("ascii")
@@ -562,7 +571,7 @@ def _assemble_and_write_shard(
 
 
 def extract_methylation_parallel(
-    bam_path: str,
+    bam_path,
     fasta_path: str,
     out_h5_path: str,
     chroms: Optional[Iterable[str]] = None,
@@ -596,6 +605,7 @@ def extract_methylation_parallel(
     site_depth_limit: int = 0,
     blacklist_path: Optional[str] = None,
     cell_site_cap: int = 0,
+    keep_cells: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -615,13 +625,26 @@ def extract_methylation_parallel(
             f"Use one of: {', '.join(SUPPORTED_COMPRESSION)}."
         )
 
-    whitelist: Optional[Set[str]] = load_cell_filter(
+    # keep_cells: a filter already built for several inputs (cli: per-file
+    # complexity cutoffs); otherwise the single run's whitelist/complexity.
+    whitelist: Optional[Set[str]] = keep_cells if keep_cells is not None else load_cell_filter(
         whitelist_path, complexity_path, min_complexity, max_complexity
     )
 
-    # Builds a missing index / converts SAM; keep input_tmp alive for the run.
-    source, input_tmp = prepare_alignment(bam_path, fasta_path)
-    bam = source.open()
+    # bam_path: one BAM, or a list (a barcode belongs to one file; each window
+    # reads every file). Builds missing indexes / converts SAM; keep the temp
+    # directories alive for the run.
+    bam_paths = [bam_path] if isinstance(bam_path, str) else list(bam_path)
+    if len(bam_paths) > 1 and max_depth:
+        raise ValueError("a finite --max-depth with several inputs is not supported by the Python engine "
+                         "(it runs one pileup per file); use the Rust engine or --max-depth 0")
+    prepared = [prepare_alignment(p, fasta_path) for p in bam_paths]
+    sources = [p[0] for p in prepared]
+    input_tmp = [p[1] for p in prepared]
+    if len(sources) > 1:
+        from .inputs import check_same_contigs
+        check_same_contigs([s.path for s in sources])
+    bam = sources[0].open()
     bam_contigs = set(bam.references)
     if chroms is None:
         target_contigs = primary_contigs(bam.references)
@@ -633,9 +656,13 @@ def extract_methylation_parallel(
     else:
         target_contigs = [c for c in chroms if c in bam_contigs]
 
-    idx_stats = {s.contig: s.mapped for s in bam.get_index_statistics()}
-    total_target_reads = sum(idx_stats.get(c, 0) for c in target_contigs)
     bam.close()
+    idx_stats: Dict[str, int] = defaultdict(int)
+    for src in sources:
+        with src.open() as f:
+            for st in f.get_index_statistics():
+                idx_stats[st.contig] += st.mapped
+    total_target_reads = sum(idx_stats.get(c, 0) for c in target_contigs)
 
     chunk_size_bp = int(chunk_size_mb * 1_000_000)
     chunks = plan_genomic_chunks(fasta_path, target_contigs, chunk_size_bp=chunk_size_bp)
@@ -677,6 +704,7 @@ def extract_methylation_parallel(
         "site_depth_limit": site_depth_limit,
         "cell_site_cap": cell_site_cap,
         "blacklist": blacklist_path or "",
+        "inputs": ",".join(src.path for src in sources),
         "extractor": "taps-sc-extract (python)",
     })
     worker_params = {
@@ -737,7 +765,7 @@ def extract_methylation_parallel(
         with ctx.Pool(
             processes=n_workers,
             initializer=_init_worker,
-            initargs=(source, fasta_path, whitelist, actual_temp_dir, worker_params),
+            initargs=(sources, fasta_path, whitelist, actual_temp_dir, worker_params),
         ) as pool:
             for result in pool.imap_unordered(_process_chunk, chunks, chunksize=1):
                 chunk_id, contig, start, end, shard_payload, chunk_stats = result

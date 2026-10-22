@@ -204,6 +204,23 @@ pub fn count(
     Ok(c)
 }
 
+impl Counts {
+    /// Add another input's counts over the same windows (multi-BAM runs).
+    pub fn add(&mut self, o: &Counts) {
+        for (k, v) in &o.table {
+            let e = self.table.entry(*k).or_insert([0, 0]);
+            e[0] += v[0];
+            e[1] += v[1];
+        }
+        for i in 0..2 {
+            for j in 0..2 {
+                self.plateau[i][j] += o.plateau[i][j];
+            }
+        }
+        self.reads += o.reads;
+    }
+}
+
 fn curve(t: &Table, ctx: &'static str, mate: u8, end: u8) -> Vec<(u64, u64)> {
     (0..P)
         .map(|p| {
@@ -334,7 +351,7 @@ pub fn write_tsv(path: &Path, c: &Counts, trim_r1: u32, trim_r2: u32, trim_3p: u
     Ok(())
 }
 
-/// `<dir>/<bam name without extension>`: the shard directory, or beside a single file.
+/// `<dir>/<input name without extension>` (the BAM, or the input list / sheet): the shard directory, or beside a single file.
 pub fn output_prefix(out: &Path, n_shards: usize, bam: &Path) -> PathBuf {
     let is_h5 = out.extension().is_some_and(|e| e == "h5" || e == "hdf5");
     let dir = if n_shards > 1 || out.is_dir() || !is_h5 {
@@ -347,7 +364,7 @@ pub fn output_prefix(out: &Path, n_shards: usize, bam: &Path) -> PathBuf {
         out.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
     };
     let name = bam.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let stem = [".bam", ".cram", ".sam"].iter().find_map(|e| name.strip_suffix(e)).unwrap_or(&name).to_string();
+    let stem = [".bam", ".cram", ".sam", ".tsv", ".txt"].iter().find_map(|e| name.strip_suffix(e)).unwrap_or(&name).to_string();
     dir.join(stem)
 }
 

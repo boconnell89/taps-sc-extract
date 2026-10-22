@@ -8,6 +8,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections import defaultdict
 from typing import List, Optional
 
 from . import __version__
@@ -50,11 +52,15 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-b", "--bam",
+        nargs="+",
         default=None,
         help=(
-            "Coordinate-sorted TAPS alignments: BAM, CRAM (decoded with -f) or SAM (converted "
-            "to a temporary BAM). A missing .bai/.csi/.crai is built automatically. "
-            "Required unless --test runs without a dataset."
+            "Coordinate-sorted alignments: BAM, CRAM (decoded with -f) or SAM (converted "
+            "to a temporary BAM). A missing .bai/.csi/.crai is built automatically. Several "
+            "inputs: list them, or give @FILE naming a list (one path per line) or a sample "
+            "sheet (.tsv or .xlsx; header row with a 'bam' column and optional complexity, "
+            "min_complexity, max_complexity, whitelist per file). A barcode must belong to "
+            "one input; reads are merged per window. Required unless --test runs without a dataset."
         ),
     )
     parser.add_argument(
@@ -497,7 +503,7 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
     cmd = [
         rust_bin,
         "extract",
-        "-b", parsed.bam,
+        "-b", *parsed.bam,
         "-f", parsed.fasta,
         "-o", parsed.out,
         "--chunk-size-mb", str(chunk_mb),
@@ -583,7 +589,9 @@ def build_tune_command(rust_bin: str, parsed) -> List[str]:
         out_dir = parsed.out if os.path.isdir(parsed.out) else (os.path.dirname(parsed.out) or ".")
     cmd = [rust_bin, "tune", "--temp-dir", temp_dir, "--out-dir", out_dir]
     if parsed.bam:
-        cmd.extend(["-b", parsed.bam, "-f", parsed.fasta])
+        if len(parsed.bam) > 1 or parsed.bam[0].startswith("@"):
+            raise ValueError("--test samples one BAM; give a single -b path")
+        cmd.extend(["-b", parsed.bam[0], "-f", parsed.fasta])
     if parsed.test_quick:
         cmd.append("--quick")
     if parsed.save_profile:
@@ -608,7 +616,7 @@ def find_rust_binary() -> Optional[str]:
     return None
 
 
-def auto_trims(parsed, chem, opts, contigs):
+def auto_trims(parsed, chem, opts, contigs, spec):
     """--trim auto (Python engine): count M-bias on a fixed sample of reads,
     choose trims for the ends the user did not set, and write
     <bam>.mbias.tsv/.png/.pdf beside the output."""
@@ -618,11 +626,23 @@ def auto_trims(parsed, chem, opts, contigs):
 
     log = logging.getLogger("taps_sc_extract")
     fasta = FastFaiReader(parsed.fasta)
-    with pysam.AlignmentFile(parsed.bam, reference_filename=parsed.fasta) as bam:
-        mapped = {s.contig: s.mapped for s in bam.get_index_statistics()}
-        sel = [(c, bam.get_reference_length(c), mapped.get(c, 0)) for c in contigs if c in bam.references]
-        windows = mbias.sample_windows(sel)
-        table, plateau, nreads = mbias.count_table(bam, fasta, windows, chem, opts["min_mapq"], opts["min_baseq"])
+    # Windows from every input's mapped reads together; each input is counted
+    # over the same windows and the tables added (same as the Rust engine).
+    mapped = defaultdict(int)
+    lengths = {}
+    for b in spec.bams:
+        with pysam.AlignmentFile(b, reference_filename=parsed.fasta) as bam:
+            for st in bam.get_index_statistics():
+                mapped[st.contig] += st.mapped
+            lengths.update(zip(bam.references, bam.lengths))
+    sel = [(c, lengths[c], mapped.get(c, 0)) for c in contigs if c in lengths]
+    windows = mbias.sample_windows(sel)
+    counts = None
+    for b in spec.bams:
+        with pysam.AlignmentFile(b, reference_filename=parsed.fasta) as bam:
+            c = mbias.count_table(bam, fasta, windows, chem, opts["min_mapq"], opts["min_baseq"])
+        counts = c if counts is None else mbias.add_counts(counts, c)
+    table, plateau, nreads = counts
     mates = (1,) if chem == "bisulfite" else (1, 2)
     chosen = mbias.choose_trims(table, plateau, chem, mates)
     out = {}
@@ -633,11 +653,11 @@ def auto_trims(parsed, chem, opts, contigs):
     shards = parsed.shards if parsed.shards and parsed.shards > 0 else 1
     odir = mbias.output_dir(parsed.out, shards)
     os.makedirs(odir, exist_ok=True)
-    prefix = os.path.join(odir, mbias.bam_prefix(parsed.bam))
+    prefix = os.path.join(odir, mbias.bam_prefix(spec.name_path))
     trims = {"trim_r1": applied["trim_r1"], "trim_r2": applied["trim_r2"], "trim_3p": applied["trim_3p"]}
     mbias.write_tsv(prefix + ".mbias.tsv", table, plateau, nreads, trims)
     try:
-        mbias.plot(prefix + ".mbias.tsv", prefix, mbias.bam_prefix(parsed.bam))
+        mbias.plot(prefix + ".mbias.tsv", prefix, mbias.bam_prefix(spec.name_path))
     except Exception as e:  # plotting is a report, never a reason to fail the run
         log.warning(f"M-bias plot not written: {e}")
     log.info(
@@ -649,7 +669,7 @@ def auto_trims(parsed, chem, opts, contigs):
     return out
 
 
-def resolve_python_options(parsed):
+def resolve_python_options(parsed, spec):
     """Python engine: detect the chemistry from the BAM and fill unset options
     with its defaults (the Rust engine does the same in chemistry.rs)."""
     import pysam
@@ -657,7 +677,7 @@ def resolve_python_options(parsed):
     from .contigs import primary_contigs
     from .fasta import FastFaiReader
 
-    with pysam.AlignmentFile(parsed.bam, reference_filename=parsed.fasta) as bam:
+    with pysam.AlignmentFile(spec.bams[0], reference_filename=parsed.fasta) as bam:
         det = detect(bam, parsed.strand_source == "auto")
         lengths = dict(zip(bam.references, bam.lengths))
         contigs = (
@@ -665,6 +685,12 @@ def resolve_python_options(parsed):
             else primary_contigs(bam.references)
         )
     chem = resolve(parsed.chemistry, det, parsed.strand_source)
+    # Every input must resolve to the same chemistry: runs never mix them.
+    for b in spec.bams[1:]:
+        with pysam.AlignmentFile(b, reference_filename=parsed.fasta) as bam:
+            c = resolve(parsed.chemistry, detect(bam, parsed.strand_source == "auto"), parsed.strand_source)
+        if c != chem:
+            raise ValueError(f"{spec.bams[0]} is {chem} but {b} is {c}: one run takes one chemistry")
     check_reference(FastFaiReader(parsed.fasta), lengths, contigs)
     if chem == "bisulfite" and parsed.baq == "htslib":
         raise ValueError("--baq htslib treats every unmethylated C as a mismatch in bisulfite data")
@@ -678,12 +704,19 @@ def resolve_python_options(parsed):
     else:
         opts["cell_site_cap"] = parsed.cell_site_cap
     opts["site_depth_limit"] = parsed.site_depth_limit
+    # Cells kept: with several inputs, the union of each input's own filter.
+    from .inputs import check_barcodes_match, load_cell_filters
+    cells, per_file, listed = load_cell_filters(spec, parsed.whitelist, parsed.complexity,
+                                                parsed.min_complexity, parsed.max_complexity)
+    check_barcodes_match(spec.bams, listed)
+    if len(spec.bams) > 1:
+        for b, (kept, n) in zip(spec.bams, per_file):
+            logging.getLogger("taps_sc_extract").info(f"  {b}: {'all' if kept is None else kept} cells kept of {'all' if n is None else n} listed")
+    opts["keep_cells"] = cells
     if parsed.site_depth_limit is None or parsed.site_depth_limit == "auto":
-        from .barcode import load_cell_filter
         from .chemistry import READS_PER_MOLECULE
         from .sitemask import MOLECULES_PER_CELL, auto_site_depth_limit
         mpc = parsed.molecules_per_cell or MOLECULES_PER_CELL
-        cells = load_cell_filter(parsed.whitelist, parsed.complexity, parsed.min_complexity, parsed.max_complexity)
         if cells is not None:
             opts["site_depth_limit"] = auto_site_depth_limit(len(cells), mpc, READS_PER_MOLECULE[chem])
         elif parsed.site_depth_limit == "auto":
@@ -692,7 +725,7 @@ def resolve_python_options(parsed):
             opts["site_depth_limit"] = 0
     opts["trim_mode"] = parsed.trim or ("auto" if chem == "bisulfite" else "manual")
     if opts["trim_mode"] == "auto":
-        opts.update(auto_trims(parsed, chem, opts, contigs))
+        opts.update(auto_trims(parsed, chem, opts, contigs, spec))
     logging.getLogger("taps_sc_extract").info(
         f"Chemistry: {chem} ({'detected from the BAM' if parsed.chemistry == 'auto' else 'explicit'}"
         f"{'; BSBolt ' + det['bsbolt'] if det['bsbolt'] else ''})"
@@ -708,6 +741,16 @@ def main(args: Optional[List[str]] = None) -> int:
     if any(v is not None and v < 0 for v in (parsed.trim_r1, parsed.trim_r2, parsed.trim_3p)):
         logger.error("--trim-r1/--trim-5p, --trim-r2 and --trim-3p must be >= 0.")
         return 1
+    # An .xlsx sample sheet becomes a TSV (paths made absolute) for both engines.
+    sheet_tmp = None
+    if parsed.bam and len(parsed.bam) == 1 and parsed.bam[0].startswith("@") and parsed.bam[0].lower().endswith(".xlsx"):
+        from .inputs import xlsx_to_tsv
+        sheet_tmp = tempfile.TemporaryDirectory(prefix="taps-sheet-")
+        try:
+            parsed.bam = ["@" + xlsx_to_tsv(parsed.bam[0][1:], sheet_tmp.name)]
+        except Exception as e:
+            logger.error(f"sample sheet {parsed.bam[0][1:]}: {e}")
+            return 1
 
     logger.info("=" * 70)
     logger.info(f"taps-sc-extract v{__version__} - Single-Cell TAPS Extractor")
@@ -756,14 +799,17 @@ def main(args: Optional[List[str]] = None) -> int:
     if parsed.chroms:
         chroms_list = [c.strip() for c in parsed.chroms.split(",") if c.strip()]
     try:
-        chem, opts = resolve_python_options(parsed)
+        from .inputs import parse_bam_args
+        spec = parse_bam_args(parsed.bam)
+        chem, opts = resolve_python_options(parsed, spec)
     except Exception as e:
         logger.error(str(e))
         return 1
 
     try:
         extract_methylation_parallel(
-            bam_path=parsed.bam,
+            bam_path=spec.bams,
+            keep_cells=opts["keep_cells"],
             fasta_path=parsed.fasta,
             out_h5_path=parsed.out,
             chroms=chroms_list,

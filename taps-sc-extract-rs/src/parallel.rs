@@ -1,19 +1,20 @@
 //! Rayon window pool.
 //!
 //! Thread-safety:
-//! - Each pool thread owns a private `IndexedReader` (thread-local). Never `Send`ed.
+//! - Each pool thread owns private readers over every input (thread-local `multibam::Merged`);
+//!   only the inputs' loaded indexes are shared (`multibam::Sources`). Readers are never `Send`ed.
 //! - `FastFaiReader` is `Arc`-shared; each `fetch` opens its own `File`.
 //! - Interners and cell maps are per-window, then either written to a unique
 //!   `shard_XXX/chunk_YYYYYY.bin` or merged by barcode string after join.
 //! - Cancellation is `Arc<AtomicBool>`; workers only load it.
 
-use crate::extract::{open_bam, process_window, ExtractParams, WindowResult};
+use crate::extract::{process_window, ExtractParams, WindowResult};
+use crate::multibam::{Merged, Sources};
 use crate::fasta::FastFaiReader;
 use crate::shard_io::{prepare_shard_dirs, write_window_shards};
 use crate::window::Window;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use rust_htslib::bam::IndexedReader;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -121,38 +122,40 @@ fn log_extraction_progress(
 }
 
 thread_local! {
-    static TLS_BAM: RefCell<Option<(PathBuf, usize, IndexedReader)>> = const { RefCell::new(None) };
+    /// (Sources id, decompression threads, this thread's readers).
+    static TLS_BAM: RefCell<Option<(u64, usize, Merged)>> = const { RefCell::new(None) };
 }
 
-fn with_thread_bam<R>(
-    bam_path: &Path,
-    decomp: usize,
-    f: impl FnOnce(&mut IndexedReader) -> Result<R>,
-) -> Result<R> {
+fn with_thread_bam<R>(src: &Sources, decomp: usize, f: impl FnOnce(&mut Merged) -> Result<R>) -> Result<R> {
     TLS_BAM.with(|bam_cell| {
         let mut slot = bam_cell.borrow_mut();
         let need = match slot.as_ref() {
             None => true,
-            Some((p, d, _)) => p.as_path() != bam_path || *d != decomp,
+            Some((id, d, _)) => *id != src.id || *d != decomp,
         };
         if need {
-            let bam = open_bam(bam_path, decomp)?;
-            *slot = Some((bam_path.to_path_buf(), decomp, bam));
+            *slot = None; // close the previous run's files first
+            *slot = Some((src.id, decomp, src.open(decomp)?));
         }
         f(&mut slot.as_mut().unwrap().2)
     })
 }
 
 fn process_one(
-    bam_path: &Path,
+    src: &Sources,
     fasta: &FastFaiReader,
     window: &Window,
     whitelist: Option<&HashSet<String>>,
     params: &ExtractParams,
 ) -> Result<WindowResult> {
-    with_thread_bam(bam_path, params.decomp_threads, |bam| {
-        process_window(bam, fasta, window, whitelist, params)
-    })
+    with_thread_bam(src, params.decomp_threads, |bam| process_window(bam, fasta, window, whitelist, params))
+}
+
+/// Shared indexes for the inputs, and enough open-file headroom for every
+/// worker to hold every input.
+fn load_sources(bams: &[PathBuf], n_workers: usize) -> Result<Arc<Sources>> {
+    crate::multibam::ensure_open_files((n_workers.max(1) * bams.len()) as u64 * 2)?;
+    Ok(Arc::new(Sources::load(bams)?))
 }
 
 fn install_pool<T>(n_workers: usize, f: impl FnOnce() -> T + Send) -> Result<T>
@@ -169,7 +172,7 @@ where
 
 /// Parallel stats (optional per-pos maps if `params.accumulate`).
 pub fn extract_stats_parallel(
-    bam_path: &Path,
+    bams: &[PathBuf],
     fasta_path: &Path,
     windows: &[Window],
     whitelist: Option<&HashSet<String>>,
@@ -179,7 +182,7 @@ pub fn extract_stats_parallel(
 ) -> Result<WindowResult> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
-    let bam_path = bam_path.to_path_buf();
+    let src = load_sources(bams, n_workers)?;
     let params = params.clone();
     let n = windows.len();
     let done = AtomicUsize::new(0);
@@ -190,7 +193,7 @@ pub fn extract_stats_parallel(
         windows.par_iter().try_for_each(|w| -> Result<()> {
             check_cancel(cancel)?;
             let r = process_one(
-                &bam_path,
+                &src,
                 fasta.as_ref(),
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
@@ -220,7 +223,7 @@ pub fn extract_stats_parallel(
 
 /// Parallel stream extract: each window writes unique `chunk_YYYYYY.bin` then drops maps.
 pub fn extract_stream_parallel(
-    bam_path: &Path,
+    bams: &[PathBuf],
     fasta_path: &Path,
     windows: &[Window],
     whitelist: Option<&HashSet<String>>,
@@ -233,7 +236,7 @@ pub fn extract_stream_parallel(
     prepare_shard_dirs(temp_dir, n_shards)?;
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
-    let bam_path = bam_path.to_path_buf();
+    let src = load_sources(bams, n_workers)?;
     let temp_dir = temp_dir.to_path_buf();
     let mut params = params.clone();
     params.accumulate = true;
@@ -247,7 +250,7 @@ pub fn extract_stream_parallel(
         windows.par_iter().try_for_each(|w| -> Result<()> {
             check_cancel(cancel)?;
             let r = process_one(
-                &bam_path,
+                &src,
                 fasta.as_ref(),
                 w,
                 wl.as_ref().map(|a| a.as_ref()),
@@ -279,7 +282,7 @@ pub fn extract_stream_parallel(
 
 /// In-memory extract: keep per-shard window payloads, no temp files.
 pub fn extract_memory_parallel(
-    bam_path: &Path,
+    bams: &[PathBuf],
     fasta_path: &Path,
     windows: &[Window],
     whitelist: Option<&HashSet<String>>,
@@ -291,7 +294,7 @@ pub fn extract_memory_parallel(
 ) -> Result<(WindowResult, Vec<Vec<crate::shard_io::ChunkFile>>)> {
     let fasta = Arc::new(FastFaiReader::open(fasta_path)?);
     let wl = whitelist.map(|w| Arc::new(w.clone()));
-    let bam_path = bam_path.to_path_buf();
+    let src = load_sources(bams, n_workers)?;
     let mut params = params.clone();
     params.accumulate = true;
     let n = windows.len();
@@ -306,7 +309,7 @@ pub fn extract_memory_parallel(
         windows.par_iter().try_for_each(|w| -> Result<()> {
             check_cancel(cancel)?;
             let mut r = process_one(
-                &bam_path,
+                &src,
                 fasta.as_ref(),
                 w,
                 wl.as_ref().map(|a| a.as_ref()),

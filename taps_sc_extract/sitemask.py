@@ -97,10 +97,14 @@ def depth_mask(spans: Iterable[Interval], limit: int) -> List[Interval]:
     return masked
 
 
-def window_depth_mask(bam, contig: str, start: int, end: int, limit: int, flag_filter: int, min_mapq: int,
+def window_depth_mask(bams, contig: str, start: int, end: int, limit: int, flag_filter: int, min_mapq: int,
                       ignore_orphans: bool, whitelist: Optional[Set[str]]) -> List[Interval]:
-    """``depth_mask`` over the reads the pileup of ``[start, end)`` would use."""
-    def spans():
+    """``depth_mask`` over the reads the pileup of ``[start, end)`` would use,
+    over every input file together (``bams``: one AlignmentFile or a list)."""
+    if not isinstance(bams, (list, tuple)):
+        bams = [bams]
+
+    def spans_of(bam):
         for r in bam.fetch(contig, start, end):
             if r.flag & flag_filter or r.mapping_quality < min_mapq:
                 continue
@@ -113,7 +117,7 @@ def window_depth_mask(bam, contig: str, start: int, end: int, limit: int, flag_f
                     continue
             if r.reference_end is not None:
                 yield r.reference_start, r.reference_end
-    return depth_mask(spans(), limit)
+    return depth_mask(heapq.merge(*(spans_of(b) for b in bams)), limit)
 
 
 def load_blacklist(path: str) -> Dict[str, List[Interval]]:
