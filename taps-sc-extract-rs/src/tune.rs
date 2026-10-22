@@ -1107,6 +1107,7 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
             cli_writers: 0,
             profile_writers: Some(rec_writers),
             in_process: false,
+            streamable: true,
         });
         let mode = plan.mode.as_str();
         let _ = writeln!(rpt, "\n================ Dataset ================");

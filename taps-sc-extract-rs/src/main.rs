@@ -256,10 +256,13 @@ enum Commands {
         /// Minimum mapping quality (default: taps 0, bisulfite 10).
         #[arg(long)]
         min_mapq: Option<u8>,
-        /// Maximum reads per position, all cells together (htslib cap; default
-        /// 100000); 0 = unlimited.
+        /// Maximum reads per position, all cells together (htslib cap): a
+        /// number (0 = unlimited) or auto (default) = 4 molecules (2 strands x
+        /// 2 haplotypes) x reads per molecule (taps 2, bisulfite 1) x cells
+        /// kept by --complexity (with its cutoff) / --whitelist. Without
+        /// either the default is 100000.
         #[arg(long)]
-        max_depth: Option<u32>,
+        max_depth: Option<crate::extract::DepthArg>,
         #[arg(long, default_value_t = false)]
         no_overlap_clip: bool,
         #[arg(long, default_value_t = false)]
@@ -742,7 +745,25 @@ fn main() -> Result<()> {
             }
             let min_baseq = min_baseq.unwrap_or(dflt.min_baseq);
             let min_mapq = min_mapq.unwrap_or(dflt.min_mapq);
-            let max_depth = max_depth.unwrap_or(dflt.max_depth);
+            // Cells kept by --complexity (with its cutoff; every barcode in
+            // the file without one) and/or --whitelist.
+            let wl = barcode::load_cell_filter(
+                whitelist.as_deref(),
+                complexity.as_deref(),
+                min_complexity,
+                max_complexity,
+            )?;
+            let (max_depth, depth_src) = match (max_depth, wl.as_ref().map(|w| w.len())) {
+                (Some(crate::extract::DepthArg::Fixed(n)), _) => (n, "explicit".to_string()),
+                (_, Some(n)) => (
+                    crate::extract::auto_max_depth(n, chem.reads_per_molecule()),
+                    format!("auto: 4 molecules x {} read(s) per molecule x {n} cells", chem.reads_per_molecule()),
+                ),
+                (Some(crate::extract::DepthArg::Auto), None) => {
+                    anyhow::bail!("--max-depth auto needs --complexity or --whitelist to count the cells; give a number instead")
+                }
+                (None, None) => (dflt.max_depth, "default; auto needs --complexity or --whitelist".to_string()),
+            };
             let trim_mode = trim.unwrap_or(if chem == chemistry::Chemistry::Bisulfite { TrimMode::Auto } else { TrimMode::Manual });
             let (set_r1, set_r2, set_3p) = (trim_r1, trim_r2, trim_3p);
             let mut trim_r1 = trim_r1.unwrap_or(dflt.trim_r1);
@@ -759,15 +780,10 @@ fn main() -> Result<()> {
                 ("trim_mode", "manual".to_string()),
                 ("min_mapq", min_mapq.to_string()),
                 ("min_baseq", min_baseq.to_string()),
+                ("max_depth", max_depth.to_string()),
                 ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                 ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
             ]);
-            let wl = barcode::load_cell_filter(
-                whitelist.as_deref(),
-                complexity.as_deref(),
-                min_complexity,
-                max_complexity,
-            )?;
 
             // PR7 Auto-tuning & Phase 1 Writer Auto-scaling
             let (budget_gb, budget_src) = autotune::system_memory_budget_gb(max_memory_gb, max_memory_fraction);
@@ -806,8 +822,32 @@ fn main() -> Result<()> {
             let decomp = decomp_threads
                 .or_else(|| saved.as_ref().and_then(|(p, _)| p.decomp_threads))
                 .unwrap_or_else(|| autotune::default_decomp_threads(n_workers));
-            let (n_shards, shards_src) = autotune::resolve_shards(shards, cell_source.count());
+            let traffic = match estimate_bam_traffic(&bam, &contig_list) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("warning: BAM read estimate unavailable: {e}");
+                    let bytes = std::fs::metadata(&bam).map(|m| m.len()).unwrap_or(0);
+                    BamTraffic {
+                        mapped_reads: 0,
+                        estimated_bytes: bytes,
+                    }
+                }
+            };
+            let est_sites = autotune::estimate_sites(
+                traffic.mapped_reads,
+                context.site_share(),
+                cell_source.count(),
+                selected_bp / 1_000_000,
+            );
+            let (n_shards, shards_src) = autotune::resolve_shards(
+                shards,
+                cell_source.count(),
+                est_sites,
+                nproc,
+                crate::h5_out::is_h5_filename(&out) && !out.is_dir(),
+            );
             let writer_mode = WriterMode::parse(&writer_mode, n_shards)?;
+            let streams_enabled = std::env::var("TAPS_STREAM_WRITERS").map_or(true, |v| v != "0");
             if trim_mode == TrimMode::Auto {
                 // --trim auto: M-bias on a fixed sample, trims for ends not set.
                 let t0 = std::time::Instant::now();
@@ -862,21 +902,11 @@ fn main() -> Result<()> {
                     ("trim_mode", "auto".to_string()),
                     ("min_mapq", min_mapq.to_string()),
                     ("min_baseq", min_baseq.to_string()),
+                    ("max_depth", max_depth.to_string()),
                     ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                     ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
                 ]);
             }
-            let traffic = match estimate_bam_traffic(&bam, &contig_list) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("warning: BAM read estimate unavailable: {e}");
-                    let bytes = std::fs::metadata(&bam).map(|m| m.len()).unwrap_or(0);
-                    BamTraffic {
-                        mapped_reads: 0,
-                        estimated_bytes: bytes,
-                    }
-                }
-            };
             let mem_plan = autotune::plan_memory(&autotune::MemoryInputs {
                 mode: &memory_mode,
                 budget_gb,
@@ -893,6 +923,8 @@ fn main() -> Result<()> {
                     None
                 },
                 in_process: writer_mode == WriterMode::Thread,
+                // Same conditions as the ShardStreams start below.
+                streamable: writer_mode == WriterMode::Process && n_shards > 1 && streams_enabled,
             });
             let (writer_threads, writer_src) = (mem_plan.writers, mem_plan.writers_src);
             let (resolved_memory_mode, mode_src) = (mem_plan.mode.clone(), mem_plan.mode_src);
@@ -980,7 +1012,7 @@ fn main() -> Result<()> {
                 detected.bsbolt.as_ref().map(|v| format!("; BSBolt {v}")).unwrap_or_default()
             );
             eprintln!(
-                "  Read filters:    MAPQ >= {}, base quality >= {}, max depth {}{}",
+                "  Read filters:    MAPQ >= {}, base quality >= {}, max depth {} ({depth_src}){}",
                 params.min_mapq,
                 params.min_baseq,
                 if params.max_depth == 0 { "unlimited".to_string() } else { params.max_depth.to_string() },
@@ -1004,7 +1036,7 @@ fn main() -> Result<()> {
                 && writer_mode == crate::h5_out::WriterMode::Process
                 && n_shards > 1
                 && writer_threads >= n_shards
-                && std::env::var("TAPS_STREAM_WRITERS").map_or(true, |v| v != "0")
+                && streams_enabled
             {
                 match crate::h5_out::resolve_output_target(&out, n_shards)? {
                     crate::h5_out::OutputTarget::ShardDir(dir) => Some(crate::shard_stream::ShardStreams::start(

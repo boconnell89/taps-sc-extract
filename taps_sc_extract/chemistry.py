@@ -121,6 +121,18 @@ def resolve(requested: str, det: Dict[str, object], strand_source: str = "auto")
     raise ValueError(f"unknown chemistry {requested!r}")
 
 
+# --max-depth auto: molecules one cell can have at a position in a deduplicated
+# library (2 strands x 2 haplotypes), times reads per molecule (both mates for
+# paired-end TAPS). Same rule as extract::auto_max_depth in Rust.
+MOLECULES_PER_CELL = 4
+READS_PER_MOLECULE = {"taps": 2, "bisulfite": 1}
+
+
+def auto_max_depth(cells: int, chemistry: str) -> int:
+    """4 molecules x reads per molecule x cells kept by --complexity / --whitelist."""
+    return max(1, min(cells * MOLECULES_PER_CELL * READS_PER_MOLECULE[chemistry], 2**31 - 1))
+
+
 def defaults(chemistry: str) -> Dict[str, object]:
     """Per-chemistry defaults for options the user did not set (see chemistry.rs)."""
     if chemistry == "taps":

@@ -1023,6 +1023,11 @@ def test_rust_command_uses_rust_defaults_unless_set():
     assert cmd[cmd.index("--compression") + 1] == "blosc"
     assert "--decomp-threads" not in cmd
     assert "--context" not in cmd
+    # Rust picks workers, shards and the depth cap itself unless set.
+    assert "-t" not in cmd and "--shards" not in cmd and "--max-depth" not in cmd
+    set_ = base + ["-t", "8", "--max-depth", "auto"]
+    cmd = build_rust_command("taps-sc-extract-rs", parse_args(set_), set_)
+    assert cmd[cmd.index("-t") + 1] == "8" and cmd[cmd.index("--max-depth") + 1] == "auto"
 
     explicit = base + ["--chunk-size-mb", "10", "--compression", "gzip", "--shards", "4"]
     parsed = parse_args(explicit)
@@ -1178,6 +1183,38 @@ def test_bisulfite_rust_defaults_match_truth(bsbolt_bam, tmp_path):
     with h5py.File(str(tmp_path / "rs" / "shard_000.h5"), "r") as f:
         attrs = dict(f["metadata"].attrs)
     assert attrs["chemistry"] == "bisulfite" and attrs["trim_3p"] == "10" and attrs["bsbolt_version"] == "1.2.1"
+
+
+def test_max_depth_auto_counts_kept_cells(bsbolt_bam, tmp_path):
+    """--max-depth auto = 4 molecules x reads per molecule (bisulfite 1) x the
+    cells --complexity keeps (all barcodes in the file without a cutoff), in
+    both engines; without a cell list the default stays 100000."""
+    from bsbolt_fixture import CELLS
+    from taps_sc_extract.chemistry import auto_max_depth
+    from taps_sc_extract.cli import main as cli_main
+
+    assert auto_max_depth(10_073, "bisulfite") == 40_292
+    assert auto_max_depth(7_351, "taps") == 58_808
+    bam, _ = bsbolt_bam
+    cx = tmp_path / "cx.txt"
+    cx.write_text("".join(f"{i + 1}\t{bc}\t{1000 * (i + 1)}\t{500 * (i + 1)}\t50\n"
+                          for i, bc in enumerate(CELLS)))
+    cases = [([], "100000"),
+             (["--complexity", str(cx)], str(4 * len(CELLS))),
+             (["--complexity", str(cx), "--min-complexity", "1500"], str(4 * (len(CELLS) - 2)))]
+    for k, (extra, want) in enumerate(cases):
+        p = _rust_bs(bam, tmp_path / f"rs{k}", "--trim", "manual", *extra)
+        assert p.returncode == 0, p.stderr[-2000:]
+        with h5py.File(str(tmp_path / f"rs{k}" / "shard_000.h5"), "r") as f:
+            assert f["metadata"].attrs["max_depth"] == want, (extra, p.stderr[-800:])
+        out = tmp_path / f"py{k}"
+        rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19", "-t", "2",
+                       "--shards", "2", "--engine", "python", "--trim", "manual", *extra])
+        assert rc == 0
+        with h5py.File(str(out / "shard_000.h5"), "r") as f:
+            assert str(f["metadata"].attrs["max_depth"]) == want, extra
+    p = _rust_bs(bam, tmp_path / "rs_err", "--max-depth", "auto")
+    assert p.returncode != 0 and "--max-depth auto needs --complexity" in p.stderr
 
 
 def test_bisulfite_rust_no_filters_match_truth_and_xb(bsbolt_bam, tmp_path):

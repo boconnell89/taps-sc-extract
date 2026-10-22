@@ -38,6 +38,15 @@ impl Chemistry {
             Chemistry::Bisulfite => "bisulfite",
         }
     }
+
+    /// Reads one molecule can put at a position: both mates for paired-end
+    /// TAPS, one read for single-end bisulfite (`--max-depth auto`).
+    pub fn reads_per_molecule(self) -> u32 {
+        match self {
+            Chemistry::Taps => 2,
+            Chemistry::Bisulfite => 1,
+        }
+    }
 }
 
 /// `--chemistry`: what the user asked for (`auto` resolves from the BAM).

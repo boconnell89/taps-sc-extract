@@ -122,21 +122,50 @@ pub fn resolve_workers(cli: usize) -> usize {
     }
 }
 
-/// Resolve shard count (0 means auto based on expected cell count).
-pub fn resolve_shards(cli_shards: usize, cell_count: usize) -> (usize, &'static str) {
+/// Output sites per shard when shards are auto. The TAPS reference run
+/// (2026-10-18) wrote 702M sites as 16 shards, ~44M each; the LER bisulfite BAM
+/// (2026-10-21, 1.15B sites, 304 cells) took 33 s after extraction as one shard
+/// and 5-10 s per shard as 16.
+pub const AUTO_SITES_PER_SHARD: f64 = 48e6;
+
+/// Resolve shard count (0 means auto). Auto takes the larger of a cell-count
+/// rule and estimated sites / `AUTO_SITES_PER_SHARD` (few deep cells still
+/// get parallel writers), capped at max(cell rule, nproc / 2) and the cell
+/// count. `-o` naming one `.h5` file keeps one shard.
+pub fn resolve_shards(
+    cli_shards: usize,
+    cell_count: usize,
+    est_sites: f64,
+    nproc: usize,
+    single_file: bool,
+) -> (usize, &'static str) {
     if cli_shards > 0 {
-        (cli_shards, "explicit")
+        return (cli_shards, "explicit");
+    }
+    if single_file {
+        return (1, "auto (-o names one .h5 file)");
+    }
+    let by_cells = if cell_count <= 10_000 {
+        1
+    } else if cell_count <= 50_000 {
+        8
+    } else if cell_count <= 100_000 {
+        16
     } else {
-        let s = if cell_count <= 10_000 {
-            1
-        } else if cell_count <= 50_000 {
-            8
-        } else if cell_count <= 100_000 {
-            16
-        } else {
-            32
-        };
-        (s, "auto")
+        32
+    };
+    let by_sites = (est_sites / AUTO_SITES_PER_SHARD).ceil().max(1.0) as usize;
+    let cap = by_cells.max(nproc / 2).max(1);
+    let s = by_sites.max(by_cells).min(cap).min(cell_count.max(1));
+    (s, if s > by_cells { "auto, by estimated sites" } else { "auto" })
+}
+
+/// Output sites expected from the BAM index (or a per-cell guess without one).
+pub fn estimate_sites(mapped_reads: u64, site_share: f64, cell_count: usize, genome_mb: u64) -> f64 {
+    if mapped_reads > 0 {
+        mapped_reads as f64 * SITES_PER_READ * site_share
+    } else {
+        cell_count as f64 * (genome_mb * 500).min(200_000) as f64
     }
 }
 
@@ -147,6 +176,12 @@ pub const SITES_PER_READ: f64 = 14.0;
 pub const MEMORY_MODE_BYTES_PER_SITE: f64 = 18.0;
 pub const WRITER_BYTES_PER_SITE: f64 = 20.0;
 pub const WRITER_BASE_GB: f64 = 0.1;
+/// Writers fed during extraction (memory mode, one process per shard): the 16
+/// children together measured 10.4 GB for 702M sites (14.8 B/site, 2026-10-18).
+pub const STREAMED_WRITER_BYTES_PER_SITE: f64 = 16.0;
+/// Share of the payloads the extraction process holds before buckets are dealt
+/// to shards (`ShardStreams`: after 1/5 of the windows).
+pub const STREAM_HOLD_FRACTION: f64 = 0.2;
 
 /// Memory mode and writer count, chosen together so the whole process tree
 /// (extraction process + concurrent writer children) fits the budget.
@@ -182,16 +217,14 @@ pub struct MemoryInputs<'a> {
     /// Default from a saved machine profile, still bounded by memory.
     pub profile_writers: Option<usize>,
     pub in_process: bool,
+    /// Writer children can be fed during extraction (process writers, shard
+    /// directory output, `TAPS_STREAM_WRITERS` not 0).
+    pub streamable: bool,
 }
 
 pub fn plan_memory(i: &MemoryInputs) -> MemoryPlan {
     let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let sites = if i.mapped_reads > 0 {
-        i.mapped_reads as f64 * SITES_PER_READ * i.site_share
-    } else {
-        // No index stats: the old per-cell guess.
-        i.cell_count as f64 * (i.genome_mb * 500).min(200_000) as f64
-    };
+    let sites = estimate_sites(i.mapped_reads, i.site_share, i.cell_count, i.genome_mb);
     let n_shards = i.n_shards.max(1);
     let stream_gb = STREAM_BASE_GB + STREAM_GB_PER_WORKER * i.n_workers as f64;
     let payload_gb = sites * MEMORY_MODE_BYTES_PER_SITE / 1e9;
@@ -208,7 +241,35 @@ pub fn plan_memory(i: &MemoryInputs) -> MemoryPlan {
         let room = i.budget_gb - parent_gb;
         ((room / writer_each_gb).floor().max(1.0) as usize).min(writer_cap)
     };
-    let (mode, mode_src) = match i.mode.to_lowercase().as_str() {
+    // Memory mode with one writer per shard streams payloads to the writers
+    // during extraction: the parent holds only what arrives before buckets are
+    // dealt, and the children hold the rest. Preferred whenever it fits.
+    let mode_lc = i.mode.to_lowercase();
+    if i.streamable
+        && n_shards > 1
+        && mode_lc != "stream"
+        && n_shards <= writer_cap
+        && (i.cli_writers == 0 || i.cli_writers >= n_shards)
+    {
+        let parent_gb = stream_gb + STREAM_HOLD_FRACTION * payload_gb;
+        let writer_each = sites / n_shards as f64 * STREAMED_WRITER_BYTES_PER_SITE / 1e9 + WRITER_BASE_GB;
+        let peak_gb = parent_gb + n_shards as f64 * writer_each;
+        if peak_gb <= i.budget_gb || mode_lc == "memory" {
+            let writers = if i.cli_writers > 0 { i.cli_writers } else { n_shards };
+            return MemoryPlan {
+                mode: "memory".to_string(),
+                mode_src: if mode_lc == "memory" { "explicit" } else { "auto (writers fed during extraction)" },
+                writers,
+                writers_src: if i.cli_writers > 0 { "explicit" } else { "auto, one per shard, fed during extraction" },
+                est_sites: sites,
+                extract_gb: parent_gb,
+                parent_during_write_gb: STREAM_BASE_GB,
+                writer_each_gb: writer_each,
+                peak_gb,
+            };
+        }
+    }
+    let (mode, mode_src) = match mode_lc.as_str() {
         "stream" => ("stream".to_string(), "explicit"),
         "memory" => ("memory".to_string(), "explicit"),
         _ => {
@@ -337,7 +398,33 @@ mod tests {
             cli_writers: 0,
             profile_writers: None,
             in_process: false,
+            streamable: false,
         }
+    }
+
+    #[test]
+    fn memory_plan_streams_writers_when_it_fits() {
+        if std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) < 16 {
+            return; // 16 writers need 16 CPUs (writer_cap)
+        }
+        // LER bisulfite BAM (2026-10-21): 91.6M reads, 16 shards, 34 GB budget.
+        // Without streaming, memory mode does not fit (it spills to disk);
+        // streamed, memory mode with all 16 writers does.
+        let mut i = inputs("auto", 34.0, 91_642_549, 16);
+        assert_eq!(plan_memory(&i).mode, "stream");
+        i.streamable = true;
+        let p = plan_memory(&i);
+        assert_eq!((p.mode.as_str(), p.writers), ("memory", 16), "{p:?}");
+        assert!(p.peak_gb <= 34.0, "{p:?}");
+        // Too small a budget: falls back to the unstreamed plan.
+        i.budget_gb = 19.0;
+        let p = plan_memory(&i);
+        assert!(p.peak_gb <= 19.0 + p.writer_each_gb, "{p:?}");
+        assert!(p.writers < 16);
+        // --memory-mode stream is never overridden.
+        let mut i = inputs("stream", 400.0, 91_642_549, 16);
+        i.streamable = true;
+        assert_eq!(plan_memory(&i).mode, "stream");
     }
 
     #[test]
@@ -390,11 +477,19 @@ mod tests {
 
     #[test]
     fn shards_resolution_auto() {
-        assert_eq!(resolve_shards(0, 5_000).0, 1);
-        assert_eq!(resolve_shards(0, 25_000).0, 8);
-        assert_eq!(resolve_shards(0, 75_000).0, 16);
-        assert_eq!(resolve_shards(0, 150_000).0, 32);
-        assert_eq!(resolve_shards(4, 150_000).0, 4);
+        // Cell rule (few sites).
+        assert_eq!(resolve_shards(0, 5_000, 1e6, 32, false).0, 1);
+        assert_eq!(resolve_shards(0, 25_000, 1e6, 32, false).0, 8);
+        assert_eq!(resolve_shards(0, 75_000, 1e6, 32, false).0, 16);
+        assert_eq!(resolve_shards(0, 150_000, 1e6, 32, false).0, 32);
+        assert_eq!(resolve_shards(4, 150_000, 1e9, 32, false).0, 4);
+        // Sites: TAPS test BAM (53.5M reads x 14) and LER (91.6M reads, 304 cells).
+        assert_eq!(resolve_shards(0, 7_351, 53_461_257.0 * SITES_PER_READ, 32, false).0, 16);
+        assert_eq!(resolve_shards(0, 304, 91_642_549.0 * SITES_PER_READ, 32, false).0, 16);
+        assert_eq!(resolve_shards(0, 304, 91_642_549.0 * SITES_PER_READ, 16, false).0, 8);
+        assert_eq!(resolve_shards(0, 3, 1e10, 96, false).0, 3);
+        // One .h5 file asked for: one shard.
+        assert_eq!(resolve_shards(0, 304, 1e10, 32, true).0, 1);
     }
 
 }

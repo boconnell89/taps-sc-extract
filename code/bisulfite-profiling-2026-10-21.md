@@ -63,3 +63,34 @@ Repeats of the same settings differ by up to 2× in processing time, and this wa
 - Measure memory mode's real per-site cost and correct the planner, so 16 writers stream during extraction as with TAPS.
 
 Each of these needs a TAPS re-check, since the defaults are shared.
+
+## After the fixes (same day)
+
+Changes:
+- **Wrapper:** `taps-sc-extract` forwards `-t` and `--shards` only when given.
+- **Shard count:** auto now uses estimated output sites / 48M as well as the cell count. It is capped at half the cores, and stays at 1 when `-o` names an `.h5` file.
+- **Memory plan:** it now models streamed writers, preferring memory mode with one writer per shard when that fits.
+- **`--max-depth auto`** (default): 4 molecules × reads per molecule × cells kept by `--complexity`/`--whitelist`; 100000 when neither is given.
+
+The plain command, with only the complexity cutoff given, now picks 32 workers, 16 shards, memory mode, and 16 writer processes fed during extraction.
+
+| Run (plain command) | Processing | End to end | Peak memory |
+|---|---:|---:|---|
+| LER, run 1 (BAM partly evicted from cache by the test suite) | 2.08M reads/s | 1.65M reads/s | 6.2 GB extraction |
+| LER, runs 2 and 3 | 6.05–6.06M reads/s | 3.41M reads/s | 7.2 GB extraction + 15.9 GB writers (plan: 32.5 GB) |
+| TAPS test BAM (53.5M reads, no cell list, depth 100000) | 4.46M reads/s | 2.79M reads/s | 6.4 GB extraction + 10.4 GB writers |
+
+On LER this is 1.8× the previous best warm end-to-end rate with the old wrapper defaults (1.9M reads/s). On the TAPS test BAM the plain command now matches the README's tuned best (`-t 32 --shards 16 --memory-mode memory`, 2.69M reads/s). Before this change it ran with 1 shard and 24 workers. The writers used 13.9 B/site against the 16 assumed.
+
+### Depth limit on LER
+
+With 304 cells the auto limit is 1,216 reads. It removes 0.81% of CpG calls (52,963,419 → 52,532,405), and the CpG rate moves from 83.847% to 83.836%. Almost all of the loss is in four regions:
+
+| Region | CG calls (limit 100000 → 1216) |
+|---|---|
+| chr2:98.6–98.7 Mb | 400,312 → 50,821 |
+| chr9:35.3–35.4 Mb | 59,178 → 8,942 |
+| chr9:3.0–3.1 Mb | 68,912 → 56,872 |
+| chr6:103.6–103.7 Mb | 16,068 → 4,660 |
+
+The chr2 locus is mm10's known satellite pileup artifact, and the chr9:3 Mb bin sits in pericentromeric satellite. chr19 has no position over 1,216 reads. The limit thins these regions rather than removing them, because htslib drops only reads that start where the last kept read started.

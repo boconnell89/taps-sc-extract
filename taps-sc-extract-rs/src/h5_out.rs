@@ -794,7 +794,7 @@ pub struct HdfOutput {
     pub master_s: f64,
 }
 
-fn is_h5_filename(path: &Path) -> bool {
+pub fn is_h5_filename(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("h5") || ext.eq_ignore_ascii_case("hdf5"))

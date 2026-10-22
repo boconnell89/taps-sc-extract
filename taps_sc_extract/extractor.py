@@ -129,6 +129,7 @@ def extract_methylation(
         "trim_mode": trim_mode,
         "min_mapq": min_mapq,
         "min_baseq": min_base_quality,
+        "max_depth": max_depth,
         "extractor": "taps-sc-extract (python)",
     })
 

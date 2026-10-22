@@ -485,6 +485,36 @@ const FLAG_FILTER: u16 = (htslib::BAM_FUNMAP
 /// test BAM); 100,000 only guards against pathological repeats.
 pub const DEFAULT_MAX_DEPTH: u32 = 100_000;
 
+/// Molecules one cell can have at a position in a deduplicated library:
+/// 2 strands x 2 haplotypes.
+pub const MOLECULES_PER_CELL: u64 = 4;
+
+/// `--max-depth`: a read count (0 = unlimited) or `auto`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthArg {
+    Auto,
+    Fixed(u32),
+}
+
+impl std::str::FromStr for DepthArg {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        if s.eq_ignore_ascii_case("auto") {
+            return Ok(DepthArg::Auto);
+        }
+        s.parse::<u32>()
+            .map(DepthArg::Fixed)
+            .map_err(|_| format!("expected a read count or 'auto', got {s:?}"))
+    }
+}
+
+/// `--max-depth auto`: 4 molecules per cell x reads per molecule x the cells
+/// kept by `--complexity` (and its cutoff) / `--whitelist`. The cap counts
+/// every read in the pileup, filtered cells' included.
+pub fn auto_max_depth(barcodes: usize, reads_per_molecule: u32) -> u32 {
+    (barcodes as u64 * MOLECULES_PER_CELL * reads_per_molecule as u64).clamp(1, i32::MAX as u64) as u32
+}
+
 /// The cap passed to htslib / `ReadPileup`: 0 means unlimited. htslib takes a
 /// signed int and treats a negative cap as "drop", so never pass `u32::MAX`.
 pub fn effective_max_depth(max_depth: u32) -> i32 {
@@ -1108,6 +1138,17 @@ mod tests {
         assert_eq!(effective_max_depth(250), 250);
         assert_eq!(effective_max_depth(u32::MAX), i32::MAX);
         assert_eq!(DEFAULT_MAX_DEPTH, 100_000);
+    }
+
+    #[test]
+    fn auto_max_depth_is_four_molecules_per_barcode() {
+        assert_eq!(auto_max_depth(10_073, 1), 40_292);
+        assert_eq!(auto_max_depth(7_351, 2), 58_808);
+        assert_eq!(auto_max_depth(0, 2), 1);
+        assert_eq!(auto_max_depth(usize::MAX / 8, 2), i32::MAX as u32);
+        assert_eq!("auto".parse::<DepthArg>(), Ok(DepthArg::Auto));
+        assert_eq!("250".parse::<DepthArg>(), Ok(DepthArg::Fixed(250)));
+        assert!("x".parse::<DepthArg>().is_err());
     }
 
     #[test]

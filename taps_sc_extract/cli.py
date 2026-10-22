@@ -102,8 +102,9 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "-t", "--threads", "--workers",
         dest="workers",
         type=int,
-        default=24,
-        help="Number of parallel chunk worker processes (default: 24).",
+        default=None,
+        help="Number of parallel chunk workers (default: Rust sizes it from cores and memory; "
+        "the Python engine uses 24).",
     )
     parser.add_argument(
         "--decomp-threads",
@@ -126,9 +127,10 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--shards",
         type=int,
-        default=1,
+        default=None,
         help=(
-            "Number of output HDF5 shard files to write in parallel (default: 1). "
+            "Number of output HDF5 shard files to write in parallel (default: Rust picks it from "
+            "the estimated output sites and cells, 1 when -o names an .h5 file; the Python engine uses 1). "
             "If >1, -o/--out is a directory of shard_000.h5..shard_NNN.h5 plus master.h5. "
             "An .h5 file name is written as a directory named after the file stem "
             "(sample.h5 -> sample/)."
@@ -218,11 +220,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-depth",
-        type=int,
+        type=_depth_arg,
         default=None,
-        help="Maximum reads per position, all cells together (htslib pileup cap; "
-        "default: 100000; 0 = unlimited). Single-cell depth at a site is about the number of "
-        "cells covering it, so a low cap drops whole cells at well-covered loci.",
+        help="Maximum reads per position, all cells together (htslib pileup cap): a number "
+        "(0 = unlimited) or auto (default) = 4 molecules (2 strands x 2 haplotypes) x reads per "
+        "molecule (taps 2, bisulfite 1) x cells kept by --complexity (with its cutoff) / "
+        "--whitelist. Without either the default is 100000.",
     )
     parser.add_argument(
         "--no-baq",
@@ -430,6 +433,19 @@ RUST_DEFAULT_CHUNK_SIZE_MB = 0  # auto: sized from worker count
 RUST_DEFAULT_COMPRESSION = "blosc"
 
 
+def _depth_arg(value: str):
+    """--max-depth: 'auto' or a non-negative read count."""
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a read count or 'auto', got {value!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError("--max-depth must be >= 0")
+    return n
+
+
 def option_was_set(argv: List[str], option: str) -> bool:
     """True when the user passed `option` or `option=value` on this argv."""
     return any(a == option or a.startswith(option + "=") for a in argv)
@@ -453,18 +469,18 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         "-b", parsed.bam,
         "-f", parsed.fasta,
         "-o", parsed.out,
-        "-t", str(parsed.workers),
         "--chunk-size-mb", str(chunk_mb),
-        "--shards", str(parsed.shards),
         "--compression", compression,
         "--max-writer-threads", str(parsed.max_writer_threads),
         "--writer-mode", parsed.writer_mode,
         "--chemistry", parsed.chemistry,
         "--strand-source", parsed.strand_source,
     ]
-    # Chemistry-dependent options: forwarded only when set, so the Rust engine
-    # applies the detected chemistry's defaults to the rest.
+    # Forwarded only when set, so the Rust engine applies its own defaults
+    # (auto workers and shards, the detected chemistry's filters and trims).
     for flag, value in (
+        ("-t", parsed.workers),
+        ("--shards", parsed.shards),
         ("--min-baseq", parsed.min_baseq),
         ("--min-mapq", parsed.min_mapq),
         ("--max-depth", parsed.max_depth),
@@ -620,6 +636,16 @@ def resolve_python_options(parsed):
     d = defaults(chem)
     opts = {k: (getattr(parsed, k) if getattr(parsed, k) is not None else d[k])
             for k in ("min_mapq", "min_baseq", "max_depth", "trim_r1", "trim_r2", "trim_3p")}
+    if parsed.max_depth is None or parsed.max_depth == "auto":
+        from .barcode import load_cell_filter
+        from .chemistry import auto_max_depth
+        cells = load_cell_filter(parsed.whitelist, parsed.complexity, parsed.min_complexity, parsed.max_complexity)
+        if cells is not None:
+            opts["max_depth"] = auto_max_depth(len(cells), chem)
+        elif parsed.max_depth == "auto":
+            raise ValueError("--max-depth auto needs --complexity or --whitelist to count the cells; give a number instead")
+        else:
+            opts["max_depth"] = d["max_depth"]
     opts["trim_mode"] = parsed.trim or ("auto" if chem == "bisulfite" else "manual")
     if opts["trim_mode"] == "auto":
         opts.update(auto_trims(parsed, chem, opts, contigs))
@@ -701,10 +727,10 @@ def main(args: Optional[List[str]] = None) -> int:
             complexity_path=parsed.complexity,
             min_complexity=parsed.min_complexity,
             max_complexity=parsed.max_complexity,
-            n_workers=parsed.workers,
+            n_workers=parsed.workers if parsed.workers is not None else 24,
             decomp_threads=parsed.decomp_threads if parsed.decomp_threads is not None else 1,
             chunk_size_mb=parsed.chunk_size_mb,
-            n_shards=parsed.shards,
+            n_shards=parsed.shards if parsed.shards is not None else 1,
             use_temp_files=(parsed.memory_mode != "memory" and not parsed.no_temp_file),
             compression=parsed.compression,
             compression_threads=parsed.compression_threads,
