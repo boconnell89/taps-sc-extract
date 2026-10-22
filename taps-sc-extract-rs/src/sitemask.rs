@@ -187,6 +187,51 @@ pub fn apply(
     removed
 }
 
+/// Observations one cell keeps at a site under `cap` (both counts scaled to
+/// `cap`, keeping their ratio; methylated rounded half up). Same rule as
+/// `sitemask.cap_counts` in Python.
+pub fn cap_counts(t: u32, c: u32, cap: u32) -> (u32, u32) {
+    let n = u64::from(t) + u64::from(c);
+    if cap == 0 || n <= u64::from(cap) {
+        return (t, c);
+    }
+    let cap64 = u64::from(cap);
+    let c2 = ((2 * cap64 * u64::from(c) + n) / (2 * n)) as u32;
+    (cap - c2, c2)
+}
+
+/// `--cell-site-cap`: no cell keeps more than `cap` observations at a site
+/// (`cap_counts`). Calls taken off come out of `stats` as well.
+pub fn cap_cells(cells: &mut [CellMaps], stats: &mut CallStats, cap: u32, ref_seq: &[u8], ref_start: u64) -> Removed {
+    let mut removed = Removed::default();
+    if cap == 0 {
+        return removed;
+    }
+    for cell in cells.iter_mut() {
+        for (ctx, v) in [(Context::Cg, &mut cell.cg), (Context::Ch, &mut cell.ch)] {
+            for e in v.iter_mut() {
+                let (t, c) = cap_counts(e.1, e.2, cap);
+                if (t, c) == (e.1, e.2) {
+                    continue;
+                }
+                removed.calls += u64::from(e.1 + e.2 - t - c);
+                removed.sites += 1;
+                let tri = (u64::from(e.0) - 1)
+                    .checked_sub(ref_start)
+                    .and_then(|rel| classify_trinucleotide(ref_seq, rel as usize))
+                    .unwrap_or(match ctx {
+                        Context::Cg => TriContext::Cpg,
+                        Context::Ch => TriContext::Chh,
+                    });
+                stats.remove(tri, ctx, u64::from(e.1 - t), u64::from(e.2 - c));
+                e.1 = t;
+                e.2 = c;
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +312,25 @@ mod tests {
         assert_eq!(cells[0].cg, vec![(11, 1, 0), (31, 1, 1)]);
         assert!(cells[0].ch.is_empty());
         assert_eq!((stats.cg_t, stats.cg_c, stats.ch_t), (2, 1, 0));
+    }
+
+    #[test]
+    fn cap_keeps_ratio_and_total() {
+        assert_eq!(cap_counts(1, 1, 2), (1, 1));
+        assert_eq!(cap_counts(0, 3, 2), (0, 2));
+        assert_eq!(cap_counts(3, 0, 2), (2, 0));
+        assert_eq!(cap_counts(1, 2, 2), (1, 1)); // 2 x 2/3 = 1.33 -> 1
+        assert_eq!(cap_counts(1, 3, 2), (0, 2)); // 1.5 rounds up
+        assert_eq!(cap_counts(10, 30, 4), (1, 3));
+        assert_eq!(cap_counts(5, 5, 0), (5, 5));
+        let mut cell = CellMaps::default();
+        cell.cg = vec![(11, 1, 2), (21, 0, 1)];
+        let mut cells = vec![cell];
+        let mut stats = CallStats { cg_t: 1, cg_c: 3, cpg_t: 1, cpg_c: 3, ..Default::default() };
+        let r = cap_cells(&mut cells, &mut stats, 2, b"NNNNNNNNNNCGNNNNNNNNCG", 0);
+        assert_eq!((r.calls, r.sites), (1, 1));
+        assert_eq!(cells[0].cg, vec![(11, 1, 1), (21, 0, 1)]);
+        assert_eq!((stats.cg_t, stats.cg_c, stats.cpg_c), (1, 2, 2));
     }
 
     #[test]

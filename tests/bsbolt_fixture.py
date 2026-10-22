@@ -216,9 +216,19 @@ def make_bsbolt_bam(out_dir: str, fasta_path: str, n_reads: int = 6000, seed: in
     return bam, truth
 
 
+def _cap(t: int, c: int, cap: int) -> Tuple[int, int]:
+    """Per-cell cap: scale (t, c) to `cap` keeping the ratio, methylated rounded half up."""
+    n = t + c
+    if cap <= 0 or n <= cap:
+        return t, c
+    c2 = int(cap * c / n + 0.5)
+    return cap - c2, c2
+
+
 def expected_calls(truth: List[ReadTruth], min_mapq: int, min_baseq: int, trim_5p: int, trim_3p: int,
-                   contexts=("CG", "CH")) -> Dict[str, Dict[Tuple[str, int], Tuple[int, int]]]:
-    """{ctx: {(cell, 1-based pos): (t, c)}} from the generator's truth."""
+                   contexts=("CG", "CH"), cap: int = 0) -> Dict[str, Dict[Tuple[str, int], Tuple[int, int]]]:
+    """{ctx: {(cell, 1-based pos): (t, c)}} from the generator's truth; `cap` is
+    the extractor's per-cell observations-per-site cap (0 = none)."""
     acc: Dict[str, Dict[Tuple[str, int], List[int]]] = {"CG": defaultdict(lambda: [0, 0]), "CH": defaultdict(lambda: [0, 0])}
     for rd in truth:
         if rd.mapq < min_mapq:
@@ -231,4 +241,4 @@ def expected_calls(truth: List[ReadTruth], min_mapq: int, min_baseq: int, trim_5
             if c.ctx not in contexts or c.qual < min_baseq or not (lo <= c.qpos < hi):
                 continue
             acc[c.ctx][(rd.cell, c.ref_pos + 1)][1 if c.meth else 0] += 1
-    return {ctx: {k: tuple(v) for k, v in d.items()} for ctx, d in acc.items()}
+    return {ctx: {k: _cap(*v, cap) for k, v in d.items()} for ctx, d in acc.items()}

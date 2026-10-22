@@ -123,7 +123,7 @@ pub fn resolve_workers(cli: usize) -> usize {
 }
 
 /// Output sites per shard when shards are auto. The TAPS reference run
-/// (2026-10-18) wrote 702M sites as 16 shards, ~44M each; the LER bisulfite BAM
+/// (2026-10-18) wrote 702M sites as 16 shards, ~44M each; a bisulfite library
 /// (2026-10-21, 1.15B sites, 304 cells) took 33 s after extraction as one shard
 /// and 5-10 s per shard as 16.
 pub const AUTO_SITES_PER_SHARD: f64 = 48e6;
@@ -407,7 +407,7 @@ mod tests {
         if std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) < 16 {
             return; // 16 writers need 16 CPUs (writer_cap)
         }
-        // LER bisulfite BAM (2026-10-21): 91.6M reads, 16 shards, 34 GB budget.
+        // A bisulfite library (2026-10-21): 91.6M reads, 16 shards, 34 GB budget.
         // Without streaming, memory mode does not fit (it spills to disk);
         // streamed, memory mode with all 16 writers does.
         let mut i = inputs("auto", 34.0, 91_642_549, 16);
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(resolve_shards(0, 75_000, 1e6, 32, false).0, 16);
         assert_eq!(resolve_shards(0, 150_000, 1e6, 32, false).0, 32);
         assert_eq!(resolve_shards(4, 150_000, 1e9, 32, false).0, 4);
-        // Sites: TAPS test BAM (53.5M reads x 14) and LER (91.6M reads, 304 cells).
+        // Sites: TAPS test BAM (53.5M reads x 14) and a bisulfite library (91.6M reads, 304 cells).
         assert_eq!(resolve_shards(0, 7_351, 53_461_257.0 * SITES_PER_READ, 32, false).0, 16);
         assert_eq!(resolve_shards(0, 304, 91_642_549.0 * SITES_PER_READ, 32, false).0, 16);
         assert_eq!(resolve_shards(0, 304, 91_642_549.0 * SITES_PER_READ, 16, false).0, 8);

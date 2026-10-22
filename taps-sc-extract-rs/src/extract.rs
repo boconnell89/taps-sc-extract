@@ -160,6 +160,9 @@ pub struct WindowTiming {
     /// Calls and cell-sites removed inside `--blacklist` regions.
     pub blacklist_calls: u64,
     pub blacklist_sites: u64,
+    /// Calls and cell-sites trimmed by `--cell-site-cap`.
+    pub cap_calls: u64,
+    pub cap_sites: u64,
     /// Read batches whose BAQ was sent to the GPU (the rest ran on the CPU).
     pub baq_gpu_batches: u64,
     /// Read batches that had BAQ work.
@@ -188,6 +191,8 @@ impl WindowTiming {
         self.site_depth_bp += o.site_depth_bp;
         self.blacklist_calls += o.blacklist_calls;
         self.blacklist_sites += o.blacklist_sites;
+        self.cap_calls += o.cap_calls;
+        self.cap_sites += o.cap_sites;
         self.baq_gpu_batches += o.baq_gpu_batches;
         self.baq_batches += o.baq_batches;
         self.total_s += o.total_s;
@@ -241,6 +246,8 @@ pub struct ExtractParams {
     pub site_depth_limit: u32,
     /// `--blacklist`: drop every call inside these regions.
     pub blacklist: Option<std::sync::Arc<crate::sitemask::Blacklist>>,
+    /// `--cell-site-cap`: most observations one cell keeps at a site; 0 = off.
+    pub cell_site_cap: u32,
     pub ignore_overlaps: bool,
     pub ignore_orphans: bool,
     pub compute_baq: bool,
@@ -290,6 +297,7 @@ impl Default for ExtractParams {
             max_depth: DEFAULT_MAX_DEPTH,
             site_depth_limit: 0,
             blacklist: None,
+            cell_site_cap: 0,
             ignore_overlaps: true,
             ignore_orphans: true,
             compute_baq: true,
@@ -543,6 +551,14 @@ impl std::str::FromStr for DepthArg {
             .map(DepthArg::Fixed)
             .map_err(|_| format!("expected a read count or 'auto', got {s:?}"))
     }
+}
+
+/// `--cell-site-cap auto`: a site is called on one strand, so a cell has at
+/// most `molecules_per_cell / 2` molecules there (one per haplotype; 2 by
+/// default, 4 for a G2 genome), times reads per molecule when overlapping
+/// mates both call (TAPS with `--no-overlap-clip`).
+pub fn auto_cell_site_cap(molecules_per_cell: u32, reads_per_call: u32) -> u32 {
+    (molecules_per_cell / 2).max(1) * reads_per_call.max(1)
 }
 
 /// `--site-depth-limit auto`: molecules per cell (`--molecules-per-cell`,
@@ -1051,6 +1067,9 @@ pub fn process_window(
         timing.site_depth_calls = r.calls;
         timing.site_depth_sites = r.sites;
     }
+    let r = crate::sitemask::cap_cells(&mut cells, &mut stats, params.cell_site_cap, &ref_seq, ref_start);
+    timing.cap_calls = r.calls;
+    timing.cap_sites = r.sites;
     if profile {
         timing.call_s = call_ns.get() as f64 * 1e-9;
         timing.pileup_s = (plp_s - timing.call_s).max(0.0);

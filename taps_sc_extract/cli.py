@@ -235,11 +235,22 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "either. The pileup is unchanged.",
     )
     parser.add_argument(
+        "--cell-site-cap",
+        type=_depth_arg,
+        default=None,
+        help="Most observations one cell keeps at a site: a number (0 = off) or auto (default) = "
+        "--molecules-per-cell / 2 (a site is called on one strand: one molecule per haplotype), "
+        "x 2 for TAPS with --no-overlap-clip. Extra observations are scaled away keeping the t:c ratio. "
+        "Relax it (raise --molecules-per-cell, or 0) when real extra copies are expected: copy-number "
+        "gains, segmental duplications, aneuploidy (e.g. cancer), replicating cells.",
+    )
+    parser.add_argument(
         "--molecules-per-cell",
         type=int,
         default=None,
-        help="Molecules one cell can have at a position, for --site-depth-limit auto (default 4 = "
-        "2 strands x 2 haplotypes; 8 allows a replicated, G2 genome).",
+        help="Molecules one cell can have at a position, both strands (default 4 = 2 strands x 2 "
+        "haplotypes; 8 allows a replicated, G2 genome). Sets --cell-site-cap auto and "
+        "--site-depth-limit auto.",
     )
     parser.add_argument(
         "--blacklist",
@@ -505,6 +516,7 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         ("--min-mapq", parsed.min_mapq),
         ("--max-depth", parsed.max_depth),
         ("--site-depth-limit", parsed.site_depth_limit),
+        ("--cell-site-cap", parsed.cell_site_cap),
         ("--molecules-per-cell", parsed.molecules_per_cell),
         ("--blacklist", parsed.blacklist),
         ("--trim-r1", parsed.trim_r1),
@@ -659,6 +671,12 @@ def resolve_python_options(parsed):
     d = defaults(chem)
     opts = {k: (getattr(parsed, k) if getattr(parsed, k) is not None else d[k])
             for k in ("min_mapq", "min_baseq", "max_depth", "trim_r1", "trim_r2", "trim_3p")}
+    from .sitemask import MOLECULES_PER_CELL, auto_cell_site_cap
+    mpc = parsed.molecules_per_cell or MOLECULES_PER_CELL
+    if parsed.cell_site_cap is None or parsed.cell_site_cap == "auto":
+        opts["cell_site_cap"] = auto_cell_site_cap(mpc, 2 if chem == "taps" and parsed.no_overlap_clip else 1)
+    else:
+        opts["cell_site_cap"] = parsed.cell_site_cap
     opts["site_depth_limit"] = parsed.site_depth_limit
     if parsed.site_depth_limit is None or parsed.site_depth_limit == "auto":
         from .barcode import load_cell_filter
@@ -776,6 +794,7 @@ def main(args: Optional[List[str]] = None) -> int:
             chemistry=chem,
             verify_ys=parsed.strand_source == "auto",
             site_depth_limit=opts["site_depth_limit"],
+            cell_site_cap=opts["cell_site_cap"],
             blacklist_path=parsed.blacklist,
         )
         return 0

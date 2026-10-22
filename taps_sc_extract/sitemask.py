@@ -22,6 +22,36 @@ def auto_site_depth_limit(cells: int, molecules_per_cell: int, reads_per_molecul
     return max(1, min(cells * molecules_per_cell * reads_per_molecule, 2**32 - 1))
 
 
+def cap_counts(t: int, c: int, cap: int) -> Tuple[int, int]:
+    """Observations one cell keeps at a site under ``cap``: both counts scaled
+    to ``cap`` keeping their ratio, methylated rounded half up (Rust
+    ``sitemask::cap_counts``)."""
+    n = t + c
+    if cap <= 0 or n <= cap:
+        return t, c
+    c2 = (2 * cap * c + n) // (2 * n)
+    return cap - c2, c2
+
+
+def auto_cell_site_cap(molecules_per_cell: int, reads_per_call: int) -> int:
+    """A site is called on one strand: molecules_per_cell / 2 molecules (one per
+    haplotype), x calls per molecule (2 only for TAPS with --no-overlap-clip)."""
+    return max(1, molecules_per_cell // 2) * max(1, reads_per_call)
+
+
+def apply_cap(accum, touched, pos_1based: int, cap: int, stats, ctx: str, ctx_tri: str) -> None:
+    """Cap each cell touched in this column (pileup columns are complete per position)."""
+    for bc in touched:
+        counts = accum[bc][pos_1based]
+        t, c = cap_counts(counts[0], counts[1], cap)
+        if (t, c) != (counts[0], counts[1]):
+            for k, key in ((0, "t"), (1, "c")):
+                d = counts[k] - (t, c)[k]
+                stats[ctx_tri][key] -= d
+                stats[ctx][key] -= d
+            counts[0], counts[1] = t, c
+
+
 def merge(intervals: Iterable[Interval]) -> List[Interval]:
     out: List[Interval] = []
     for s, e in sorted(intervals):

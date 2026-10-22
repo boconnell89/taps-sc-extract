@@ -1,4 +1,4 @@
-# Bisulfite extraction on the merged LER BAM (2026-10-21)
+# Bisulfite extraction on a merged single-cell library (2026-10-21)
 
 First measurements of `--chemistry bisulfite` (auto-detected) on real data.
 
@@ -6,9 +6,9 @@ First measurements of `--chemistry bisulfite` (auto-detected) on real data.
 
 | | |
 |---|---|
-| BAM | `AdeyLER1-TTGGACTC.bbrd.q10.bam`: BSBolt 1.2.1, single-end Ultima, two runs merged (one `@RG` each; run 2's QNAMEs end in `_2`), deduplicated, MAPQ ≥ 10, 91.6M reads, 10.2 GB |
+| BAM | Merged, deduplicated sciMETv3 mouse brain library: BSBolt 1.2.1, single-end Ultima, two runs merged (one `@RG` each; run 2's QNAMEs end in `_2`), deduplicated, MAPQ ≥ 10, 91.6M reads, 10.2 GB |
 | Reference | `/mnt/e/refs/mm10/BSB_ref.fa`, the BSBolt index FASTA the header names (unconverted; contig lengths equal mm10) |
-| Cells | `--complexity AdeyLER1-TTGGACTC.complexity.txt --min-complexity 10000`: 304 of 10,073 barcodes, holding 96% of the unique reads |
+| Cells | `--complexity <library>.complexity.txt --min-complexity 10000`: 304 of 10,073 barcodes, holding 96% of the unique reads |
 | Host | Reference workstation (Ryzen 9 5900XT, 16 cores / 32 threads, ~58 GB in WSL2); input, temp and output on the WSL ext4 VHDX. Machine idle (load < 0.6) |
 
 ## Results (every run below gave identical totals)
@@ -76,13 +76,21 @@ The plain command, with only the complexity cutoff given, now picks 32 workers, 
 
 | Run (plain command) | Processing | End to end | Peak memory |
 |---|---:|---:|---|
-| LER, run 1 (BAM partly evicted from cache by the test suite) | 2.08M reads/s | 1.65M reads/s | 6.2 GB extraction |
-| LER, runs 2 and 3 | 6.05–6.06M reads/s | 3.41M reads/s | 7.2 GB extraction + 15.9 GB writers (plan: 32.5 GB) |
+| Bisulfite library, run 1 (BAM partly evicted from cache by the test suite) | 2.08M reads/s | 1.65M reads/s | 6.2 GB extraction |
+| Bisulfite library, runs 2 and 3 | 6.05–6.06M reads/s | 3.41M reads/s | 7.2 GB extraction + 15.9 GB writers (plan: 32.5 GB) |
 | TAPS test BAM (53.5M reads, no cell list, depth 100000) | 4.46M reads/s | 2.79M reads/s | 6.4 GB extraction + 10.4 GB writers |
 
-On LER this is 1.8× the previous best warm end-to-end rate with the old wrapper defaults (1.9M reads/s). On the TAPS test BAM the plain command now matches the README's tuned best (`-t 32 --shards 16 --memory-mode memory`, 2.69M reads/s). Before this change it ran with 1 shard and 24 workers. The writers used 13.9 B/site against the 16 assumed.
+On the bisulfite library this is 1.8× the previous best warm end-to-end rate with the old wrapper defaults (1.9M reads/s). On the TAPS test BAM the plain command now matches the README's tuned best (`-t 32 --shards 16 --memory-mode memory`, 2.69M reads/s). Before this change it ran with 1 shard and 24 workers. The writers used 13.9 B/site against the 16 assumed.
 
-### Depth limit on LER
+### Depth limit on the bisulfite library
+
+*Superseded later the same day:* the pileup is now unlimited. Instead:
+- `--site-depth-limit` drops whole positions above 1,216 reads. That is 3,477 bp in eight 100 kb regions, a median of 1.0% of a cell's CG calls; every other cell-site is unchanged.
+- `--cell-site-cap` (2 observations per cell per site) trims a further 0.30% of CG calls; per-cell CpG % moves by under 0.04 points.
+
+CG totals: 52,963,419 → 52,461,421 → 52,305,563; CpG 83.847% → 83.838% → 83.831%.
+
+The original measurement with the pileup cap follows.
 
 With 304 cells the auto limit is 1,216 reads. It removes 0.81% of CpG calls (52,963,419 → 52,532,405), and the CpG rate moves from 83.847% to 83.836%. Almost all of the loss is in four regions:
 

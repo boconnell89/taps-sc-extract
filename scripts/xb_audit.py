@@ -92,7 +92,9 @@ def trim_window(length, reverse, t5, t3):
     return (t3, length - t5) if reverse else (t5, length - t3)
 
 
-STEPS = ["XB as is", "+ supplementary dropped", "+ MAPQ", "+ base quality", "+ trims"]
+STEPS = ["XB as is", "+ supplementary dropped", "+ MAPQ", "+ base quality", "+ trims", "+ per-cell cap"]
+# Steps decided per call; the per-cell cap acts on each cell-site's totals afterwards.
+CALL_STEPS = STEPS[:-1]
 
 
 def xb_calls(bam, fa, contig, start, end, args, st, cells=None):
@@ -153,9 +155,13 @@ def xb_calls(bam, fa, contig, start, end, args, st, cells=None):
                         read.mapping_quality >= args.min_mapq,
                         quals[qpos] >= args.min_baseq,
                         lo <= qpos < hi]
-                for s, step in enumerate(STEPS):
+                for s, step in enumerate(CALL_STEPS):
                     if all(keep[: s + 1]):
                         out[step][ctx][key][meth] += 1
+    from taps_sc_extract.sitemask import cap_counts
+    for ctx in ("CG", "CH"):
+        for k, (t, c) in out["+ trims"][ctx].items():
+            out["+ per-cell cap"][ctx][k] = list(cap_counts(t, c, args.cell_site_cap))
     return out
 
 
@@ -231,6 +237,7 @@ def main():
     ap.add_argument("--min-baseq", type=int, default=20)
     ap.add_argument("--trim-5p", type=int, default=0)
     ap.add_argument("--trim-3p", type=int, default=10)
+    ap.add_argument("--cell-site-cap", type=int, default=2, help="the extractor's per-cell cap per site (0 = off)")
     ap.add_argument("-o", "--out-prefix", required=True)
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--block", type=int, default=5_000_000, help="bp compared at a time (bounds memory)")

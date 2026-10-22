@@ -449,6 +449,9 @@ def _run_rust_chr19(out_h5, *extra):
 
     if "--max-depth" not in extra:
         extra = (*extra, "--max-depth", FROZEN_MAX_DEPTH)
+    # Frozen references and the Python API runs have no per-cell cap.
+    if "--cell-site-cap" not in extra:
+        extra = (*extra, "--cell-site-cap", "0")
     from taps_sc_extract.cli import find_rust_binary
 
     rust_bin = find_rust_binary()
@@ -741,7 +744,7 @@ def test_context_selection_both_engines(chr19_slice_inputs, tmp_path):
         out = tmp_path / f"rs_{keep}"
         subprocess.run(
             [rust_bin, "extract", "-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
-             "-t", "2", "--shards", "2", "--no-baq", "--context", keep],
+             "-t", "2", "--shards", "2", "--no-baq", "--context", keep, "--cell-site-cap", "0"],
             check=True, capture_output=True,
         )
         assert _cells_of(out / "master.h5", gone) is None
@@ -1146,11 +1149,12 @@ def bsbolt_bam(tmp_path_factory):
     return bam, truth
 
 
-def _expected(truth, **kw):
+def _expected(truth, cap=2, **kw):
+    """Truth calls; `cap` = the per-cell cap the run used (2 is --cell-site-cap auto)."""
     import sys
     sys.path.insert(0, os.path.dirname(__file__))
     from bsbolt_fixture import expected_calls
-    return expected_calls(truth, **kw)
+    return expected_calls(truth, cap=cap, **kw)
 
 
 def _rust_bs(bam, out, *extra):
@@ -1227,6 +1231,15 @@ def test_site_filters_drop_whole_positions_in_both_engines(bsbolt_bam, tmp_path)
     assert p.returncode == 0, p.stderr[-2000:]
     full = _calls_of(tmp_path / "rs_all" / "master.h5")
 
+    # Per-cell cap (default auto = 2 for 4 molecules per cell): every cell-site
+    # of an uncapped run, scaled with cap_counts; the same in Python below.
+    from taps_sc_extract.sitemask import cap_counts
+    p = _rust_bs(bam, tmp_path / "rs_nocap", *base, "--cell-site-cap", "0")
+    assert p.returncode == 0, p.stderr[-2000:]
+    nocap = _calls_of(tmp_path / "rs_nocap" / "master.h5")
+    assert any(t + c > 2 for d in nocap.values() for t, c in d.values()), "fixture has no cell-site over the cap"
+    assert full == {ctx: {k: cap_counts(*v, 2) for k, v in d.items()} for ctx, d in nocap.items()}
+
     depth = _kept_depth(bam, "chr19", 10, 0x704 | 0x800, set(CELLS))
     limit = 3
     deep = {p for p, d in depth.items() if d > limit}
@@ -1241,7 +1254,7 @@ def test_site_filters_drop_whole_positions_in_both_engines(bsbolt_bam, tmp_path)
     extra = [*base, "--site-depth-limit", str(limit), "--blacklist", str(bed)]
     p = _rust_bs(bam, tmp_path / "rs", *extra)
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "Site filters:          depth limit dropped" in p.stderr
+    assert "Site filters:          per-cell cap trimmed" in p.stderr
     rs = _calls_of(tmp_path / "rs" / "master.h5")
     rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(tmp_path / "py"), "-c", "chr19", "-t", "2",
                    "--shards", "2", "--engine", "python", *extra])
@@ -1272,10 +1285,10 @@ def test_bisulfite_rust_no_filters_match_truth_and_xb(bsbolt_bam, tmp_path):
     """Without filters every informative base is called: equal to the truth and
     to the reads' own BSBolt XB calls."""
     bam, truth = bsbolt_bam
-    p = _rust_bs(bam, tmp_path / "rs", "--min-mapq", "0", "--min-baseq", "0", "--trim-3p", "0")
+    p = _rust_bs(bam, tmp_path / "rs", "--min-mapq", "0", "--min-baseq", "0", "--trim-3p", "0", "--cell-site-cap", "0")
     assert p.returncode == 0, p.stderr[-2000:]
     got = _calls_of(tmp_path / "rs" / "master.h5")
-    want = _expected(truth, min_mapq=0, min_baseq=0, trim_5p=0, trim_3p=0)
+    want = _expected(truth, cap=0, min_mapq=0, min_baseq=0, trim_5p=0, trim_3p=0)
     # XB decoded independently (CIGAR walk; one letter = one call).
     import re
     xb = {"CG": defaultdict(lambda: [0, 0]), "CH": defaultdict(lambda: [0, 0])}
@@ -1371,7 +1384,7 @@ def test_xb_audit_matches_pileup_after_all_filters(bsbolt_bam, tmp_path):
     assert r.returncode == 0, r.stderr[-1500:]
     assert "mismatch" not in r.stdout and "length mismatch" not in r.stdout
     rows = [l.split("\t") for l in open(tmp_path / "audit.xb_audit.tsv").read().splitlines()[1:]]
-    final = [row for row in rows if row[0] == "+ trims"]
+    final = [row for row in rows if row[0] == "+ per-cell cap"]
     assert len(final) == 2 and all(row[5:9] == ["0", "0", "0", row[8]] and int(row[8]) > 0 for row in final)
     first = [row for row in rows if row[0] == "XB as is"]
     assert any(int(row[5]) > 0 for row in first)  # unfiltered XB really differs

@@ -27,7 +27,7 @@ from .calling import (
 )
 from .chemistry import flag_filter, guard_window, tables
 from .h5_writer import set_run_attrs
-from .sitemask import Cursor, load_blacklist, merge, window_depth_mask
+from .sitemask import Cursor, apply_cap, load_blacklist, merge, window_depth_mask
 from .context import classify_context, classify_trinucleotide_context
 from .h5_writer import AmethystH5Writer, METH_DTYPE
 
@@ -67,6 +67,7 @@ def extract_methylation(
     trim_mode: str = "manual",
     site_depth_limit: int = 0,
     blacklist_path: Optional[str] = None,
+    cell_site_cap: int = 0,
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -134,6 +135,7 @@ def extract_methylation(
         "min_baseq": min_base_quality,
         "max_depth": max_depth,
         "site_depth_limit": site_depth_limit,
+        "cell_site_cap": cell_site_cap,
         "blacklist": blacklist_path or "",
         "extractor": "taps-sc-extract (python)",
     })
@@ -232,6 +234,7 @@ def extract_methylation(
                 target_accum = accum_cg if ctx == "CG" else accum_ch
                 pos_1based = pos + 1
 
+                touched = set()
                 for pileupread in col.pileups:
                     if pileupread.is_del or pileupread.is_refskip:
                         continue
@@ -260,6 +263,7 @@ def extract_methylation(
                         continue
 
                     contig_barcodes.add(bc)
+                    touched.add(bc)
                     counts = target_accum[bc][pos_1based]
                     if call == 1:
                         counts[1] += 1  # methylated (c)
@@ -269,6 +273,8 @@ def extract_methylation(
                         counts[0] += 1  # unmethylated (t)
                         contig_counts[ctx_tri]["t"] += 1
                         contig_counts[ctx]["t"] += 1
+                if cell_site_cap and touched:
+                    apply_cap(target_accum, touched, pos_1based, cell_site_cap, contig_counts, ctx, ctx_tri)
 
             # Flush accumulated contig calls to HDF5
             contig_bytes = contig.encode("ascii")

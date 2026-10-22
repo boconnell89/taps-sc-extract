@@ -43,7 +43,7 @@ from .calling import (
 )
 from .chemistry import flag_filter, guard_window, tables
 from .fasta import FastFaiReader
-from .sitemask import Cursor, load_blacklist, merge, overlapping, window_depth_mask
+from .sitemask import Cursor, apply_cap, load_blacklist, merge, overlapping, window_depth_mask
 from .h5_writer import (
     set_run_attrs,
     write_run_attrs,
@@ -228,6 +228,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
         masked += window_depth_mask(bam, contig, start, end, params["site_depth_limit"], flag_filter(chemistry),
                                     min_mapq, ignore_orphans, whitelist)
     mask = Cursor(merge(masked))
+    cell_site_cap = params.get("cell_site_cap", 0)
 
     pileup_iter = bam.pileup(
         contig,
@@ -287,6 +288,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
         target_accum = accum_cg if ctx == "CG" else accum_ch
         pos_1based = pos + 1
 
+        touched = set()
         for pileupread in col.pileups:
             if pileupread.is_del or pileupread.is_refskip:
                 continue
@@ -315,6 +317,7 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
                 continue
 
             barcodes_seen.add(bc)
+            touched.add(bc)
             counts = target_accum[bc][pos_1based]
             if call == 1:
                 counts[1] += 1
@@ -324,6 +327,8 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
                 counts[0] += 1
                 stats[ctx_tri]["t"] += 1
                 stats[ctx]["t"] += 1
+        if cell_site_cap and touched:
+            apply_cap(target_accum, touched, pos_1based, cell_site_cap, stats, ctx, ctx_tri)
 
     # Convert accumulator dicts to compact NumPy structured arrays partitioned by shard
     contig_bytes = contig.encode("ascii")
@@ -590,6 +595,7 @@ def extract_methylation_parallel(
     trim_mode: str = "manual",
     site_depth_limit: int = 0,
     blacklist_path: Optional[str] = None,
+    cell_site_cap: int = 0,
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -669,6 +675,7 @@ def extract_methylation_parallel(
         "min_baseq": min_base_quality,
         "max_depth": max_depth,
         "site_depth_limit": site_depth_limit,
+        "cell_site_cap": cell_site_cap,
         "blacklist": blacklist_path or "",
         "extractor": "taps-sc-extract (python)",
     })
@@ -690,6 +697,7 @@ def extract_methylation_parallel(
         "contexts": tuple(contexts),
         "site_depth_limit": site_depth_limit,
         "blacklist": load_blacklist(blacklist_path) if blacklist_path else {},
+        "cell_site_cap": cell_site_cap,
     }
 
     if effective_shards > 1:

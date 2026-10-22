@@ -261,14 +261,24 @@ enum Commands {
         /// thins deep positions by read order; --site-depth-limit drops them.
         #[arg(long)]
         max_depth: Option<u32>,
+        /// Most observations one cell keeps at a site: a number (0 = off) or
+        /// auto (default) = --molecules-per-cell / 2 (a site is called on one
+        /// strand: one molecule per haplotype), x 2 for TAPS with
+        /// --no-overlap-clip. Extra observations are scaled away keeping the
+        /// t:c ratio. Relax it (raise --molecules-per-cell, or 0) when real
+        /// extra copies are expected: copy-number gains, segmental
+        /// duplications, aneuploidy (e.g. cancer), replicating cells.
+        #[arg(long)]
+        cell_site_cap: Option<crate::extract::DepthArg>,
         /// Drop every call at positions covered by more kept-cell reads than
         /// this: a number (0 = off) or auto (default) = --molecules-per-cell x
         /// reads per molecule (taps 2, bisulfite 1) x cells kept by
         /// --complexity (with its cutoff) / --whitelist. Off without either.
         #[arg(long)]
         site_depth_limit: Option<crate::extract::DepthArg>,
-        /// Molecules one cell can have at a position, for --site-depth-limit
-        /// auto: 4 = 2 strands x 2 haplotypes; 8 allows a replicated (G2) genome.
+        /// Molecules one cell can have at a position (both strands): 4 = 2
+        /// strands x 2 haplotypes; 8 allows a replicated (G2) genome. Sets
+        /// --cell-site-cap auto and --site-depth-limit auto.
         #[arg(long, default_value_t = crate::extract::MOLECULES_PER_CELL)]
         molecules_per_cell: u32,
         /// BED of regions whose calls are dropped for every cell (e.g. the
@@ -617,6 +627,7 @@ fn main() -> Result<()> {
                 max_depth,
                 site_depth_limit: 0,
                 blacklist: None,
+                cell_site_cap: 0,
                 ignore_overlaps,
                 ignore_orphans,
                 compute_baq,
@@ -706,6 +717,7 @@ fn main() -> Result<()> {
             min_baseq,
             min_mapq,
             max_depth,
+            cell_site_cap,
             site_depth_limit,
             molecules_per_cell,
             blacklist,
@@ -788,6 +800,14 @@ fn main() -> Result<()> {
                 }
                 (None, None) => (0, "auto; off without --complexity or --whitelist".to_string()),
             };
+            let reads_per_call = if chem == chemistry::Chemistry::Taps && no_overlap_clip { 2 } else { 1 };
+            let (cell_site_cap, cell_cap_src) = match cell_site_cap {
+                Some(crate::extract::DepthArg::Fixed(n)) => (n, "explicit".to_string()),
+                _ => (
+                    crate::extract::auto_cell_site_cap(molecules_per_cell, reads_per_call),
+                    format!("auto: {molecules_per_cell} molecules / 2 strands x {reads_per_call} call(s) per molecule"),
+                ),
+            };
             let blacklist_set = match blacklist.as_deref() {
                 Some(p) => Some(std::sync::Arc::new(crate::sitemask::Blacklist::load(p)?)),
                 None => None,
@@ -810,6 +830,7 @@ fn main() -> Result<()> {
                 ("min_baseq", min_baseq.to_string()),
                 ("max_depth", max_depth.to_string()),
                 ("site_depth_limit", site_depth_limit.to_string()),
+                ("cell_site_cap", cell_site_cap.to_string()),
                 ("blacklist", blacklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
                 ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                 ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
@@ -934,6 +955,7 @@ fn main() -> Result<()> {
                     ("min_baseq", min_baseq.to_string()),
                     ("max_depth", max_depth.to_string()),
                     ("site_depth_limit", site_depth_limit.to_string()),
+                ("cell_site_cap", cell_site_cap.to_string()),
                     ("blacklist", blacklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
                     ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                     ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
@@ -977,6 +999,7 @@ fn main() -> Result<()> {
                 max_depth,
                 site_depth_limit,
                 blacklist: blacklist_set.clone(),
+                cell_site_cap,
                 ignore_overlaps: !no_overlap_clip,
                 ignore_orphans: !no_ignore_orphans,
                 compute_baq: !no_baq,
@@ -1058,7 +1081,8 @@ fn main() -> Result<()> {
                 eprintln!("  5' trim:         R1={} bp, R2={} bp; 3' {} bp", params.trim_r1, params.trim_r2, params.trim_3p);
             }
             eprintln!(
-                "  Site filters:    depth limit {} ({site_depth_src}); blacklist {}",
+                "  Site filters:    per-cell cap {} ({cell_cap_src}); depth limit {} ({site_depth_src}); blacklist {}",
+                if cell_site_cap == 0 { "off".to_string() } else { cell_site_cap.to_string() },
                 if site_depth_limit == 0 { "off".to_string() } else { site_depth_limit.to_string() },
                 match (&blacklist, &blacklist_set) {
                     (Some(p), Some(b)) => format!("{} ({} regions, {:.2} Mb)", p.display(), b.n_regions(), b.total_bp() as f64 / 1e6),
@@ -1359,10 +1383,10 @@ fn print_extraction_summary(
     eprintln!("Total Wall Time:       {total_s:.1}s ({:.2} min)", total_s / 60.0);
     eprintln!("Processing Time:       {process_s:.1}s ({:.2} min)", process_s / 60.0);
     let t = &r.timing;
-    if t.site_depth_bp > 0 || t.blacklist_sites > 0 {
+    if t.site_depth_bp > 0 || t.blacklist_sites > 0 || t.cap_sites > 0 {
         eprintln!(
-            "Site filters:          depth limit dropped {} calls at {} cell-sites ({} bp over the limit); blacklist dropped {} calls at {} cell-sites",
-            t.site_depth_calls, t.site_depth_sites, t.site_depth_bp, t.blacklist_calls, t.blacklist_sites
+            "Site filters:          per-cell cap trimmed {} calls at {} cell-sites; depth limit dropped {} calls at {} cell-sites ({} bp over the limit); blacklist dropped {} calls at {} cell-sites",
+            t.cap_calls, t.cap_sites, t.site_depth_calls, t.site_depth_sites, t.site_depth_bp, t.blacklist_calls, t.blacklist_sites
         );
     }
     eprintln!("HDF5 Write Time:       {write_s:.1}s ({:.2} min)", write_s / 60.0);
