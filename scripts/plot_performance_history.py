@@ -1,7 +1,7 @@
 """Plot the README's Performance History: throughput and peak memory relative to
 the last version before the 2026-10-14 work (e19e2b4).
 
-Numbers are the README table's (reference workstation, full test BAM, each
+Numbers are the docs/performance.md history table (reference workstation, full test BAM, each
 release's defaults). Writes docs/img/perf_history_throughput.svg and
 docs/img/perf_history_memory.svg. Run from the repository root:
 
