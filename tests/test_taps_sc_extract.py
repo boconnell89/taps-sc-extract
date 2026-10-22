@@ -1025,9 +1025,11 @@ def test_rust_command_uses_rust_defaults_unless_set():
     assert "--context" not in cmd
     # Rust picks workers, shards and the depth cap itself unless set.
     assert "-t" not in cmd and "--shards" not in cmd and "--max-depth" not in cmd
-    set_ = base + ["-t", "8", "--max-depth", "auto"]
+    assert "--site-depth-limit" not in cmd and "--blacklist" not in cmd
+    set_ = base + ["-t", "8", "--site-depth-limit", "auto", "--molecules-per-cell", "8", "--blacklist", "x.bed"]
     cmd = build_rust_command("taps-sc-extract-rs", parse_args(set_), set_)
-    assert cmd[cmd.index("-t") + 1] == "8" and cmd[cmd.index("--max-depth") + 1] == "auto"
+    assert cmd[cmd.index("-t") + 1] == "8" and cmd[cmd.index("--site-depth-limit") + 1] == "auto"
+    assert cmd[cmd.index("--molecules-per-cell") + 1] == "8" and cmd[cmd.index("--blacklist") + 1] == "x.bed"
 
     explicit = base + ["--chunk-size-mb", "10", "--compression", "gzip", "--shards", "4"]
     parsed = parse_args(explicit)
@@ -1185,36 +1187,85 @@ def test_bisulfite_rust_defaults_match_truth(bsbolt_bam, tmp_path):
     assert attrs["chemistry"] == "bisulfite" and attrs["trim_3p"] == "10" and attrs["bsbolt_version"] == "1.2.1"
 
 
-def test_max_depth_auto_counts_kept_cells(bsbolt_bam, tmp_path):
-    """--max-depth auto = 4 molecules x reads per molecule (bisulfite 1) x the
-    cells --complexity keeps (all barcodes in the file without a cutoff), in
-    both engines; without a cell list the default stays 100000."""
+def test_depth_mask_matches_brute_force():
+    import random
+    from taps_sc_extract.sitemask import depth_mask
+    rng = random.Random(3)
+    for limit in (0, 1, 2, 5):
+        spans = sorted((s, s + 1 + rng.randrange(60)) for s in (rng.randrange(1000) for _ in range(300)))
+        depth = [0] * 1100
+        for st, en in spans:
+            for i in range(st, en):
+                depth[i] += 1
+        got = depth_mask(spans, limit)
+        for pos, d in enumerate(depth):
+            assert any(st <= pos < en for st, en in got) == (d > limit), (limit, pos, d)
+
+
+def _kept_depth(bam, contig, min_mapq, flag_filter, cells):
+    """Per-position depth of kept-cell reads passing the read filters (independent of sitemask)."""
+    depth = {}
+    with pysam.AlignmentFile(bam) as f:
+        for r in f.fetch(contig):
+            if r.flag & flag_filter or r.mapping_quality < min_mapq or r.query_name.split(":")[0] not in cells:
+                continue
+            for p in range(r.reference_start, r.reference_end):
+                depth[p] = depth.get(p, 0) + 1
+    return depth
+
+
+def test_site_filters_drop_whole_positions_in_both_engines(bsbolt_bam, tmp_path):
+    """--site-depth-limit and --blacklist remove every call at a masked position
+    and nothing else (the pileup is unchanged); Rust and Python agree per cell.
+    --site-depth-limit auto = molecules per cell x 1 read (bisulfite) x kept cells."""
     from bsbolt_fixture import CELLS
-    from taps_sc_extract.chemistry import auto_max_depth
     from taps_sc_extract.cli import main as cli_main
 
-    assert auto_max_depth(10_073, "bisulfite") == 40_292
-    assert auto_max_depth(7_351, "taps") == 58_808
     bam, _ = bsbolt_bam
+    base = ["--trim", "manual"]
+    p = _rust_bs(bam, tmp_path / "rs_all", *base)
+    assert p.returncode == 0, p.stderr[-2000:]
+    full = _calls_of(tmp_path / "rs_all" / "master.h5")
+
+    depth = _kept_depth(bam, "chr19", 10, 0x704 | 0x800, set(CELLS))
+    limit = 3
+    deep = {p for p, d in depth.items() if d > limit}
+    assert deep, "fixture has no position over the test limit"
+    bed = tmp_path / "bl.bed"
+    bed.write_text("track name=test\nchr19\t5100000\t5120000\n")
+    black = set(range(5_100_000, 5_120_000))
+    want = {ctx: {k: v for k, v in d.items() if (k[1] - 1) not in deep and (k[1] - 1) not in black}
+            for ctx, d in full.items()}
+    assert sum(map(len, want.values())) < sum(map(len, full.values()))
+
+    extra = [*base, "--site-depth-limit", str(limit), "--blacklist", str(bed)]
+    p = _rust_bs(bam, tmp_path / "rs", *extra)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "Site filters:          depth limit dropped" in p.stderr
+    rs = _calls_of(tmp_path / "rs" / "master.h5")
+    rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(tmp_path / "py"), "-c", "chr19", "-t", "2",
+                   "--shards", "2", "--engine", "python", *extra])
+    assert rc == 0
+    py = _calls_of(tmp_path / "py" / "master.h5")
+    for ctx in ("CG", "CH"):
+        assert rs[ctx] == want[ctx], ctx
+        assert py[ctx] == want[ctx], ctx
+
+    # auto: molecules per cell x kept cells; off without a cell list.
     cx = tmp_path / "cx.txt"
-    cx.write_text("".join(f"{i + 1}\t{bc}\t{1000 * (i + 1)}\t{500 * (i + 1)}\t50\n"
-                          for i, bc in enumerate(CELLS)))
-    cases = [([], "100000"),
+    cx.write_text("".join(f"{i + 1}\t{bc}\t{1000 * (i + 1)}\t{500 * (i + 1)}\t50\n" for i, bc in enumerate(CELLS)))
+    cases = [([], "0"),
              (["--complexity", str(cx)], str(4 * len(CELLS))),
-             (["--complexity", str(cx), "--min-complexity", "1500"], str(4 * (len(CELLS) - 2)))]
-    for k, (extra, want) in enumerate(cases):
-        p = _rust_bs(bam, tmp_path / f"rs{k}", "--trim", "manual", *extra)
+             (["--complexity", str(cx), "--min-complexity", "1500"], str(4 * (len(CELLS) - 2))),
+             (["--complexity", str(cx), "--molecules-per-cell", "8"], str(8 * len(CELLS)))]
+    for k, (more, want_limit) in enumerate(cases):
+        p = _rust_bs(bam, tmp_path / f"auto{k}", *base, *more)
         assert p.returncode == 0, p.stderr[-2000:]
-        with h5py.File(str(tmp_path / f"rs{k}" / "shard_000.h5"), "r") as f:
-            assert f["metadata"].attrs["max_depth"] == want, (extra, p.stderr[-800:])
-        out = tmp_path / f"py{k}"
-        rc = cli_main(["-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19", "-t", "2",
-                       "--shards", "2", "--engine", "python", "--trim", "manual", *extra])
-        assert rc == 0
-        with h5py.File(str(out / "shard_000.h5"), "r") as f:
-            assert str(f["metadata"].attrs["max_depth"]) == want, extra
-    p = _rust_bs(bam, tmp_path / "rs_err", "--max-depth", "auto")
-    assert p.returncode != 0 and "--max-depth auto needs --complexity" in p.stderr
+        with h5py.File(str(tmp_path / f"auto{k}" / "shard_000.h5"), "r") as f:
+            assert f["metadata"].attrs["site_depth_limit"] == want_limit, (more, p.stderr[-800:])
+            assert f["metadata"].attrs["max_depth"] == "0"
+    p = _rust_bs(bam, tmp_path / "auto_err", "--site-depth-limit", "auto")
+    assert p.returncode != 0 and "--site-depth-limit auto needs --complexity" in p.stderr
 
 
 def test_bisulfite_rust_no_filters_match_truth_and_xb(bsbolt_bam, tmp_path):

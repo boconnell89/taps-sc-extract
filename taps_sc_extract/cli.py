@@ -220,12 +220,32 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-depth",
+        type=int,
+        default=None,
+        help="htslib pileup cap, all cells together (default: 0 = unlimited). A cap thins deep "
+        "positions by read order; --site-depth-limit drops them instead.",
+    )
+    parser.add_argument(
+        "--site-depth-limit",
         type=_depth_arg,
         default=None,
-        help="Maximum reads per position, all cells together (htslib pileup cap): a number "
-        "(0 = unlimited) or auto (default) = 4 molecules (2 strands x 2 haplotypes) x reads per "
-        "molecule (taps 2, bisulfite 1) x cells kept by --complexity (with its cutoff) / "
-        "--whitelist. Without either the default is 100000.",
+        help="Drop every call at positions covered by more kept-cell reads than this: a number "
+        "(0 = off) or auto (default) = --molecules-per-cell x reads per molecule (taps 2, "
+        "bisulfite 1) x cells kept by --complexity (with its cutoff) / --whitelist; off without "
+        "either. The pileup is unchanged.",
+    )
+    parser.add_argument(
+        "--molecules-per-cell",
+        type=int,
+        default=None,
+        help="Molecules one cell can have at a position, for --site-depth-limit auto (default 4 = "
+        "2 strands x 2 haplotypes; 8 allows a replicated, G2 genome).",
+    )
+    parser.add_argument(
+        "--blacklist",
+        default=None,
+        help="BED of regions whose calls are dropped for every cell (e.g. the ENCODE blacklist). "
+        "The pileup is unchanged.",
     )
     parser.add_argument(
         "--no-baq",
@@ -434,7 +454,7 @@ RUST_DEFAULT_COMPRESSION = "blosc"
 
 
 def _depth_arg(value: str):
-    """--max-depth: 'auto' or a non-negative read count."""
+    """--site-depth-limit: 'auto' or a non-negative read count."""
     if value.lower() == "auto":
         return "auto"
     try:
@@ -442,7 +462,7 @@ def _depth_arg(value: str):
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected a read count or 'auto', got {value!r}")
     if n < 0:
-        raise argparse.ArgumentTypeError("--max-depth must be >= 0")
+        raise argparse.ArgumentTypeError("--site-depth-limit must be >= 0")
     return n
 
 
@@ -484,6 +504,9 @@ def build_rust_command(rust_bin: str, parsed, argv: List[str]) -> List[str]:
         ("--min-baseq", parsed.min_baseq),
         ("--min-mapq", parsed.min_mapq),
         ("--max-depth", parsed.max_depth),
+        ("--site-depth-limit", parsed.site_depth_limit),
+        ("--molecules-per-cell", parsed.molecules_per_cell),
+        ("--blacklist", parsed.blacklist),
         ("--trim-r1", parsed.trim_r1),
         ("--trim-r2", parsed.trim_r2),
         ("--trim-3p", parsed.trim_3p),
@@ -636,16 +659,19 @@ def resolve_python_options(parsed):
     d = defaults(chem)
     opts = {k: (getattr(parsed, k) if getattr(parsed, k) is not None else d[k])
             for k in ("min_mapq", "min_baseq", "max_depth", "trim_r1", "trim_r2", "trim_3p")}
-    if parsed.max_depth is None or parsed.max_depth == "auto":
+    opts["site_depth_limit"] = parsed.site_depth_limit
+    if parsed.site_depth_limit is None or parsed.site_depth_limit == "auto":
         from .barcode import load_cell_filter
-        from .chemistry import auto_max_depth
+        from .chemistry import READS_PER_MOLECULE
+        from .sitemask import MOLECULES_PER_CELL, auto_site_depth_limit
+        mpc = parsed.molecules_per_cell or MOLECULES_PER_CELL
         cells = load_cell_filter(parsed.whitelist, parsed.complexity, parsed.min_complexity, parsed.max_complexity)
         if cells is not None:
-            opts["max_depth"] = auto_max_depth(len(cells), chem)
-        elif parsed.max_depth == "auto":
-            raise ValueError("--max-depth auto needs --complexity or --whitelist to count the cells; give a number instead")
+            opts["site_depth_limit"] = auto_site_depth_limit(len(cells), mpc, READS_PER_MOLECULE[chem])
+        elif parsed.site_depth_limit == "auto":
+            raise ValueError("--site-depth-limit auto needs --complexity or --whitelist to count the cells; give a number instead")
         else:
-            opts["max_depth"] = d["max_depth"]
+            opts["site_depth_limit"] = 0
     opts["trim_mode"] = parsed.trim or ("auto" if chem == "bisulfite" else "manual")
     if opts["trim_mode"] == "auto":
         opts.update(auto_trims(parsed, chem, opts, contigs))
@@ -749,6 +775,8 @@ def main(args: Optional[List[str]] = None) -> int:
             contexts=("CG", "CH") if parsed.context == "both" else (parsed.context,),
             chemistry=chem,
             verify_ys=parsed.strand_source == "auto",
+            site_depth_limit=opts["site_depth_limit"],
+            blacklist_path=parsed.blacklist,
         )
         return 0
     except Exception as e:

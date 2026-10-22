@@ -43,6 +43,7 @@ from .calling import (
 )
 from .chemistry import flag_filter, guard_window, tables
 from .fasta import FastFaiReader
+from .sitemask import Cursor, load_blacklist, merge, overlapping, window_depth_mask
 from .h5_writer import (
     set_run_attrs,
     write_run_attrs,
@@ -220,6 +221,14 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     }
     barcodes_seen: Set[str] = set()
 
+    # Per-position filters (sitemask): blacklist regions and positions deeper
+    # than --site-depth-limit lose their calls in every cell.
+    masked = overlapping(params.get("blacklist", {}).get(contig, []), start, end)
+    if params.get("site_depth_limit", 0) > 0:
+        masked += window_depth_mask(bam, contig, start, end, params["site_depth_limit"], flag_filter(chemistry),
+                                    min_mapq, ignore_orphans, whitelist)
+    mask = Cursor(merge(masked))
+
     pileup_iter = bam.pileup(
         contig,
         start=start,
@@ -237,6 +246,8 @@ def _process_chunk(chunk_info: Tuple[int, str, int, int]) -> Tuple[int, str, int
     for col in pileup_iter:
         pos = col.reference_pos  # 0-based
         if pos < start or pos >= end:
+            continue
+        if mask.hit(pos):
             continue
 
         rel_pos = pos - ref_start
@@ -566,7 +577,7 @@ def extract_methylation_parallel(
     max_writer_threads: Optional[int] = 6,
     min_base_quality: int = 20,
     min_mapq: int = 0,
-    max_depth: int = 100000,
+    max_depth: int = 0,
     compute_baq: bool = True,
     ignore_orphans: bool = True,
     ignore_overlaps: bool = True,
@@ -577,6 +588,8 @@ def extract_methylation_parallel(
     trim_3p: int = 0,
     verify_ys: bool = True,
     trim_mode: str = "manual",
+    site_depth_limit: int = 0,
+    blacklist_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Parallel single-cell TAPS methylation extractor.
@@ -655,6 +668,8 @@ def extract_methylation_parallel(
         "min_mapq": min_mapq,
         "min_baseq": min_base_quality,
         "max_depth": max_depth,
+        "site_depth_limit": site_depth_limit,
+        "blacklist": blacklist_path or "",
         "extractor": "taps-sc-extract (python)",
     })
     worker_params = {
@@ -673,6 +688,8 @@ def extract_methylation_parallel(
         "chemistry": chemistry,
         "verify_ys": verify_ys,
         "contexts": tuple(contexts),
+        "site_depth_limit": site_depth_limit,
+        "blacklist": load_blacklist(blacklist_path) if blacklist_path else {},
     }
 
     if effective_shards > 1:

@@ -121,25 +121,18 @@ def resolve(requested: str, det: Dict[str, object], strand_source: str = "auto")
     raise ValueError(f"unknown chemistry {requested!r}")
 
 
-# --max-depth auto: molecules one cell can have at a position in a deduplicated
-# library (2 strands x 2 haplotypes), times reads per molecule (both mates for
-# paired-end TAPS). Same rule as extract::auto_max_depth in Rust.
-MOLECULES_PER_CELL = 4
+# Reads one molecule can put at a position: both mates for paired-end TAPS
+# (--site-depth-limit auto; Rust Chemistry::reads_per_molecule).
 READS_PER_MOLECULE = {"taps": 2, "bisulfite": 1}
-
-
-def auto_max_depth(cells: int, chemistry: str) -> int:
-    """4 molecules x reads per molecule x cells kept by --complexity / --whitelist."""
-    return max(1, min(cells * MOLECULES_PER_CELL * READS_PER_MOLECULE[chemistry], 2**31 - 1))
 
 
 def defaults(chemistry: str) -> Dict[str, object]:
     """Per-chemistry defaults for options the user did not set (see chemistry.rs)."""
     if chemistry == "taps":
-        return {"min_mapq": 0, "min_baseq": 20, "max_depth": 100000, "trim_r1": 0, "trim_r2": 10, "trim_3p": 0, "baq": True}
+        return {"min_mapq": 0, "min_baseq": 20, "max_depth": 0, "trim_r1": 0, "trim_r2": 10, "trim_3p": 0, "baq": True}
     # Bisulfite SE (BSBolt): drop MAPQ < 10 (0 = not bisulfite-unique), trim
     # 10 bp off the sequenced 3' end (Tn5 gap fill-in), no BAQ.
-    return {"min_mapq": 10, "min_baseq": 20, "max_depth": 100000, "trim_r1": 0, "trim_r2": 0, "trim_3p": 10, "baq": False}
+    return {"min_mapq": 10, "min_baseq": 20, "max_depth": 0, "trim_r1": 0, "trim_r2": 0, "trim_3p": 10, "baq": False}
 
 
 def check_reference(fasta, bam_lengths: Dict[str, int], contigs) -> None:

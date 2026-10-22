@@ -24,7 +24,7 @@ pub fn extract_barcode(qname: &str) -> &str {
 }
 
 /// Lines of a plain or gzipped (`.gz`) text file.
-fn open_text(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
+pub fn open_text(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
     let file = File::open(path)?;
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gz")) {
         Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file))))

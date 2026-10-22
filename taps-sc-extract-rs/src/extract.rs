@@ -81,6 +81,23 @@ impl CallStats {
         }
     }
 
+    /// Take back `t` unmethylated and `c` methylated calls (`sitemask::apply`).
+    pub fn remove(&mut self, tri: TriContext, ctx: Context, t: u64, c: u64) {
+        let (tc, tt) = match tri {
+            TriContext::Cpg => (&mut self.cpg_c, &mut self.cpg_t),
+            TriContext::Chg => (&mut self.chg_c, &mut self.chg_t),
+            TriContext::Chh => (&mut self.chh_c, &mut self.chh_t),
+        };
+        *tc = tc.saturating_sub(c);
+        *tt = tt.saturating_sub(t);
+        let (xc, xt) = match ctx {
+            Context::Cg => (&mut self.cg_c, &mut self.cg_t),
+            Context::Ch => (&mut self.ch_c, &mut self.ch_t),
+        };
+        *xc = xc.saturating_sub(c);
+        *xt = xt.saturating_sub(t);
+    }
+
     pub fn merge(&mut self, other: &CallStats) {
         self.cpg_c += other.cpg_c;
         self.cpg_t += other.cpg_t;
@@ -135,6 +152,14 @@ pub struct WindowTiming {
     pub baq_reads: u64,
     /// Records the `--max-depth` cap dropped (read-centric calling only).
     pub depth_dropped: u64,
+    /// Calls and cell-sites removed at positions deeper than `--site-depth-limit`.
+    pub site_depth_calls: u64,
+    pub site_depth_sites: u64,
+    /// Reference positions over the limit (inside the window).
+    pub site_depth_bp: u64,
+    /// Calls and cell-sites removed inside `--blacklist` regions.
+    pub blacklist_calls: u64,
+    pub blacklist_sites: u64,
     /// Read batches whose BAQ was sent to the GPU (the rest ran on the CPU).
     pub baq_gpu_batches: u64,
     /// Read batches that had BAQ work.
@@ -158,6 +183,11 @@ impl WindowTiming {
         self.pushed += o.pushed;
         self.baq_reads += o.baq_reads;
         self.depth_dropped += o.depth_dropped;
+        self.site_depth_calls += o.site_depth_calls;
+        self.site_depth_sites += o.site_depth_sites;
+        self.site_depth_bp += o.site_depth_bp;
+        self.blacklist_calls += o.blacklist_calls;
+        self.blacklist_sites += o.blacklist_sites;
         self.baq_gpu_batches += o.baq_gpu_batches;
         self.baq_batches += o.baq_batches;
         self.total_s += o.total_s;
@@ -206,6 +236,11 @@ pub struct ExtractParams {
     pub min_baseq: u8,
     pub min_mapq: u8,
     pub max_depth: u32,
+    /// Drop every call at positions where more kept-cell reads than this
+    /// cover the base (`sitemask`); 0 = off.
+    pub site_depth_limit: u32,
+    /// `--blacklist`: drop every call inside these regions.
+    pub blacklist: Option<std::sync::Arc<crate::sitemask::Blacklist>>,
     pub ignore_overlaps: bool,
     pub ignore_orphans: bool,
     pub compute_baq: bool,
@@ -253,6 +288,8 @@ impl Default for ExtractParams {
             min_baseq: 20,
             min_mapq: 0,
             max_depth: DEFAULT_MAX_DEPTH,
+            site_depth_limit: 0,
+            blacklist: None,
             ignore_overlaps: true,
             ignore_orphans: true,
             compute_baq: true,
@@ -479,17 +516,17 @@ const FLAG_FILTER: u16 = (htslib::BAM_FUNMAP
     | htslib::BAM_FQCFAIL
     | htslib::BAM_FDUP) as u16;
 
-/// Default `--max-depth`: htslib's per-position read cap, counted across all
-/// cells. Single-cell depth at a site is roughly the number of cells covering
-/// it, so 250 dropped whole cells at well-covered loci (805k reads on the
-/// test BAM); 100,000 only guards against pathological repeats.
-pub const DEFAULT_MAX_DEPTH: u32 = 100_000;
+/// Default htslib pileup cap: unlimited (2026-10-21). Deep positions are
+/// handled by `--site-depth-limit`, which drops a position for every cell
+/// instead of thinning it by read order. It was 100,000 from 2026-10-20 and
+/// 250 before that (250 dropped 805k reads on the test BAM).
+pub const DEFAULT_MAX_DEPTH: u32 = 0;
 
 /// Molecules one cell can have at a position in a deduplicated library:
-/// 2 strands x 2 haplotypes.
-pub const MOLECULES_PER_CELL: u64 = 4;
+/// 2 strands x 2 haplotypes (8 for a replicated, G2 genome).
+pub const MOLECULES_PER_CELL: u32 = 4;
 
-/// `--max-depth`: a read count (0 = unlimited) or `auto`.
+/// `--site-depth-limit`: a read count (0 = off) or `auto`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepthArg {
     Auto,
@@ -508,11 +545,11 @@ impl std::str::FromStr for DepthArg {
     }
 }
 
-/// `--max-depth auto`: 4 molecules per cell x reads per molecule x the cells
-/// kept by `--complexity` (and its cutoff) / `--whitelist`. The cap counts
-/// every read in the pileup, filtered cells' included.
-pub fn auto_max_depth(barcodes: usize, reads_per_molecule: u32) -> u32 {
-    (barcodes as u64 * MOLECULES_PER_CELL * reads_per_molecule as u64).clamp(1, i32::MAX as u64) as u32
+/// `--site-depth-limit auto`: molecules per cell (`--molecules-per-cell`,
+/// default 4) x reads per molecule x the cells kept by `--complexity` (and its
+/// cutoff) / `--whitelist`.
+pub fn auto_site_depth_limit(cells: usize, molecules_per_cell: u32, reads_per_molecule: u32) -> u32 {
+    (cells as u64 * u64::from(molecules_per_cell) * u64::from(reads_per_molecule)).clamp(1, u32::MAX as u64) as u32
 }
 
 /// The cap passed to htslib / `ReadPileup`: 0 means unlimited. htslib takes a
@@ -682,6 +719,8 @@ pub fn process_window(
         whitelist,
     };
     let mut sink = crate::readcall::CallSink::default();
+    // --site-depth-limit: kept cells' read spans, in push (= start) order.
+    let mut sweep = (params.site_depth_limit > 0).then(|| crate::sitemask::DepthSweep::new(params.site_depth_limit));
     let win_start = window.start as u32;
     let win_end = window.end as u32;
 
@@ -950,6 +989,15 @@ pub fn process_window(
         let t_call = Instant::now();
         for (rec, _) in slot.pool[..slot.n].iter().zip(&slot.keep[..slot.n]).filter(|(_, k)| **k) {
             timing.pushed += 1;
+            if let Some(sw) = sweep.as_mut() {
+                let kept = whitelist.is_none_or(|wl| {
+                    wl.contains(std::str::from_utf8(barcode_from_qname_bytes(rec.qname())).unwrap_or(""))
+                });
+                if kept {
+                    let end = unsafe { htslib::bam_endpos(rec.inner()) };
+                    sw.push(rec.pos().max(0) as u64, end.max(0) as u64);
+                }
+            }
             if read_mode {
                 rp.push(rec, &mut call_one)?;
                 continue;
@@ -985,6 +1033,23 @@ pub fn process_window(
     plp_s += lap(profile);
     for cell in cells.iter_mut() {
         cell.normalize();
+    }
+    // Per-position filters: the blacklist first, then depth on what is left.
+    if let Some(bl) = &params.blacklist {
+        let regions = bl.overlapping(&window.contig, window.start, window.end);
+        let r = crate::sitemask::apply(&mut cells, &mut stats, &regions, &ref_seq, ref_start);
+        timing.blacklist_calls = r.calls;
+        timing.blacklist_sites = r.sites;
+    }
+    if let Some(sw) = sweep.take() {
+        let deep = sw.finish();
+        timing.site_depth_bp = deep
+            .iter()
+            .map(|&(s, e)| e.min(window.end).saturating_sub(s.max(window.start)))
+            .sum();
+        let r = crate::sitemask::apply(&mut cells, &mut stats, &deep, &ref_seq, ref_start);
+        timing.site_depth_calls = r.calls;
+        timing.site_depth_sites = r.sites;
     }
     if profile {
         timing.call_s = call_ns.get() as f64 * 1e-9;
@@ -1137,15 +1202,16 @@ mod tests {
         assert_eq!(effective_max_depth(0), i32::MAX);
         assert_eq!(effective_max_depth(250), 250);
         assert_eq!(effective_max_depth(u32::MAX), i32::MAX);
-        assert_eq!(DEFAULT_MAX_DEPTH, 100_000);
+        assert_eq!(DEFAULT_MAX_DEPTH, 0);
     }
 
     #[test]
-    fn auto_max_depth_is_four_molecules_per_barcode() {
-        assert_eq!(auto_max_depth(10_073, 1), 40_292);
-        assert_eq!(auto_max_depth(7_351, 2), 58_808);
-        assert_eq!(auto_max_depth(0, 2), 1);
-        assert_eq!(auto_max_depth(usize::MAX / 8, 2), i32::MAX as u32);
+    fn auto_site_depth_limit_is_molecules_per_cell() {
+        assert_eq!(auto_site_depth_limit(304, 4, 1), 1_216);
+        assert_eq!(auto_site_depth_limit(7_351, 4, 2), 58_808);
+        assert_eq!(auto_site_depth_limit(304, 8, 1), 2_432);
+        assert_eq!(auto_site_depth_limit(0, 4, 2), 1);
+        assert_eq!(auto_site_depth_limit(usize::MAX / 8, 8, 2), u32::MAX);
         assert_eq!("auto".parse::<DepthArg>(), Ok(DepthArg::Auto));
         assert_eq!("250".parse::<DepthArg>(), Ok(DepthArg::Fixed(250)));
         assert!("x".parse::<DepthArg>().is_err());

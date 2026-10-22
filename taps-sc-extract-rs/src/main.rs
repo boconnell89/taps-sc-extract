@@ -25,6 +25,7 @@ mod profile;
 mod readcall;
 mod shard_io;
 mod shard_stream;
+mod sitemask;
 mod tune;
 mod window;
 
@@ -256,13 +257,24 @@ enum Commands {
         /// Minimum mapping quality (default: taps 0, bisulfite 10).
         #[arg(long)]
         min_mapq: Option<u8>,
-        /// Maximum reads per position, all cells together (htslib cap): a
-        /// number (0 = unlimited) or auto (default) = 4 molecules (2 strands x
-        /// 2 haplotypes) x reads per molecule (taps 2, bisulfite 1) x cells
-        /// kept by --complexity (with its cutoff) / --whitelist. Without
-        /// either the default is 100000.
+        /// htslib pileup cap, all cells together (default 0 = unlimited). A cap
+        /// thins deep positions by read order; --site-depth-limit drops them.
         #[arg(long)]
-        max_depth: Option<crate::extract::DepthArg>,
+        max_depth: Option<u32>,
+        /// Drop every call at positions covered by more kept-cell reads than
+        /// this: a number (0 = off) or auto (default) = --molecules-per-cell x
+        /// reads per molecule (taps 2, bisulfite 1) x cells kept by
+        /// --complexity (with its cutoff) / --whitelist. Off without either.
+        #[arg(long)]
+        site_depth_limit: Option<crate::extract::DepthArg>,
+        /// Molecules one cell can have at a position, for --site-depth-limit
+        /// auto: 4 = 2 strands x 2 haplotypes; 8 allows a replicated (G2) genome.
+        #[arg(long, default_value_t = crate::extract::MOLECULES_PER_CELL)]
+        molecules_per_cell: u32,
+        /// BED of regions whose calls are dropped for every cell (e.g. the
+        /// ENCODE blacklist). The pileup is unchanged.
+        #[arg(long)]
+        blacklist: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         no_overlap_clip: bool,
         #[arg(long, default_value_t = false)]
@@ -603,6 +615,8 @@ fn main() -> Result<()> {
                 min_baseq,
                 min_mapq,
                 max_depth,
+                site_depth_limit: 0,
+                blacklist: None,
                 ignore_overlaps,
                 ignore_orphans,
                 compute_baq,
@@ -692,6 +706,9 @@ fn main() -> Result<()> {
             min_baseq,
             min_mapq,
             max_depth,
+            site_depth_limit,
+            molecules_per_cell,
+            blacklist,
             no_overlap_clip,
             no_ignore_orphans,
             no_baq,
@@ -753,16 +770,27 @@ fn main() -> Result<()> {
                 min_complexity,
                 max_complexity,
             )?;
-            let (max_depth, depth_src) = match (max_depth, wl.as_ref().map(|w| w.len())) {
+            let max_depth = max_depth.unwrap_or(dflt.max_depth);
+            if molecules_per_cell == 0 {
+                anyhow::bail!("--molecules-per-cell must be at least 1");
+            }
+            let (site_depth_limit, site_depth_src) = match (site_depth_limit, wl.as_ref().map(|w| w.len())) {
                 (Some(crate::extract::DepthArg::Fixed(n)), _) => (n, "explicit".to_string()),
                 (_, Some(n)) => (
-                    crate::extract::auto_max_depth(n, chem.reads_per_molecule()),
-                    format!("auto: 4 molecules x {} read(s) per molecule x {n} cells", chem.reads_per_molecule()),
+                    crate::extract::auto_site_depth_limit(n, molecules_per_cell, chem.reads_per_molecule()),
+                    format!(
+                        "auto: {molecules_per_cell} molecules x {} read(s) per molecule x {n} cells",
+                        chem.reads_per_molecule()
+                    ),
                 ),
                 (Some(crate::extract::DepthArg::Auto), None) => {
-                    anyhow::bail!("--max-depth auto needs --complexity or --whitelist to count the cells; give a number instead")
+                    anyhow::bail!("--site-depth-limit auto needs --complexity or --whitelist to count the cells; give a number instead")
                 }
-                (None, None) => (dflt.max_depth, "default; auto needs --complexity or --whitelist".to_string()),
+                (None, None) => (0, "auto; off without --complexity or --whitelist".to_string()),
+            };
+            let blacklist_set = match blacklist.as_deref() {
+                Some(p) => Some(std::sync::Arc::new(crate::sitemask::Blacklist::load(p)?)),
+                None => None,
             };
             let trim_mode = trim.unwrap_or(if chem == chemistry::Chemistry::Bisulfite { TrimMode::Auto } else { TrimMode::Manual });
             let (set_r1, set_r2, set_3p) = (trim_r1, trim_r2, trim_3p);
@@ -781,6 +809,8 @@ fn main() -> Result<()> {
                 ("min_mapq", min_mapq.to_string()),
                 ("min_baseq", min_baseq.to_string()),
                 ("max_depth", max_depth.to_string()),
+                ("site_depth_limit", site_depth_limit.to_string()),
+                ("blacklist", blacklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
                 ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                 ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
             ]);
@@ -903,6 +933,8 @@ fn main() -> Result<()> {
                     ("min_mapq", min_mapq.to_string()),
                     ("min_baseq", min_baseq.to_string()),
                     ("max_depth", max_depth.to_string()),
+                    ("site_depth_limit", site_depth_limit.to_string()),
+                    ("blacklist", blacklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
                     ("baq", if no_baq { "off".to_string() } else { format!("{baq:?}").to_lowercase() }),
                     ("extractor", format!("taps-sc-extract-rs {}", env!("CARGO_PKG_VERSION"))),
                 ]);
@@ -943,6 +975,8 @@ fn main() -> Result<()> {
                 min_baseq,
                 min_mapq,
                 max_depth,
+                site_depth_limit,
+                blacklist: blacklist_set.clone(),
                 ignore_overlaps: !no_overlap_clip,
                 ignore_orphans: !no_ignore_orphans,
                 compute_baq: !no_baq,
@@ -1012,7 +1046,7 @@ fn main() -> Result<()> {
                 detected.bsbolt.as_ref().map(|v| format!("; BSBolt {v}")).unwrap_or_default()
             );
             eprintln!(
-                "  Read filters:    MAPQ >= {}, base quality >= {}, max depth {} ({depth_src}){}",
+                "  Read filters:    MAPQ >= {}, base quality >= {}, pileup cap {}{}",
                 params.min_mapq,
                 params.min_baseq,
                 if params.max_depth == 0 { "unlimited".to_string() } else { params.max_depth.to_string() },
@@ -1023,6 +1057,14 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("  5' trim:         R1={} bp, R2={} bp; 3' {} bp", params.trim_r1, params.trim_r2, params.trim_3p);
             }
+            eprintln!(
+                "  Site filters:    depth limit {} ({site_depth_src}); blacklist {}",
+                if site_depth_limit == 0 { "off".to_string() } else { site_depth_limit.to_string() },
+                match (&blacklist, &blacklist_set) {
+                    (Some(p), Some(b)) => format!("{} ({} regions, {:.2} Mb)", p.display(), b.n_regions(), b.total_bp() as f64 / 1e6),
+                    _ => "none".to_string(),
+                }
+            );
             eprintln!("  Windows:         {} window(s) across {:?}", windows.len(), contig_list);
             eprintln!("  Output:          {}", out.display());
             eprintln!("======================================================================");
@@ -1316,6 +1358,13 @@ fn print_extraction_summary(
     eprintln!("======================================================================");
     eprintln!("Total Wall Time:       {total_s:.1}s ({:.2} min)", total_s / 60.0);
     eprintln!("Processing Time:       {process_s:.1}s ({:.2} min)", process_s / 60.0);
+    let t = &r.timing;
+    if t.site_depth_bp > 0 || t.blacklist_sites > 0 {
+        eprintln!(
+            "Site filters:          depth limit dropped {} calls at {} cell-sites ({} bp over the limit); blacklist dropped {} calls at {} cell-sites",
+            t.site_depth_calls, t.site_depth_sites, t.site_depth_bp, t.blacklist_calls, t.blacklist_sites
+        );
+    }
     eprintln!("HDF5 Write Time:       {write_s:.1}s ({:.2} min)", write_s / 60.0);
     eprintln!(
         "Read Throughput:       {:.1} MB/s (est. {:.1} MB BAM)",

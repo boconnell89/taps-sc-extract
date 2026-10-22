@@ -27,6 +27,7 @@ from .calling import (
 )
 from .chemistry import flag_filter, guard_window, tables
 from .h5_writer import set_run_attrs
+from .sitemask import Cursor, load_blacklist, merge, window_depth_mask
 from .context import classify_context, classify_trinucleotide_context
 from .h5_writer import AmethystH5Writer, METH_DTYPE
 
@@ -53,7 +54,7 @@ def extract_methylation(
     max_complexity: Optional[float] = None,
     min_base_quality: int = 20,
     min_mapq: int = 0,
-    max_depth: int = 100000,
+    max_depth: int = 0,
     compute_baq: bool = True,
     ignore_orphans: bool = True,
     ignore_overlaps: bool = True,
@@ -64,6 +65,8 @@ def extract_methylation(
     trim_3p: int = 0,
     verify_ys: bool = True,
     trim_mode: str = "manual",
+    site_depth_limit: int = 0,
+    blacklist_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract methylation calls from a TAPS BAM file into an Amethyst HDF5 file.
@@ -130,6 +133,8 @@ def extract_methylation(
         "min_mapq": min_mapq,
         "min_baseq": min_base_quality,
         "max_depth": max_depth,
+        "site_depth_limit": site_depth_limit,
+        "blacklist": blacklist_path or "",
         "extractor": "taps-sc-extract (python)",
     })
 
@@ -141,6 +146,7 @@ def extract_methylation(
         "CH": {"c": 0, "t": 0},
     }
 
+    blacklist = load_blacklist(blacklist_path) if blacklist_path else {}
     all_barcodes: Set[str] = set()
     contig_breakdown = []
     start_total_time = time.time()
@@ -171,6 +177,11 @@ def extract_methylation(
 
             if chemistry == "bisulfite":
                 guard_window(bam, contig, 0, ref_len, min_mapq, verify_ys)
+            masked = list(blacklist.get(contig, []))
+            if site_depth_limit > 0:
+                masked += window_depth_mask(bam, contig, 0, ref_len, site_depth_limit, flag_filter(chemistry),
+                                            min_mapq, ignore_orphans, whitelist)
+            mask = Cursor(merge(masked))
             pileup_iter = bam.pileup(
                 contig,
                 ignore_overlaps=ignore_overlaps,
@@ -185,7 +196,7 @@ def extract_methylation(
 
             for col in pileup_iter:
                 pos = col.reference_pos  # 0-based
-                if pos >= ref_len:
+                if pos >= ref_len or mask.hit(pos):
                     continue
 
                 ref_b = ref_seq[pos]
