@@ -452,6 +452,9 @@ def _run_rust_chr19(out_h5, *extra):
     # Frozen references and the Python API runs use the manual TAPS trims.
     if "--trim" not in extra:
         extra = (*extra, "--trim", "manual")
+    # ... and MAPQ 0, the TAPS default when they were made.
+    if "--min-mapq" not in extra:
+        extra = (*extra, "--min-mapq", "0")
     # Frozen references and the Python API runs have no per-cell cap.
     if "--cell-site-cap" not in extra:
         extra = (*extra, "--cell-site-cap", "0")
@@ -747,7 +750,8 @@ def test_context_selection_both_engines(chr19_slice_inputs, tmp_path):
         out = tmp_path / f"rs_{keep}"
         subprocess.run(
             [rust_bin, "extract", "-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
-             "-t", "2", "--shards", "2", "--no-baq", "--context", keep, "--cell-site-cap", "0", "--trim", "manual"],
+             "-t", "2", "--shards", "2", "--no-baq", "--context", keep, "--cell-site-cap", "0", "--trim", "manual",
+             "--min-mapq", "0"],
             check=True, capture_output=True,
         )
         assert _cells_of(out / "master.h5", gone) is None

@@ -71,7 +71,7 @@ With both a whitelist and a complexity file, a cell must pass both. Filtered cel
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--min-mapq` | int | TAPS 0, bisulfite 10 | Minimum mapping quality. BSBolt gives 0 to reads that are not bisulfite-unique. |
+| `--min-mapq` | int | 10 | Minimum mapping quality. `bwa mem` gives 0 to reads placed at random among equally good hits, and BSBolt to reads that are not bisulfite-unique. `--min-mapq 0` keeps them. |
 | `--min-baseq` | int | 20 | Minimum base quality. Bases below this are not called. BAQ can lower qualities first (Rust engine). |
 | `--no-overlap-clip` | flag | off (clipping on) | Keep overlapping mate bases. Default: htslib overlap clipping zeros the lower-quality overlapping base, which then fails `--min-baseq`. TAPS only; single-end bisulfite has no mates. With this flag, `--cell-site-cap auto` doubles (two mates can both call). |
 
@@ -161,7 +161,7 @@ Per-chemistry defaults fill only options you did not set:
 
 | Option | TAPS | Bisulfite |
 |---|---|---|
-| `--min-mapq` | 0 | 10 |
+| `--min-mapq` | 10 | 10 |
 | `--min-baseq` | 20 | 20 |
 | `--max-depth` | 0 | 0 |
 | `--trim` | `auto` | `auto` |

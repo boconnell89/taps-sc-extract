@@ -263,7 +263,7 @@ enum Commands {
         /// Minimum base quality (default 20).
         #[arg(long)]
         min_baseq: Option<u8>,
-        /// Minimum mapping quality (default: taps 0, bisulfite 10).
+        /// Minimum mapping quality (default 10: bwa gives 0 to reads placed at random among equal hits).
         #[arg(long)]
         min_mapq: Option<u8>,
         /// htslib pileup cap, all cells together (default 0 = unlimited). A cap

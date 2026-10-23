@@ -209,9 +209,10 @@ pub struct Defaults {
 impl Chemistry {
     pub fn defaults(self) -> Defaults {
         match self {
-            // TAPS: unchanged historical defaults.
+            // TAPS: MAPQ 10 (bwa mem gives 0 to reads placed at random among
+            // equal hits; 2026-10-23, was 0), otherwise the historical defaults.
             Chemistry::Taps => Defaults {
-                min_mapq: 0,
+                min_mapq: 10,
                 min_baseq: 20,
                 max_depth: crate::extract::DEFAULT_MAX_DEPTH,
                 trim_r1: crate::calling::DEFAULT_TRIM_R1,

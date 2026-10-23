@@ -16,7 +16,7 @@ Each chemistry fills only the options you did not set:
 
 | Option | TAPS | Bisulfite |
 |---|---|---|
-| `--min-mapq` | 0 | 10 |
+| `--min-mapq` | 10 | 10 |
 | `--min-baseq` | 20 | 20 |
 | `--max-depth` | 0 (unlimited) | 0 (unlimited) |
 | `--trim` | `auto` | `auto` |
@@ -36,7 +36,7 @@ Bisulfite is single-end directional only. Paired reads, `*_G2A` / PBAT `YS` tags
 
 `--min-mapq` drops whole reads before they enter the pileup (and before BAQ). `--min-baseq` drops individual bases at call time, after BAQ has had a chance to lower qualities.
 
-**TAPS default MAPQ 0.** Properly paired TAPS reads with flags 99 / 147 / 83 / 163 are called even at MAPQ 0.
+**TAPS default MAPQ 10** (it was 0 until 2026-10-23). `bwa mem` gives MAPQ 0 to a read placed at random among equally good hits, and 1–9 to near-ties; their calls land mostly in repeats and pool methylation from different copies. Pipelines that already filter (e.g. `samtools view -q 10`) see no change; `--min-mapq 0` restores the old behaviour.
 
 **Bisulfite default MAPQ 10.** BSBolt assigns MAPQ 0 to alignments that are not bisulfite-unique.
 

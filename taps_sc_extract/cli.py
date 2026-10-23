@@ -224,7 +224,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--min-mapq",
         type=int,
         default=None,
-        help="Minimum mapping quality (default: taps 0, bisulfite 10; BSBolt gives 0 to reads "
+        help="Minimum mapping quality (default: 10 for both chemistries; bwa and BSBolt give 0 to reads "
         "that are not bisulfite-unique).",
     )
     parser.add_argument(

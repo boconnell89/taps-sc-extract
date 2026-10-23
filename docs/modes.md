@@ -28,7 +28,7 @@ taps-sc-extract \
 ### What Happens
 - **Chemistry Detection**: Resolves automatically to `taps` from paired-end alignments lacking bisulfite strand tags.
 - **TAPS-Aware BAQ**: Enables `--baq taps` (TAPS-aware profile HMM). OT reads realign against a C-masked reference and OB reads against a G-masked reference so that true methylation calls are not penalized as mismatches. Reads with an all-M alignment that match the masked reference exactly skip the HMM (~72% of reads); 0.0007% of CG calls differ from running BAQ on every read. See [settings.md](settings.md#baq).
-- **Trims & Filters**: `--trim auto` measures M-bias per mate and end and trims what it finds (typically read 2's first 9 bp, the Tn5 gap); `--trim manual` uses the fixed read 2 5′ trim of 10 bp. The M-bias table and plots are written next to the output. Minimum base quality is 20 (`--min-baseq 20`) and minimum MAPQ is 0 (`--min-mapq 0`).
+- **Trims & Filters**: `--trim auto` measures M-bias per mate and end and trims what it finds (typically read 2's first 9 bp, the Tn5 gap); `--trim manual` uses the fixed read 2 5′ trim of 10 bp. The M-bias table and plots are written next to the output. Minimum base quality is 20 (`--min-baseq 20`) and minimum MAPQ is 10 (`--min-mapq 10`).
 - **Overlaps**: Automatically clips mate overlaps to avoid double-counting read pairs.
 
 ---

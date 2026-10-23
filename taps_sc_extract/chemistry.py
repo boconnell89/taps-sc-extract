@@ -129,7 +129,7 @@ READS_PER_MOLECULE = {"taps": 2, "bisulfite": 1}
 def defaults(chemistry: str) -> Dict[str, object]:
     """Per-chemistry defaults for options the user did not set (see chemistry.rs)."""
     if chemistry == "taps":
-        return {"min_mapq": 0, "min_baseq": 20, "max_depth": 0, "trim_r1": 0, "trim_r2": 10, "trim_3p": 0, "baq": True}
+        return {"min_mapq": 10, "min_baseq": 20, "max_depth": 0, "trim_r1": 0, "trim_r2": 10, "trim_3p": 0, "baq": True}
     # Bisulfite SE (BSBolt): drop MAPQ < 10 (0 = not bisulfite-unique), trim
     # 10 bp off the sequenced 3' end (Tn5 gap fill-in), no BAQ.
     return {"min_mapq": 10, "min_baseq": 20, "max_depth": 0, "trim_r1": 0, "trim_r2": 0, "trim_3p": 10, "baq": False}

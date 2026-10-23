@@ -19,7 +19,7 @@ How each chemistry's reads are turned into methylation calls, and why BAQ needs 
 
 | Option | TAPS default | Bisulfite default |
 |---|---|---|
-| `--min-mapq` | 0 | 10 (BSBolt gives 0 to reads that are not bisulfite-unique) |
+| `--min-mapq` | 10 (bwa gives 0 to reads placed at random among equal hits) | 10 (BSBolt gives 0 to reads that are not bisulfite-unique) |
 | `--min-baseq` | 20 | 20 |
 | `--trim` | `auto` | `auto` (M-bias) |
 | `--trim-r1` / `--trim-5p` | 0 | 0 |
