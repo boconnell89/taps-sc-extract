@@ -21,7 +21,7 @@ How each chemistry's reads are turned into methylation calls, and why BAQ needs 
 |---|---|---|
 | `--min-mapq` | 0 | 10 (BSBolt gives 0 to reads that are not bisulfite-unique) |
 | `--min-baseq` | 20 | 20 |
-| `--trim` | `manual` | `auto` (M-bias) |
+| `--trim` | `auto` | `auto` (M-bias) |
 | `--trim-r1` / `--trim-5p` | 0 | 0 |
 | `--trim-r2` | 10 | (single-end: no read 2) |
 | `--trim-3p` | 0 | 10 when `--trim manual` |
@@ -41,7 +41,7 @@ TAPS (TET-assisted pyridine borane sequencing) converts methylated cytosine (5mC
 
 - **Which reads are called:** only properly paired reads with exactly these flags. Other reads, such as orphans and supplementary alignments, can sit in the pileup but are never called.
 - **Mate overlap:** where two mates of a pair overlap, htslib's overlap clipping keeps one base call. `--no-overlap-clip` turns this off.
-- **5′ trim of read 2:** read 2's first 10 sequenced bases (`--trim-r2 10`) are dropped by default. Both ends can be trimmed: see [settings.md](settings.md#trims-and-m-bias).
+- **Trims:** `--trim auto` (the default) measures M-bias and typically trims read 2's first 9 bp (the Tn5 gap, filled with unmethylated C); `--trim manual` drops read 2's first 10 bases. See [settings.md](settings.md#trims-and-m-bias).
 
 ## Bisulfite (BSBolt, single-end)
 

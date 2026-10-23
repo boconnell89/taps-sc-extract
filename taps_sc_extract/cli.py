@@ -38,6 +38,9 @@ def setup_logging(verbose: bool = False, log_file: Optional[str] = None):
 
     # File handler (if specified)
     if log_file:
+        # The log usually sits in the output directory, which may not exist yet.
+        log_dir = os.path.dirname(os.path.abspath(log_file))
+        os.makedirs(log_dir, exist_ok=True)
         file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
@@ -418,7 +421,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Rust engine: share of available memory the run may use, extraction plus "
-            "writer processes (default: 0.6)."
+            "writer processes (default: 0.85)."
         ),
     )
     parser.add_argument(
@@ -750,7 +753,7 @@ def resolve_python_options(parsed, spec):
             raise ValueError("--site-depth-limit auto needs --complexity or --whitelist to count the cells; give a number instead")
         else:
             opts["site_depth_limit"] = 0
-    opts["trim_mode"] = parsed.trim or ("auto" if chem == "bisulfite" else "manual")
+    opts["trim_mode"] = parsed.trim or "auto"  # M-bias trims by default, both chemistries
     if opts["trim_mode"] == "auto":
         opts.update(auto_trims(parsed, chem, opts, contigs, spec))
     logging.getLogger("taps_sc_extract").info(

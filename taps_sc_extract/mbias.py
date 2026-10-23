@@ -18,6 +18,8 @@ import math
 import os
 from typing import Dict, List, Optional, Tuple
 
+from .calling import DEFAULT_TRIM_R2
+
 P = 20
 PLATEAU_MIN_LEN = 60
 LENGTH_BINS = [(40, 59), (60, 99), (100, 149), (150, 1_000_000)]
@@ -197,6 +199,28 @@ def curve(table, ctx: str, mate: int, end: int) -> List[Tuple[int, int]]:
     return out
 
 
+# Each end is compared with its own baseline: positions BASELINE_FROM..P-1 of
+# its curve (Rust mbias::baseline). A plateau pooled over mates put TAPS read 1
+# and read 2 (about 10 points apart mid-read) both out of band.
+BASELINE_FROM = 15
+BASELINE_WARN = 0.10  # baseline this far from the plateau: the bias may run past 15 bp
+
+
+def baseline(cur: List[Tuple[int, int]], min_calls: int) -> Optional[float]:
+    """Positions BASELINE_FROM..P-1 pooled after dropping the highest- and
+    lowest-rate position (Rust mbias::baseline)."""
+    if sum(m + u for m, u in cur[BASELINE_FROM:]) < min_calls:
+        return None
+    import functools
+    tail = [x for x in cur[BASELINE_FROM:] if x[0] + x[1] > 0]
+    # Stable sort by rate, compared exactly by cross-multiplication (as in Rust).
+    tail.sort(key=functools.cmp_to_key(lambda a, b: (a[0] * (b[0] + b[1]) > b[0] * (a[0] + a[1])) - (a[0] * (b[0] + b[1]) < b[0] * (a[0] + a[1]))))
+    mid = tail[1:-1] if len(tail) >= 3 else tail
+    m = sum(x[0] for x in mid)
+    u = sum(x[1] for x in mid)
+    return m / (m + u) if m + u else None
+
+
 def walk(cur: List[Tuple[int, int]], plateau_rate: float, delta: float, min_calls: int):
     """Trim for one end: walk inward from p = 0; while a position is biased the
     trim is p + 1; stop at the first STABLE_RUN consecutive in-band-or-unknown
@@ -234,13 +258,21 @@ def choose_trims(table, plateau, chemistry: str, mates=(1,)) -> Dict[str, object
                 if pn[ctx] < min_calls:
                     per_ctx[ctx] = None
                     continue
-                rate = plateau[ctx][0] / pn[ctx]
-                t, unknown_head = walk(curve(table, ctx, mate, end), rate, DELTA[ctx], min_calls)
+                cur = curve(table, ctx, mate, end)
+                pooled = plateau[ctx][0] / pn[ctx]
+                rate = baseline(cur, min_calls)
+                if rate is None:
+                    rate = pooled
+                if ctx == "CG" and abs(rate - pooled) > BASELINE_WARN:
+                    lab = f"R{mate} " if len(mates) > 1 else ""
+                    notes.append(f"{lab}{end}': CG at 15-19 bp is {100 * rate:.1f}% against a {100 * pooled:.1f}% plateau; "
+                                 "the bias may extend past 15 bp, check the M-bias plot")
+                t, unknown_head = walk(cur, rate, DELTA[ctx], min_calls)
                 per_ctx[ctx] = (t, unknown_head)
             label = f"R{mate} " if len(mates) > 1 else ""
             cg = per_ctx["CG"]
             if cg is None or cg[1]:
-                fallback = CANDIDATE_3P[chemistry] if end == 3 else 0
+                fallback = CANDIDATE_3P[chemistry] if end == 3 else (DEFAULT_TRIM_R2 if chemistry == "taps" and mate == 2 else 0)
                 ch = per_ctx["CH"]
                 if ch is not None and not ch[1]:
                     t = ch[0]

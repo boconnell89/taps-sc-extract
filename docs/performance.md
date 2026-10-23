@@ -97,7 +97,7 @@ htslib threads per worker that inflate BGZF blocks ahead of the reader. Leave it
 
 ### Shards (`--shards`)
 
-- **Rust default, auto:** the larger of a cell-count rule and the estimated output sites ÷ 48M, capped at half the CPUs and at the cell count.
+- **Rust default, auto:** the larger of a cell-count rule and the estimated output sites ÷ 48M, capped at half the CPUs and at the cell count. After extraction, the writer planner may split the output into more files (next section).
   - Cell-count rule: 1 shard up to 10,000 cells, 8 up to 50,000, 16 up to 100,000, 32 above that.
   - The site rule matters for few, deep cells. On the 304-cell bisulfite library above, 16 shards wrote the output several times faster than one, because the shards are written in parallel.
 - **Single file:** naming an `.h5` file with `-o` keeps 1 shard.
@@ -110,7 +110,10 @@ htslib threads per worker that inflate BGZF blocks ahead of the reader. Leave it
 
 - **`--writer-mode process`** (the default with more than one shard): one `write-shard` child process per shard. Each streams its shard one cell at a time in bounded slices.
 - **`--writer-mode thread`:** in-process writers. They share one HDF5 lock and so don't write in parallel; auto caps them at 6.
-- **`--max-writer-threads`** (0 = auto): up to min(shards, CPUs), within the memory budget. On network filesystems use 2–4; on spinning disks, 1.
+- **`--max-writer-threads`** (0 = auto): planned after extraction, when the shard sizes are known exactly. A writer holds its whole shard (measured: RSS ≈ 1.0 × payload + 0.1 GB; planned at 1.15 × + 0.25 GB). The planner runs as many writers as fit in the memory free at that moment, up to the `--test` profile's count, else the CPU count. With automatic shards it also splits the output into more files, from whole buckets, when that shortens the write (rounds of writers × largest file).
+  - On the 40-file, 54.7-billion-site server run, 32 shards of ~21 GB allowed only about 22 writers at once. The planner would write 128 files of ~7 GB with 80 writers.
+  - An explicit `--max-writer-threads` or `--shards` is followed as given; if the plan does not fit, the log says `WARNING: ... may run out of memory` with the count that would fit.
+  - On network filesystems use 2–4 writers; on spinning disks, 1.
 - **`--compression-threads`** (Blosc only, default 1): 1 to 32 threads all wrote equally fast. Most cell datasets are a single chunk too small for Blosc to split, so the parallelism comes from shards.
 
 ### Memory mode (`--memory-mode`, `--temp-dir`)
@@ -121,7 +124,8 @@ htslib threads per worker that inflate BGZF blocks ahead of the reader. Leave it
   - It prefers memory mode with one streamed writer per shard when the whole process tree fits the memory budget.
   - Otherwise it chooses between memory and stream mode, with as many writers as fit.
   - The config block prints the plan: `Memory plan: ... est. peak ~X GB of Y GB`.
-  - The budget is `--max-memory-fraction` (default 0.6 of available memory) or `--max-memory-gb`, and it covers extraction plus writers.
+  - The budget is `--max-memory-fraction` (default 0.85 of available memory) or `--max-memory-gb`, and it covers extraction plus writers. The write phase re-reads available memory after extraction.
+  - Explicit `--memory-mode memory` is followed even when the estimate exceeds the budget, with a WARNING.
 - **Storage:** keep input, temp and output on fast local storage. On the reference machine, the same job ran at 0.31M reads/s from a 9p-mounted HDD against 0.56M reads/s from local NVMe (measured before the 2026-10-15 upgrades).
 
 ### Contexts (`--context`)

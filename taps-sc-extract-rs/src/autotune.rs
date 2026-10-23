@@ -29,10 +29,10 @@ pub fn get_available_memory_gb() -> f64 {
 }
 
 /// Default share of MemAvailable the run may use (`--max-memory-fraction`).
-pub const DEFAULT_MEMORY_FRACTION: f64 = 0.6;
+pub const DEFAULT_MEMORY_FRACTION: f64 = 0.85;
 
 /// Memory budget for the whole process tree (extraction plus writer children):
-/// `--max-memory-gb` if given, else `fraction` (default 0.6) of MemAvailable.
+/// `--max-memory-gb` if given, else `fraction` (default 0.85) of MemAvailable.
 pub fn system_memory_budget_gb(max_memory_gb: Option<f64>, fraction: Option<f64>) -> (f64, String) {
     if let Some(gb) = max_memory_gb {
         (gb.max(1.0), "explicit".to_string())
@@ -116,7 +116,7 @@ pub fn resolve_workers_with_budget(cli: usize, budget_gb: f64) -> (usize, &'stat
 /// Deprecated resolve_workers without budget for backwards compatibility.
 pub fn resolve_workers(cli: usize) -> usize {
     if cli == 0 {
-        default_workers(get_available_memory_gb() * 0.6)
+        default_workers(get_available_memory_gb() * DEFAULT_MEMORY_FRACTION)
     } else {
         cli
     }
@@ -174,11 +174,15 @@ pub fn estimate_sites(mapped_reads: u64, site_share: f64, cell_count: usize, gen
 /// sliced `write-shard` children together ~14.5 B/site (10.2 GB). Margins added.
 pub const SITES_PER_READ: f64 = 14.0;
 pub const MEMORY_MODE_BYTES_PER_SITE: f64 = 18.0;
-pub const WRITER_BYTES_PER_SITE: f64 = 20.0;
+/// A writer holds its whole shard: measured 12.6-12.7 B/site on 32 shards of a
+/// 54.7B-site bisulfite run and ~14.5 B/site on the TAPS test BAM (2026-10-22).
+/// Used at startup only; the write phase is re-planned from measured shard
+/// sizes (`plan_write`).
+pub const WRITER_BYTES_PER_SITE: f64 = 15.0;
 pub const WRITER_BASE_GB: f64 = 0.1;
 /// Writers fed during extraction (memory mode, one process per shard): the 16
 /// children together measured 10.4 GB for 702M sites (14.8 B/site, 2026-10-18).
-pub const STREAMED_WRITER_BYTES_PER_SITE: f64 = 16.0;
+pub const STREAMED_WRITER_BYTES_PER_SITE: f64 = 15.0;
 /// Share of the payloads the extraction process holds before buckets are dealt
 /// to shards (`ShardStreams`: after 1/5 of the windows).
 pub const STREAM_HOLD_FRACTION: f64 = 0.2;
@@ -306,6 +310,118 @@ pub fn plan_memory(i: &MemoryInputs) -> MemoryPlan {
         writer_each_gb,
         peak_gb,
     }
+}
+
+/// Writer RSS per byte of shard payload (temp-file bytes, or 12 B per site in
+/// memory: the TAPSCK01 site record and the in-memory one are both 12 bytes),
+/// plus a base per process. Measured 2026-10-22: RSS ~= 1.0 x payload + 0.1 GB
+/// (20.6 GB for 20.5 GB on the server; 0.73 GB for 0.62 GB locally). 15% and
+/// 0.15 GB of margin: the 32-writer crash came within 1% of MemAvailable.
+pub const WRITER_RSS_PER_BYTE: f64 = 1.15;
+pub const WRITER_RSS_BASE_BYTES: f64 = 0.25e9;
+
+/// Most output files the write phase may split a run into (per CPU).
+pub const MAX_FILES_PER_CPU: usize = 2;
+
+/// How the write phase runs, decided after extraction from measured sizes.
+#[derive(Clone, Debug)]
+pub struct WritePlan {
+    /// Buckets per output file (`groups.len()` files).
+    pub groups: Vec<Vec<usize>>,
+    /// Writer processes at once.
+    pub writers: usize,
+    /// Estimated RSS of the largest file's writer (bytes).
+    pub writer_rss: f64,
+    pub notes: Vec<String>,
+}
+
+fn writer_rss(bytes: u64) -> f64 {
+    bytes as f64 * WRITER_RSS_PER_BYTE + WRITER_RSS_BASE_BYTES
+}
+
+/// Choose the number of output files and concurrent writers from the
+/// per-bucket payload bytes, so the writers that run at once fit `budget_bytes`
+/// (memory available for writers now). With automatic shards, files range from
+/// `n_shards` up to the bucket count (whole buckets only; a cell never splits),
+/// at most `MAX_FILES_PER_CPU` per CPU; the count with the shortest estimated
+/// write (rounds of writers x largest file) wins, fewer files on ties. `cap`
+/// bounds writers (`--max-writer-threads`, else the machine profile, else
+/// CPUs). Explicit settings are followed as given: an explicit `--shards`
+/// keeps its file count and an explicit `--max-writer-threads` runs that many
+/// writers; when they do not fit the budget a warning is added instead.
+pub fn plan_write(
+    bucket_bytes: &[u64],
+    n_shards: usize,
+    shards_explicit: bool,
+    cap: usize,
+    cap_explicit: bool,
+    budget_bytes: f64,
+    nproc: usize,
+) -> WritePlan {
+    let n_shards = n_shards.max(1);
+    let cap = cap.max(1);
+    let most = if n_shards <= 1 {
+        1
+    } else if shards_explicit {
+        n_shards
+    } else {
+        bucket_bytes.len().clamp(n_shards, n_shards.max(MAX_FILES_PER_CPU * nproc.max(1)))
+    };
+    let mut best: Option<(f64, WritePlan)> = None;
+    for k in n_shards..=most {
+        let groups = crate::h5_out::pack_buckets(bucket_bytes, k);
+        let largest = groups.iter().map(|g| g.iter().map(|&b| bucket_bytes[b]).sum::<u64>()).max().unwrap_or(0);
+        let rss = writer_rss(largest);
+        let fit = ((budget_bytes / rss).floor().max(1.0)) as usize;
+        let writers = if cap_explicit { k.min(cap) } else { k.min(cap).min(fit).max(1) };
+        let rounds = k.div_ceil(writers) as f64;
+        let cost = rounds * largest.max(1) as f64;
+        if best.as_ref().is_none_or(|(c, _)| cost < *c * 0.999) {
+            best = Some((cost, WritePlan { groups, writers, writer_rss: rss, notes: Vec::new() }));
+        }
+    }
+    let mut plan = best.expect("at least one file count").1;
+    let files = plan.groups.len();
+    let gb = |b: f64| b / 1e9;
+    if files > n_shards {
+        plan.notes.push(format!(
+            "writing {files} files instead of {n_shards} so that {} writers fit in {:.0} GB (~{:.1} GB each)",
+            plan.writers,
+            gb(budget_bytes),
+            gb(plan.writer_rss)
+        ));
+    }
+    let fit = ((budget_bytes / plan.writer_rss).floor().max(1.0)) as usize;
+    if plan.writers > fit {
+        plan.notes.push(format!(
+            "WARNING: {} writers of ~{:.1} GB each need ~{:.0} GB, but only {:.0} GB is free; the write may run out of memory. \
+             About {fit} writers fit{}",
+            plan.writers,
+            gb(plan.writer_rss),
+            gb(plan.writers as f64 * plan.writer_rss),
+            gb(budget_bytes),
+            if shards_explicit { "; more --shards would make each writer smaller" } else { "" }
+        ));
+    } else if plan.writer_rss > budget_bytes {
+        plan.notes.push(format!(
+            "WARNING: one writer needs ~{:.1} GB but only {:.0} GB is free; the write may run out of memory",
+            gb(plan.writer_rss),
+            gb(budget_bytes)
+        ));
+    }
+    plan
+}
+
+/// Memory the write phase may use now: `--max-memory-gb` minus what this
+/// process holds, else `fraction` of MemAvailable read now.
+pub fn write_budget_bytes(max_memory_gb: Option<f64>, fraction: Option<f64>) -> f64 {
+    let f = fraction.unwrap_or(DEFAULT_MEMORY_FRACTION).clamp(0.05, 1.0);
+    let avail = get_available_memory_gb() * f;
+    let gb = match max_memory_gb {
+        Some(m) => (m - process_rss_mb() / 1024.0).min(avail),
+        None => avail,
+    };
+    gb.max(0.5) * 1e9
 }
 
 /// Cell-count source for auto-tune.
@@ -446,13 +562,58 @@ mod tests {
 
     #[test]
     fn memory_plan_explicit_and_in_process() {
-        let mut i = inputs("memory", 8.0, 53_461_257, 16);
+        let mut i = inputs("memory", 400.0, 53_461_257, 16);
         i.cli_writers = 16;
         let p = plan_memory(&i);
         assert_eq!((p.mode.as_str(), p.writers), ("memory", 16));
+        // Explicit memory mode is followed even when it cannot fit; the peak
+        // estimate shows it (main.rs warns).
+        let mut i = inputs("memory", 8.0, 53_461_257, 16);
+        i.cli_writers = 16;
+        let p = plan_memory(&i);
+        assert_eq!(p.mode, "memory");
+        assert!(p.peak_gb > 8.0);
         let mut i = inputs("stream", 500.0, 1_000_000, 16);
         i.in_process = true;
         assert!(plan_memory(&i).writers <= MAX_AUTO_WRITERS);
+    }
+
+    #[test]
+    fn write_plan_fits_the_server_run() {
+        // 2026-10-22 server run: 54.7B sites in 32 shards (128 buckets), 12 B
+        // per site of payload, 0.85 x ~650 GB free after extraction, 96 CPUs.
+        let site = 54.7e9 / 128.0;
+        let buckets: Vec<u64> = (0..128).map(|i| (site * (0.95 + 0.1 * (i % 3) as f64 / 2.0) * 12.0) as u64).collect();
+        let budget = 0.85 * 650e9;
+        // Asked for 32 writers on 32 files: 32 x ~25 GB cannot fit, so the
+        // files are split further until 32 run at once, never 32 x 25 GB.
+        // Automatic shards and writers: the files are split further until the
+        // writers that run at once fit, never 32 x 25 GB.
+        let p = plan_write(&buckets, 32, false, 96, false, budget, 96);
+        assert!(p.writers as f64 * p.writer_rss <= budget, "{p:?}");
+        assert!(p.groups.len() > 32 && p.writers >= 24, "{p:?}");
+        assert_eq!(p.groups.iter().map(|g| g.len()).sum::<usize>(), 128);
+        assert!(!p.notes.iter().any(|n| n.contains("WARNING")));
+        // Explicit --shards 32 --max-writer-threads 32 (the run that crashed):
+        // followed as given, with a warning.
+        let p = plan_write(&buckets, 32, true, 32, true, budget, 96);
+        assert_eq!((p.groups.len(), p.writers), (32, 32));
+        assert!(p.notes.iter().any(|n| n.contains("WARNING") && n.contains("may run out of memory")), "{p:?}");
+        // Explicit --shards 32, automatic writers: as many as fit, no split.
+        let p = plan_write(&buckets, 32, true, 96, false, budget, 96);
+        assert_eq!(p.groups.len(), 32);
+        assert!(p.writers < 32 && p.writers as f64 * p.writer_rss <= budget, "{p:?}");
+        // One file stays one file.
+        let one = plan_write(&buckets[..1], 1, false, 32, false, budget, 96);
+        assert_eq!((one.groups.len(), one.writers), (1, 1));
+        // Plenty of memory: the requested shards, all writers at once, no notes.
+        let p = plan_write(&buckets, 32, false, 32, false, 5e12, 96);
+        assert_eq!((p.groups.len(), p.writers), (32, 32));
+        assert!(p.notes.is_empty());
+        // Tiny budget: one writer, warned.
+        let p = plan_write(&buckets, 32, false, 32, false, 1e9, 4);
+        assert_eq!(p.writers, 1);
+        assert!(p.notes.iter().any(|n| n.contains("may run out of memory")));
     }
 
     #[test]

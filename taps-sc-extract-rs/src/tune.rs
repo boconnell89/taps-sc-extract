@@ -905,15 +905,27 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     let (n_cells, mean_sites) = if a.quick { (1000usize, 30_000u32) } else { (2000usize, 50_000u32) };
     let h5_dir = a.out_dir.join(format!(".taps_tune_h5_{}", std::process::id()));
     let mut h5: Vec<H5Run> = Vec::new();
+    // Up to every logical CPU: on a 64-thread server the old ladder stopped at
+    // the 32 physical cores, and "fastest" then just meant "largest tried".
     let proc_ladder: Vec<usize> = {
-        let mut v = vec![1, 4, host.physical_cores.min(16), host.physical_cores];
+        let mut v = vec![1, 4, host.physical_cores.min(16), host.physical_cores, host.nproc];
         v.sort_unstable();
         v.dedup();
         v
     };
+    // Each writer gets real work (>= 5M sites, 2M with --quick), so the probe
+    // measures writing rather than process start-up, within a quarter of the
+    // memory budget.
+    let per_writer_sites: u64 = if a.quick { 2_000_000 } else { 5_000_000 };
+    let budget_sites = (0.25 * autotune::system_memory_budget_gb(None, None).0 * 1e9 / 12.0) as u64;
+    let cells_for = |w: usize| -> usize {
+        let want = (w as u64 * per_writer_sites).div_ceil(mean_sites as u64) as usize;
+        let most = (budget_sites / mean_sites as u64).max(n_cells as u64) as usize;
+        want.clamp(n_cells, most)
+    };
     h5.push(h5_run(&h5_dir, WriterMode::Thread, 4, n_cells, mean_sites, None)?);
     for &w in &proc_ladder {
-        h5.push(h5_run(&h5_dir, WriterMode::Process, w, n_cells, mean_sites, None)?);
+        h5.push(h5_run(&h5_dir, WriterMode::Process, w, cells_for(w), mean_sites, None)?);
     }
     let best_h5 = h5
         .iter()
@@ -929,7 +941,7 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     // the temp filesystem), and a few very large cells (low cell count, deep
     // coverage: each cell is one writer's serial work).
     let bw = best_h5.writers.max(1);
-    let h5_stream = h5_run(&h5_dir, WriterMode::Process, bw, n_cells, mean_sites, Some(&a.temp_dir))?;
+    let h5_stream = h5_run(&h5_dir, WriterMode::Process, bw, cells_for(bw), mean_sites, Some(&a.temp_dir))?;
     let (dense_cells, dense_sites) = if a.quick { (2 * bw, 300_000u32) } else { (2 * bw, 1_000_000u32) };
     let h5_dense = h5_run(&h5_dir, WriterMode::Process, bw, dense_cells, dense_sites, None)?;
     let _ = std::fs::remove_dir_all(&h5_dir);
@@ -937,7 +949,11 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
     // --- Recommendations.
     let rec_workers = knee;
     let rec_decomp = if inflate_share > 0.15 { 2 } else { 0 };
-    let rec_writers = best_h5.writers.max(1);
+    // The profile's writer count caps the run's planner. When the largest count
+    // tried was still the fastest, no limit was found: cap at the CPU count and
+    // let the planner fit writers to memory per run.
+    let top = proc_ladder.iter().copied().max().unwrap_or(1);
+    let rec_writers = if best_h5.writers >= top { host.nproc.max(1) } else { best_h5.writers.max(1) };
 
     // --- Optional dataset sample.
     let dataset = match (&a.bam, &a.fasta) {
@@ -1020,7 +1036,12 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
             f.fs_type
         );
     }
-    let _ = writeln!(rpt, "HDF5 shard writes (LZF, {} cells x ~{} sites):", n_cells, mean_sites);
+    let _ = writeln!(
+        rpt,
+        "HDF5 shard writes (LZF, cells of ~{} sites; at least {:.0}M sites per process writer):",
+        mean_sites,
+        per_writer_sites as f64 / 1e6
+    );
     for r in &h5 {
         let _ = writeln!(
             rpt,
@@ -1165,7 +1186,13 @@ fn run_probes(a: &TuneArgs, host: &HostInfo, work: &Path, build: &str) -> Result
         }
     }
 
-    let _ = writeln!(rpt, "\nRecommended: -t {rec_workers} --decomp-threads {rec_decomp} --writer-mode process --max-writer-threads {rec_writers} (shards >= {rec_writers}); --chunk-size-mb auto");
+    let _ = writeln!(
+        rpt,
+        "\nRecommended: -t {rec_workers} --decomp-threads {rec_decomp}; leave --shards and --max-writer-threads unset. \
+         Each run fits as many writers as memory allows (up to {rec_writers}, saved with --save-profile) and splits \
+         the output into more files when that lets more writers run at once. Giving --max-writer-threads makes it \
+         a fixed count, used even if it does not fit."
+    );
     eprint!("{rpt}");
 
     // --- Save.

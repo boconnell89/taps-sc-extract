@@ -449,6 +449,9 @@ def _run_rust_chr19(out_h5, *extra):
 
     if "--max-depth" not in extra:
         extra = (*extra, "--max-depth", FROZEN_MAX_DEPTH)
+    # Frozen references and the Python API runs use the manual TAPS trims.
+    if "--trim" not in extra:
+        extra = (*extra, "--trim", "manual")
     # Frozen references and the Python API runs have no per-cell cap.
     if "--cell-site-cap" not in extra:
         extra = (*extra, "--cell-site-cap", "0")
@@ -702,7 +705,7 @@ def test_read_caller_matches_pileup(chr19_slice_inputs, tmp_path, extra):
         out = tmp_path / caller
         subprocess.run(
             [rust_bin, "extract", "-b", str(paths["ref"]), "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
-             "-t", "2", "--shards", "2", "--caller", caller, *extra],
+             "-t", "2", "--shards", "2", "--caller", caller, *extra, "--trim", "manual"],
             check=True, capture_output=True,
         )
         cells[caller] = {ctx: _cells_of(out / "master.h5", ctx) for ctx in ("CG", "CH")}
@@ -744,7 +747,7 @@ def test_context_selection_both_engines(chr19_slice_inputs, tmp_path):
         out = tmp_path / f"rs_{keep}"
         subprocess.run(
             [rust_bin, "extract", "-b", bam, "-f", CHR19_FASTA, "-o", str(out), "-c", "chr19",
-             "-t", "2", "--shards", "2", "--no-baq", "--context", keep, "--cell-site-cap", "0"],
+             "-t", "2", "--shards", "2", "--no-baq", "--context", keep, "--cell-site-cap", "0", "--trim", "manual"],
             check=True, capture_output=True,
         )
         assert _cells_of(out / "master.h5", gone) is None
@@ -786,7 +789,7 @@ def test_inputs_index_sam_cram_rust(chr19_slice_inputs, tmp_path):
     def run(key):
         p = subprocess.run(
             [rust_bin, "extract", "-b", str(paths[key]), "-f", CHR19_FASTA, "-o", str(tmp_path / f"{key}.h5"),
-             "-c", "chr19", "--start", "5000000", "--end", "6000000", "-t", "2", "--shards", "1"],
+             "-c", "chr19", "--start", "5000000", "--end", "6000000", "-t", "2", "--shards", "1", "--trim", "manual"],
             capture_output=True, text=True,
         )
         return p.returncode, p.stdout + p.stderr
@@ -1415,7 +1418,21 @@ def test_mbias_rule_python():
     c = mbias.choose_trims(*table(step, [(3, p, 0.02) for p in range(12)], 5000), "bisulfite")
     assert c["trim_3p"] == 10 and any("CH suggests 12" in n for n in c["notes"])
     assert mbias.choose_trims(*table([], [], 10), "bisulfite")["trim_3p"] == 10
-    assert mbias.choose_trims(*table([(5, p, 0.5) for p in range(mbias.P)], [], 5000), "bisulfite")["trim_r1"] == mbias.MAX_AUTO_TRIM
+    # The cap: a bias past position 15 against a normal level at 15-19.
+    assert mbias.choose_trims(*table([(5, p, 0.5) for p in range(15)], [], 5000), "bisulfite")["trim_r1"] == mbias.MAX_AUTO_TRIM
+    # A bias over the whole 20 bp is invisible against its own level: warned.
+    c = mbias.choose_trims(*table([(5, p, 0.5) for p in range(mbias.P)], [], 5000), "bisulfite")
+    assert c["trim_r1"] == 0 and any("may extend past 15 bp" in n for n in c["notes"])
+    # TAPS-like mates: read 2 ~10 points under read 1; only read 2's first 9 bp go.
+    t = {}
+    for mate, level in ((1, 0.74), (2, 0.63)):
+        for end in (5, 3):
+            for p in range(mbias.P):
+                rate = 0.05 if (mate == 2 and end == 5 and p < 9) else level
+                m = int(round(rate * 5000))
+                t[("CG", mate, end, 1, p)] = [m, 5000 - m]
+    c = mbias.choose_trims(t, {"CG": [70_000, 30_000], "CH": [5_000, 95_000]}, "taps", (1, 2))
+    assert (c["trim_r1"], c["trim_r2"], c["trim_3p"]) == (0, 9, 0)
     big = [("chr1", 200_000_000, 3_000_000), ("chr2", 100_000_000, 1_000_000)]
     w = mbias.sample_windows(big)
     assert len(w) == mbias.N_WINDOWS and sum(1 for x in w if x[0] == "chr1") == 48
@@ -1646,3 +1663,17 @@ def test_python_writer_threads_zero_means_auto():
     auto = _shard_writer_concurrency(8, use_temp_files=True, max_writer_threads=None)
     assert _shard_writer_concurrency(8, use_temp_files=True, max_writer_threads=0) == auto
     assert _shard_writer_concurrency(8, use_temp_files=True, max_writer_threads=1) == 1
+
+
+def test_log_file_directory_is_created(tmp_path):
+    """--log-file inside a not-yet-created output directory must not crash."""
+    import logging
+    from taps_sc_extract.cli import setup_logging
+
+    log = tmp_path / "extract" / "nested" / "run.log"
+    setup_logging(log_file=str(log))
+    logging.getLogger("taps_sc_extract").info("hello")
+    for h in logging.getLogger().handlers:
+        h.flush()
+    assert log.exists() and "hello" in log.read_text()
+    setup_logging()  # restore console-only logging for later tests

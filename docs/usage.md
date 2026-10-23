@@ -92,12 +92,12 @@ Trims are in BAM SEQ coordinates (soft clips included). Reverse-strand SEQ is re
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--trim` | `auto` \| `manual` | TAPS `manual`, bisulfite `auto` | `auto`: measure M-bias on a sample of reads and pick trims for ends you did not set; writes `<bam>.mbias.tsv` / `.png` / `.pdf` next to the output. `manual`: chemistry defaults or the explicit values. An explicit `--trim-5p` / `--trim-r2` / `--trim-3p` always wins for that end. |
+| `--trim` | `auto` \| `manual` | `auto` (both chemistries) | `auto`: measure M-bias on a sample of reads and pick trims for ends you did not set; writes `<bam>.mbias.tsv` / `.png` / `.pdf` next to the output. `manual`: chemistry defaults or the explicit values. An explicit `--trim-5p` / `--trim-r2` / `--trim-3p` always wins for that end. |
 | `--trim-r1`, `--trim-5p` | int | 0 | Drop this many sequenced 5′ bases of read 1, or of every single-end read. |
 | `--trim-r2` | int | TAPS 10, bisulfite 0 | Drop this many sequenced 5′ bases of read 2. No effect on single-end reads (a warning is printed). |
 | `--trim-3p`, `--trim-3prime` | int | TAPS 0, bisulfite 10 (when `--trim manual`) | Drop this many sequenced 3′ bases of every read. Bisulfite: the Tn5 9 bp gap is filled with unmethylated C at end repair. |
 
-`--trim auto` samples about 300,000 mapped reads (every read when the selection is that small; otherwise 64 windows). It counts CpG and CH methylation by distance from each sequenced end on reads at least 40 bp, and trims each end up to where CpG methylation returns to the mid-read plateau (within 2 percentage points or 3 standard errors, for 3 positions in a row; cap 15 bp). CH (1 point) only warns, unless CpG has too few calls. Both engines choose the same trims from the same table. Plots are drawn by `python -m taps_sc_extract.mbias`.
+`--trim auto` samples about 300,000 mapped reads (every read when the selection is that small; otherwise 64 windows). It counts CpG and CH methylation by distance from each sequenced end on reads at least 40 bp, and trims each end up to where its CpG methylation returns to that end's own level at 15–19 bp (within 2 percentage points or 3 standard errors, for 3 positions in a row; cap 15 bp). Each mate and end is judged on its own, because TAPS read 2 sits about 10 points below read 1 mid-read. With too few calls an end falls back to 0 bp (TAPS read 2's 5′ end: 10 bp; bisulfite 3′: 10 bp). CH (1 point) only warns, unless CpG has too few calls. Both engines choose the same trims from the same table. Plots are drawn by `python -m taps_sc_extract.mbias`.
 
 Effects: [settings.md](settings.md#trims-and-m-bias).
 
@@ -164,7 +164,7 @@ Per-chemistry defaults fill only options you did not set:
 | `--min-mapq` | 0 | 10 |
 | `--min-baseq` | 20 | 20 |
 | `--max-depth` | 0 | 0 |
-| `--trim` | `manual` | `auto` |
+| `--trim` | `auto` | `auto` |
 | `--trim-r1` | 0 | 0 |
 | `--trim-r2` | 10 | 0 (no read 2) |
 | `--trim-3p` | 0 | 10 when `--trim manual` |
@@ -184,8 +184,8 @@ Tuning advice and measured rates: [performance.md](performance.md).
 | `-t`, `--threads`, `--workers` | int | auto | Window workers (Rayon threads in Rust). Unset or `0`: min(logical CPUs, workers that fit the stream-mode footprint in the memory budget), or the saved `--test` profile. The wrapper alias `--threads` is not a Rust-binary flag; call `taps-sc-extract-rs` with `-t` / `--workers`. |
 | `--decomp-threads` | int | 4 / 2 / 0 by worker count | BAM BGZF decompression threads per worker. `0` = inflate on the worker thread. Auto: 4 at 1–4 workers, 2 at 5–7, 0 at 8 or more (or the saved profile). Several inputs: 0. |
 | `--chunk-size-mb` | int | auto (0) | Genomic window size in megabases. Auto: about 6 windows per worker, clamped to 2–100 Mb. Window size does not change calls. |
-| `--shards` | int | auto (0) | Number of output HDF5 shard files. Auto: the larger of a cell-count rule (1 / 8 / 16 / 32 at ≤10k / 50k / 100k / more cells) and estimated sites / 48 million, capped at max(cell rule, nproc/2) and the cell count. An `.h5` `-o` keeps 1. Unset or `0` = auto. |
-| `--max-writer-threads`, `--writer-threads` | int | 0 (auto) | Maximum concurrent shard writers (`--writer-threads` is a wrapper-only alias). Auto: up to shard count, CPUs and the memory budget (about 20 bytes per site of a shard each); one writer per shard when writers are fed during extraction. In-process (`thread`) writers are capped at 6. |
+| `--shards` | int | auto (0) | Number of output HDF5 shard files. Auto: the larger of a cell-count rule (1 / 8 / 16 / 32 at ≤10k / 50k / 100k / more cells) and estimated sites / 48 million, capped at max(cell rule, nproc/2) and the cell count; after extraction the writer planner may raise it (see `--max-writer-threads`). An `.h5` `-o` keeps 1. An explicit count is kept as given. |
+| `--max-writer-threads`, `--writer-threads` | int | 0 (auto) | Maximum concurrent shard writers (`--writer-threads` is a wrapper-only alias). Auto: decided after extraction from the measured shard sizes and the memory free then, as many as fit (a writer holds its whole shard, ~1.15 × its payload), up to the `--test` profile's count or the CPU count. With automatic `--shards` the output may be split into more files (whole buckets, up to 4 per requested shard) when that lets more writers run at once. One writer per shard when writers are fed during extraction. In-process (`thread`) writers are capped at 6. **An explicit value is used as given**, with a WARNING in the log if it is not expected to fit. |
 | `--writer-mode` | `auto` \| `process` \| `thread` | `auto` | `process`: one `taps-sc-extract-rs write-shard` child per shard (default when shards > 1). `thread`: in-process pool sharing one HDF5 lock. `auto` = `process` when shards > 1, else `thread`. |
 | `--compression-threads` | int | 1 (Blosc codecs) | Blosc threads per shard writer (`blosc` / `blosc-zstd` only). |
 
@@ -202,7 +202,7 @@ Rust hashes barcodes into 4 × shards buckets and packs buckets into shards by s
 | `--memory-mode` | `auto` \| `stream` \| `memory` | `auto` | `stream`: window results go to compact temp files, then writers read them. `memory`: results stay in RAM; with process writers and more than one shard, each window's payload is piped to the writer children as it finishes. `auto`: memory mode with one streamed writer per shard when the estimated peak (parent + 20% held payload + 16 B/site in the children) fits the budget; otherwise stream. |
 | `--no-temp-file` | flag | off | Same as `--memory-mode memory`. Wrapper only; forwarded as `--memory-mode memory`. |
 | `--max-memory-gb` | float | unset | Memory budget in GB for the whole process tree (extraction plus writer children). Overrides `--max-memory-fraction`. Minimum 1 GB. |
-| `--max-memory-fraction` | float | 0.6 | Share of `MemAvailable` the run may use, clamped to 0.05–1.0. The budget is at least 2 GB. |
+| `--max-memory-fraction` | float | 0.85 | Share of `MemAvailable` the run may use, clamped to 0.05–1.0. The budget is at least 2 GB. |
 | `--temp-dir` | path | `$TMPDIR`, else `/tmp` | Directory for stream-mode temp chunk files, in both engines. Point it at fast local storage, not a network mount. |
 
 The run summary reports the extraction process's peak RSS and the writer children's combined peak. Count both when sizing memory.

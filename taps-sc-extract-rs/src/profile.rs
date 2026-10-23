@@ -138,5 +138,8 @@ pub fn write_profile_json(path: &Path, p: &RunProfile) -> Result<()> {
         o.push_str(if i + 1 < p.writer_reports.len() { ",\n" } else { "\n" });
     }
     o.push_str("  ]\n}\n");
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    }
     std::fs::write(path, o).with_context(|| format!("write {}", path.display()))
 }

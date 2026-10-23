@@ -227,7 +227,7 @@ enum Commands {
         /// Memory budget in GB for the whole process tree (overrides --max-memory-fraction).
         #[arg(long)]
         max_memory_gb: Option<f64>,
-        /// Share of MemAvailable the run may use (default 0.6).
+        /// Share of MemAvailable the run may use (default 0.85).
         #[arg(long)]
         max_memory_fraction: Option<f64>,
         /// Optional expected cell count (auto-detected from whitelist if omitted).
@@ -857,7 +857,8 @@ fn main() -> Result<()> {
                 Some(p) => Some(std::sync::Arc::new(crate::sitemask::Blacklist::load(p)?)),
                 None => None,
             };
-            let trim_mode = trim.unwrap_or(if chem == chemistry::Chemistry::Bisulfite { TrimMode::Auto } else { TrimMode::Manual });
+            // --trim auto (M-bias) is the default for both chemistries.
+            let trim_mode = trim.unwrap_or(TrimMode::Auto);
             let (set_r1, set_r2, set_3p) = (trim_r1, trim_r2, trim_3p);
             let mut trim_r1 = trim_r1.unwrap_or(dflt.trim_r1);
             let mut trim_r2 = trim_r2.unwrap_or(dflt.trim_r2);
@@ -1100,7 +1101,10 @@ fn main() -> Result<()> {
                 budget_gb
             );
             if mem_plan.peak_gb > budget_gb {
-                eprintln!("  warning: estimated peak exceeds the memory budget; lower --max-writer-threads or use --memory-mode stream");
+                eprintln!(
+                    "  WARNING: the estimated peak exceeds the memory budget and the run may run out of memory; \
+                     explicit settings are followed as given (lower --max-writer-threads, raise --shards, or use --memory-mode stream)"
+                );
             }
             eprintln!("  Chunk size:      {:.1} Mb ({chunk_src})", chunk_bp as f64 / 1e6);
             if blosc_threads > 0 {
@@ -1223,9 +1227,40 @@ fn main() -> Result<()> {
             };
             let process_s = t_process.elapsed().as_secs_f64();
             let cpu_after_process = profile::cpu_times();
+            // Re-plan the write phase from the measured shard payloads and the
+            // memory free now (writers fed during extraction are already running).
+            let write_plan = {
+                let weights = match &pending {
+                    PendingOutput::Streamed(_) => None,
+                    PendingOutput::Memory(mem) => {
+                        Some(crate::h5_out::bucket_sites(mem).iter().map(|s| s * 12).collect::<Vec<u64>>())
+                    }
+                    PendingOutput::Stream(tmp) => Some(crate::h5_out::bucket_bytes(tmp.path(), n_buckets)),
+                };
+                weights.map(|w| {
+                    let (cap, explicit) = if max_writer_threads > 0 {
+                        (max_writer_threads, true)
+                    } else if let Some(p) = saved.as_ref().and_then(|(p, _)| p.writers) {
+                        (p, false)
+                    } else {
+                        (nproc, false)
+                    };
+                    let cap = if writer_mode == WriterMode::Thread { cap.min(autotune::MAX_AUTO_WRITERS) } else { cap };
+                    let budget = autotune::write_budget_bytes(max_memory_gb, max_memory_fraction);
+                    autotune::plan_write(&w, n_shards, shards_src == "explicit", cap, explicit, budget, nproc)
+                })
+            };
+            if let Some(p) = &write_plan {
+                for n in &p.notes {
+                    eprintln!("note: {n}");
+                }
+            }
+            let writer_threads = write_plan.as_ref().map_or(writer_threads, |p| p.writers);
+            let n_files = write_plan.as_ref().map_or(n_shards, |p| p.groups.len());
             eprintln!(
-                "Extraction workers finished in {process_s:.1}s. Writing {n_shards} shard(s) with {writer_threads} {} writer(s).",
-                writer_mode.label()
+                "Extraction workers finished in {process_s:.1}s. Writing {n_files} shard(s) with {writer_threads} {} writer(s){}.",
+                writer_mode.label(),
+                write_plan.as_ref().map_or(String::new(), |p| format!(" (~{:.1} GB each)", p.writer_rss / 1e9))
             );
             let t_write = Instant::now();
             let crate::h5_out::HdfOutput { path: h5_path, reports: writer_reports, master_s } = match pending {
@@ -1236,7 +1271,7 @@ fn main() -> Result<()> {
                     crate::h5_out::HdfOutput { path, reports, master_s: t_master.elapsed().as_secs_f64() }
                 }
                 PendingOutput::Memory(mem) => {
-                    let groups = crate::h5_out::pack_buckets(&crate::h5_out::bucket_sites(&mem), n_shards);
+                    let groups = write_plan.as_ref().expect("planned for memory output").groups.clone();
                     assemble_hdf5_from_memory(
                         crate::h5_out::group_buckets(mem, &groups),
                         &out,
@@ -1247,10 +1282,7 @@ fn main() -> Result<()> {
                     )?
                 }
                 PendingOutput::Stream(tmp) => {
-                    let groups = crate::h5_out::pack_buckets(
-                        &crate::h5_out::bucket_bytes(tmp.path(), n_buckets),
-                        n_shards,
-                    );
+                    let groups = write_plan.as_ref().expect("planned for stream output").groups.clone();
                     let res = assemble_hdf5_from_temp(
                         tmp.path(),
                         &out,
@@ -1278,7 +1310,7 @@ fn main() -> Result<()> {
                 process_s,
                 write_s,
                 out_bytes,
-                n_shards,
+                n_files,
                 resolved_memory_mode == "stream",
                 crate::autotune::process_peak_rss_mb(),
                 crate::h5_out::concurrent_writer_peak_mb(&writer_reports, writer_threads),
@@ -1302,7 +1334,7 @@ fn main() -> Result<()> {
                         ("decomp_threads", decomp.to_string()),
                         ("chunk_bp", chunk_bp.to_string()),
                         ("windows", windows.len().to_string()),
-                        ("shards", n_shards.to_string()),
+                        ("shards", n_files.to_string()),
                         ("writer_mode", writer_mode.label().to_string()),
                         ("writers", writer_threads.to_string()),
                         ("memory_mode", resolved_memory_mode.clone()),

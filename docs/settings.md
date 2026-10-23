@@ -19,7 +19,7 @@ Each chemistry fills only the options you did not set:
 | `--min-mapq` | 0 | 10 |
 | `--min-baseq` | 20 | 20 |
 | `--max-depth` | 0 (unlimited) | 0 (unlimited) |
-| `--trim` | `manual` | `auto` |
+| `--trim` | `auto` | `auto` |
 | `--trim-r1` | 0 | 0 |
 | `--trim-r2` | 10 | unused (single-end) |
 | `--trim-3p` | 0 | 10 when `--trim manual` |
@@ -57,18 +57,18 @@ One interval `[lo, hi)` is applied per read:
 
 With `--trim-3p 0` this is the old 5′-only rule. `--trim-r2` has no effect on single-end reads.
 
-**TAPS manual defaults:** R2 5′ 10 bp (Tn5 / TAPS M-bias on read 2), R1 0, 3′ 0.
+**TAPS `--trim auto` (the default):** on the TAPS test BAM it picks read 2 5′ 9 bp (the Tn5 gap, ~5% methylated against ~63% mid-read), read 1 5′ 0 bp and 3′ 0–2 bp. **`--trim manual`:** R2 5′ 10 bp, R1 0, 3′ 0.
 
 **Bisulfite `--trim auto` (the default):** a pass over about 300,000 sampled reads (every read when the selection is that small; otherwise 64 windows dealt by mapped reads) counts CpG and CH methylation by distance from each sequenced end. Only reads at least 40 bp long contribute to the end curves, so the two ends do not mix. The plateau is the mid-read rate on reads at least 60 bp, at least 20 bp from both ends.
 
 The rule, identical in both engines:
 
-1. Walk inward from position 0. While a position's CpG rate is more than 2 percentage points (or 3 standard errors) from the plateau, the trim is that position plus one.
+1. Walk inward from position 0. While a position's CpG rate is more than 2 percentage points (or 3 standard errors) from that end's own level, the trim is that position plus one. The level is the same end's curve at positions 15–19, pooled after dropping the highest and lowest position. Each mate is judged separately: TAPS read 2 sits about 10 points under read 1 mid-read, so a pooled plateau would trim read 1 for nothing and read 2 to the cap. If an end's level is more than 10 points from the plateau, a warning says the bias may extend past 15 bp.
 2. Stop at the first 3 consecutive in-band or low-count positions.
 3. Cap at 15 bp.
 4. A position needs 500 calls (or `TAPS_MBIAS_MIN_CALLS`) before it can set or stop the trim.
 5. If CpG lacks data, CH may set the trim (and a warning is logged). If CH wants a longer trim than CpG, CpG is kept and CH is warned.
-6. If the end has too few calls, fall back to 0 bp (5′) or the chemistry's 3′ candidate (bisulfite 10, TAPS 0).
+6. If the end has too few calls, fall back to 0 bp (5′; TAPS read 2: 10 bp) or the chemistry's 3′ candidate (bisulfite 10, TAPS 0).
 
 An explicit `--trim-5p` / `--trim-r2` / `--trim-3p` wins for that end. The chosen trims are written as HDF5 `/metadata` attributes and as `<bam>.mbias.tsv` / `.png` / `.pdf` next to the output. Plots are drawn by `python -m taps_sc_extract.mbias` (seaborn); a missing plotter logs a note and the run continues.
 

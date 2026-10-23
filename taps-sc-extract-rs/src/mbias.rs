@@ -38,6 +38,16 @@ fn delta(ctx: &str) -> f64 {
     }
 }
 
+/// 5' fallback when an end has too few calls: TAPS read 2 keeps its
+/// established 10 bp trim; every other 5' end 0.
+fn candidate_5p(chem: Chemistry, mate: u8) -> u32 {
+    if chem == Chemistry::Taps && mate == 2 {
+        crate::calling::DEFAULT_TRIM_R2
+    } else {
+        0
+    }
+}
+
 fn candidate_3p(chem: Chemistry) -> u32 {
     match chem {
         Chemistry::Taps => 0,
@@ -237,6 +247,32 @@ fn curve(t: &Table, ctx: &'static str, mate: u8, end: u8) -> Vec<(u64, u64)> {
 }
 
 /// Trim for one end (see `mbias.walk`): (trim, unknown positions near the end).
+/// First position of an end's own baseline: positions `BASELINE_FROM..P` of
+/// its curve. Each end is compared with its own level a little further in, not
+/// with a plateau pooled over mates (TAPS read 2's mid-read rate is ~10 points
+/// under read 1's, which made a pooled plateau trim read 1 for nothing and read
+/// 2 to the cap).
+pub const BASELINE_FROM: usize = 15;
+/// A baseline this far from the pooled plateau means the bias may run past
+/// position 15, where the walk cannot see it: warn.
+pub const BASELINE_WARN: f64 = 0.10;
+
+/// An end's baseline: positions `BASELINE_FROM..P` pooled after dropping the
+/// highest- and lowest-rate position (one odd position does not move it), if
+/// those positions have `min_calls` calls. Same as Python `mbias.baseline`.
+fn baseline(cur: &[(u64, u64)], min_calls: u64) -> Option<f64> {
+    let all = &cur[BASELINE_FROM..];
+    if all.iter().map(|x| x.0 + x.1).sum::<u64>() < min_calls {
+        return None;
+    }
+    let mut tail: Vec<(u64, u64)> = all.iter().copied().filter(|x| x.0 + x.1 > 0).collect();
+    // Stable sort by rate (cross-multiplied: exact, no float ties).
+    tail.sort_by(|a, b| (a.0 as u128 * (b.0 + b.1) as u128).cmp(&(b.0 as u128 * (a.0 + a.1) as u128)));
+    let mid = if tail.len() >= 3 { &tail[1..tail.len() - 1] } else { &tail[..] };
+    let (m, u) = mid.iter().fold((0u64, 0u64), |a, x| (a.0 + x.0, a.1 + x.1));
+    (m + u > 0).then(|| m as f64 / (m + u) as f64)
+}
+
 fn walk(cur: &[(u64, u64)], plateau_rate: f64, delta: f64, min_calls: u64) -> (u32, bool) {
     let (mut trim, mut run, mut unknown_head) = (0u32, 0usize, false);
     for (p, &(m, u)) in cur.iter().enumerate() {
@@ -293,8 +329,18 @@ pub fn choose(c: &Counts, chem: Chemistry, mates: &[u8]) -> Chosen {
                 if pn[ci] < mc {
                     continue;
                 }
-                let rate = c.plateau[ci][0] as f64 / pn[ci] as f64;
-                per[ci] = Some(walk(&curve(&c.table, ctx, mate, end), rate, delta(ctx), mc));
+                let cur = curve(&c.table, ctx, mate, end);
+                let plateau = c.plateau[ci][0] as f64 / pn[ci] as f64;
+                let rate = baseline(&cur, mc).unwrap_or(plateau);
+                if ctx == "CG" && (rate - plateau).abs() > BASELINE_WARN {
+                    let label = if mates.len() > 1 { format!("R{mate} ") } else { String::new() };
+                    out.notes.push(format!(
+                        "{label}{end}': CG at 15-19 bp is {:.1}% against a {:.1}% plateau; the bias may extend past 15 bp, check the M-bias plot",
+                        100.0 * rate,
+                        100.0 * plateau
+                    ));
+                }
+                per[ci] = Some(walk(&cur, rate, delta(ctx), mc));
             }
             let label = if mates.len() > 1 { format!("R{mate} ") } else { String::new() };
             let t = match per[0] {
@@ -312,7 +358,7 @@ pub fn choose(c: &Counts, chem: Chemistry, mates: &[u8]) -> Chosen {
                         tch
                     }
                     _ => {
-                        let f = if end == 3 { candidate_3p(chem) } else { 0 };
+                        let f = if end == 3 { candidate_3p(chem) } else { candidate_5p(chem, mate) };
                         out.notes.push(format!("{label}{end}': too few calls near the read end; using the default {f} bp"));
                         f
                     }
@@ -426,10 +472,30 @@ mod tests {
         let sparse = table(&[], &[], 10);
         let c = choose(&sparse, Chemistry::Bisulfite, &[1]);
         assert_eq!(c.trim_3p, 10);
-        // The cap.
-        let long: Vec<(u8, usize, f64)> = (0..P).map(|p| (5u8, p, 0.5)).collect();
+        // The cap: a bias reaching past position 15 against a normal baseline.
+        let long: Vec<(u8, usize, f64)> = (0..15).map(|p| (5u8, p, 0.5)).collect();
         let c = choose(&table(&long, &[], 5000), Chemistry::Bisulfite, &[1]);
         assert_eq!(c.trim_r1, MAX_AUTO_TRIM);
+        // A bias over the whole 20 bp is invisible against its own baseline: warned.
+        let whole: Vec<(u8, usize, f64)> = (0..P).map(|p| (5u8, p, 0.5)).collect();
+        let c = choose(&table(&whole, &[], 5000), Chemistry::Bisulfite, &[1]);
+        assert_eq!(c.trim_r1, 0);
+        assert!(c.notes.iter().any(|n| n.contains("may extend past 15 bp")));
+        // TAPS-like mates: read 2 sits ~10 points under read 1 mid-read; each end
+        // is compared with its own level, so only read 2's first 9 bp are trimmed.
+        let mut t = Table::new();
+        for (mate, level) in [(1u8, 0.74), (2u8, 0.63)] {
+            for end in [5u8, 3] {
+                for p in 0..P {
+                    let rate = if mate == 2 && end == 5 && p < 9 { 0.05 } else { level };
+                    let m = (rate * 5000.0f64).round() as u64;
+                    t.insert(("CG", mate, end, 1, p), [m, 5000 - m]);
+                }
+            }
+        }
+        let taps = Counts { table: t, plateau: [[70_000, 30_000], [5_000, 95_000]], reads: 1 };
+        let c = choose(&taps, Chemistry::Taps, &[1, 2]);
+        assert_eq!((c.trim_r1, c.trim_r2, c.trim_3p), (0, 9, 0));
     }
 
     #[test]
